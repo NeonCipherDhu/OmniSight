@@ -1,0 +1,25 @@
+# User camera configurations & private credentials
+cameras.json
+camera_names.json
+*.tmp
+
+# Local camera snapshots, recordings, backups & PTZ preset thumbnails
+captures/
+
+# Python bytecode & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# PyInstaller build artifacts
+build/
+dist/
+installer/
+
+# Local IDE & agent configs
+.agents/
+.vscode/
+.idea/

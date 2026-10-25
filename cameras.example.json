@@ -1,0 +1,22 @@
+[
+  {
+    "cam_id": "v380_example01",
+    "name": "Camera 01",
+    "protocol": "v380",
+    "ip": "192.168.1.100",
+    "port": 8800,
+    "device_id": "12345678",
+    "username": "admin",
+    "password": "YOUR_CAMERA_PASSWORD",
+    "quality": 1,
+    "rtsp_url": "",
+    "audio_enabled": true,
+    "light_mode": "auto",
+    "image_mode": "auto",
+    "flipped": false,
+    "person_detection": true,
+    "detection_sensitivity": "ultra",
+    "gpu_acceleration": true,
+    "ptz_presets": []
+  }
+]

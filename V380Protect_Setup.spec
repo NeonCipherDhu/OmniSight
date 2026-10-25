@@ -1,0 +1,39 @@
+# -*- mode: python ; coding: utf-8 -*-
+
+
+a = Analysis(
+    ['installer_main.py'],
+    pathex=[],
+    binaries=[],
+    datas=[('build/V380Protect_Payload.zip', '.'), ('v380_protect.ico', '.')],
+    hiddenimports=[],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+    noarchive=False,
+    optimize=0,
+)
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.datas,
+    [],
+    name='V380Protect_Setup',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    runtime_tmpdir=None,
+    console=False,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    icon=['v380_protect.ico'],
+)
