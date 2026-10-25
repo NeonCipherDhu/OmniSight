@@ -1,10 +1,11 @@
 """
-Native V380 / V380 Pro LAN Protocol Implementation (Port 8800 & UDP 10008/10009).
+OmniSight LAN Protocol Implementation (TCP Port 8800 & UDP 10008/10009).
+Unofficial client compatible with V380 cameras.
 
 Supports:
 - UDP Broadcast LAN Auto-Discovery (port 10008/10009 `NVDEVSEARCH^100`)
 - Active TCP Port 8800 Subnet Scanner fallback (including 192.168.1.x & local subnets)
-- V380 Dual-Stage AES-128-ECB Password Encryption (`macrovideo+*#!^@`)
+- Dual-Stage AES-128-ECB Password Encryption
 - Auth Handshake (`cmd 1167` -> `resp 1168`, both v31/v32 and legacy v2 variants, with auto-username/port fallback)
 - Stream Login & Start (`cmd 301` -> `resp 401` -> `cmd 303`)
 - Media Frame Reassembly (`0x7F` 12-byte fragment headers)
@@ -51,12 +52,12 @@ class DiscoveredCamera:
     discovery_method: str = "UDP Broadcast"
 
     def display_title(self) -> str:
-        label = self.name or (f"V380 ({self.dev_id})" if self.dev_id else f"V380 @ {self.ip}")
+        label = self.name or (f"Camera ({self.dev_id})" if self.dev_id else f"Camera @ {self.ip}")
         return f"{label} [{self.ip}:{self.port}]"
 
 
 @dataclass
-class V380Frame:
+class CameraFrame:
     is_audio: bool
     raw_type: int
     payload: bytes
@@ -70,10 +71,10 @@ class V380Frame:
 
 
 @dataclass
-class V380RecordingSegment:
+class RecordingSegment:
     """
-    Represents a single recording clip stored on a V380 camera's microSD card
-    (returned by Macrovideo SDK 6.0 Segment Search `cmd 361` / `cmd 362`).
+    Represents a single recording clip stored on a camera's microSD card
+    (returned by Segment Search `cmd 361` / `cmd 362`).
     """
 
     seg_id: int
@@ -131,8 +132,8 @@ class V380RecordingSegment:
         return f"{sec}s"
 
 
-class V380Commands:
-    """Binary control packets sent over the active V380 stream socket."""
+class LanCameraCommands:
+    """Binary control packets sent over the active camera stream socket."""
 
     PTZ_RIGHT = bytes([0xAA, 0x00, 0x00, 0x00, 0xE8, 0x03, 0xE8, 0x03, 0xEA, 0x03, 0xE8, 0x03, 0x00, 0x00, 0x01, 0x00])
     PTZ_LEFT  = bytes([0xAA, 0x00, 0x00, 0x00, 0xE8, 0x03, 0xE8, 0x03, 0xE9, 0x03, 0xE8, 0x03, 0x00, 0x00, 0x01, 0x00])
@@ -161,7 +162,7 @@ class V380Commands:
         return struct.pack("<IIII", 0xAB, int(action), int(slot_id), 0)
 
 
-# IMA-ADPCM step and index tables used by V380 audio (8000 Hz, 16-bit mono)
+# IMA-ADPCM step and index tables used by 8000 Hz, 16-bit mono camera audio
 _IMA_STEP_TABLE = [
     7, 8, 9, 10, 11, 12, 13, 14, 16, 17,
     19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
@@ -200,9 +201,9 @@ def _build_alaw_table() -> List[int]:
 _ALAW_TO_PCM16 = _build_alaw_table()
 
 
-def decode_v380_alaw_to_pcm16(alaw_bytes: bytes) -> bytes:
+def decode_alaw_to_pcm16(alaw_bytes: bytes) -> bytes:
     """
-    Decode V380 0x1A G.711 A-Law (PCMA, 8000 Hz, mono) audio payload into signed 16-bit LE PCM.
+    Decode 0x1A G.711 A-Law (PCMA, 8000 Hz, mono) audio payload into signed 16-bit LE PCM.
     """
     if not alaw_bytes:
         return b""
@@ -212,9 +213,9 @@ def decode_v380_alaw_to_pcm16(alaw_bytes: bytes) -> bytes:
     return bytes(out)
 
 
-def decode_v380_adpcm_to_pcm16(adpcm_bytes: bytes) -> bytes:
+def decode_adpcm_to_pcm16(adpcm_bytes: bytes) -> bytes:
     """
-    Decode V380 IMA-ADPCM audio payload into signed 16-bit little-endian PCM (8000 Hz, mono).
+    Decode IMA-ADPCM audio payload into signed 16-bit little-endian PCM (8000 Hz, mono).
     """
     if len(adpcm_bytes) < 4:
         return b""
@@ -288,9 +289,9 @@ def get_local_ipv4_addresses() -> List[str]:
     return sorted(ips)
 
 
-class V380Discovery:
+class LanCameraDiscovery:
     """
-    Discovers V380 cameras on the local network (including un-added cameras across subnets) via:
+    Discovers compatible LAN cameras on the local network (including un-added cameras across subnets) via:
     1. Native UDP broadcast (`NVDEVSEARCH^100` to port 10008, receiving `NVDEVRESULT` on 10009)
     2. Two-pass paced Unicast UDP `NVDEVSEARCH^100` sweep across local & neighbor subnets
        (wakes idle/un-added Wi-Fi cameras from DTIM sleep, resolves router ARP without overflowing
@@ -422,7 +423,7 @@ class V380Discovery:
 
             # Stage 1: Broadcast UDP discovery on local segment
             if progress_cb:
-                progress_cb("Sending V380 UDP broadcast (port 10008/10009)...")
+                progress_cb("Sending UDP discovery broadcast (port 10008/10009)...")
             for _ in range(2):
                 for sock in socks:
                     for bcast in broadcast_targets:
@@ -478,7 +479,7 @@ class V380Discovery:
                             ip=ip,
                             mac="",
                             port=8800,
-                            name=f"V380 Camera ({ip})",
+                            name=f"Camera ({ip})",
                             discovery_method="TCP Port 8800 Scan",
                         )
 
@@ -501,7 +502,7 @@ class V380Discovery:
             ip=ip,
             mac=mac,
             port=8800,
-            name=f"V380 ({dev_id})" if dev_id else f"V380 ({ip})",
+            name=f"Camera ({dev_id})" if dev_id else f"Camera ({ip})",
             discovery_method=method,
         )
 
@@ -534,7 +535,7 @@ class V380Discovery:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                     s.settimeout(0.65)
                     if s.connect_ex((target_ip, 8800)) == 0:
-                        # Always send a 520-byte V380 handshake frame so the camera's
+                        # Always send a 520-byte handshake frame so the camera's
                         # blocking recv() loop finishes immediately and never locks port 8800.
                         probe_pkt = bytearray(520)
                         struct.pack_into("<I", probe_pkt, 0, 1167)
@@ -564,9 +565,9 @@ class V380Discovery:
         return sorted(found)
 
 
-class V380Client:
+class LanCameraClient:
     """
-    Native TCP Port 8800 V380 Camera Client.
+    Unofficial TCP Port 8800 LAN Camera Client (compatible with V380 cameras).
     Handles authentication, stream login, media decryption, NAL extraction, and PTZ/Light controls.
     """
 
@@ -581,7 +582,7 @@ class V380Client:
         password: str = "",
         stream_quality: int = 1,  # 1 = HD, 0 = SD
         enable_audio: bool = True,
-        on_frame: Optional[Callable[[V380Frame], None]] = None,
+        on_frame: Optional[Callable[[CameraFrame], None]] = None,
         on_status: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.ip = ip.strip()
@@ -649,8 +650,8 @@ class V380Client:
     @classmethod
     def generate_password(cls, password: str, block_bytes: int = 48) -> bytes:
         """
-        Encrypt user password using V380's dual-stage AES-128-ECB scheme:
-        Stage 1: AES-ECB encrypt with `macrovideo+*#!^@`
+        Encrypt user password using the camera's dual-stage AES-128-ECB scheme:
+        Stage 1: AES-ECB encrypt with static protocol key
         Stage 2: AES-ECB encrypt with random 16-char printable key
         Output: 16-byte random key + encrypted password blocks
         """
@@ -681,12 +682,12 @@ class V380Client:
         if self.device_id > 0:
             return True
         self._emit_status("Discovering device ID...")
-        single = V380Discovery.query_single_ip(self.ip, timeout_sec=0.9)
+        single = LanCameraDiscovery.query_single_ip(self.ip, timeout_sec=0.9)
         if single and single.dev_id.isdigit():
             self.device_id = int(single.dev_id)
             self._emit_status(f"Found Device ID: {self.device_id}")
             return True
-        devices = V380Discovery.discover(timeout_sec=1.5, scan_tcp_8800=False)
+        devices = LanCameraDiscovery.discover(timeout_sec=1.5, scan_tcp_8800=False)
         for dev in devices:
             if dev.ip == self.ip and dev.dev_id.isdigit():
                 self.device_id = int(dev.dev_id)
@@ -696,22 +697,22 @@ class V380Client:
 
     def _wake_camera_port_8800(self) -> None:
         """
-        Wake V380 cameras (especially v31/v32 firmware or cross-subnet cameras) whose
+        Wake compatible cameras (especially v31/v32 firmware or cross-subnet cameras) whose
         local TCP port 8800 listener goes into standby until triggered by:
         1. Unicast UDP `NVDEVSEARCH^100` to <ip>:10008
-        2. V380 Cloud Dispatch (`dispa1.av380.net:8001`) `cmd 1167` wakeup signal
+        2. Optional Cloud Dispatch (`dispa1.av380.net:8001`) `cmd 1167` wakeup signal
         """
         # 1. Send unicast UDP discovery wakeup to camera IP on port 10008
         # Use an ephemeral local port so background stream workers never steal UDP 10009 replies during scans.
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as usock:
-                V380Discovery._configure_udp_socket(usock)
+                LanCameraDiscovery._configure_udp_socket(usock)
                 usock.bind(("0.0.0.0", 0))
                 usock.sendto(b"NVDEVSEARCH^100", (self.ip, 10008))
         except Exception:
             pass
 
-        # 2. If we have a Device ID, trigger V380 Cloud Dispatch wakeup so the camera
+        # 2. If we have a Device ID, trigger Cloud Dispatch wakeup so the camera
         # immediately opens its local TCP port 8800 listener
         if self.device_id <= 0:
             return
@@ -786,7 +787,7 @@ class V380Client:
     def authenticate(self, skip_cloud_wake: bool = False) -> Tuple[int, str]:
         """
         Perform port 8800 authentication (`cmd 1167` -> `resp 1168`).
-        Sends the UDP 10008 + V380 Cloud Dispatch wakeup first (unless `skip_cloud_wake`
+        Sends the UDP 10008 + dispatch wakeup first (unless `skip_cloud_wake`
         is set during a fast HD/SD stream quality switch).
         """
         if self._stop_event.is_set():
@@ -804,8 +805,8 @@ class V380Client:
                 usernames_to_try.append(u)
 
         variants = [
-            (520, 120, 31, 48),  # Modern V380 Pro LAN (520 bytes, unk1=120, ver=31)
-            (256, 1022, 2, 16),  # Classic V380 LAN (256 bytes, unk1=1022, ver=2)
+            (520, 120, 31, 48),  # Modern LAN auth (520 bytes, unk1=120, ver=31)
+            (256, 1022, 2, 16),  # Classic LAN auth (256 bytes, unk1=1022, ver=2)
         ]
 
         last_err = "Connection timed out"
@@ -1107,7 +1108,7 @@ class V380Client:
                 acodec = "adpcm"
 
             self.on_frame(
-                V380Frame(
+                CameraFrame(
                     is_audio=True,
                     raw_type=raw_type,
                     payload=bytes(audio_payload),
@@ -1130,7 +1131,7 @@ class V380Client:
         is_key = self._is_key_video_frame(raw_type, outer_frame_type, normalized)
 
         self.on_frame(
-            V380Frame(
+            CameraFrame(
                 is_audio=False,
                 raw_type=raw_type,
                 payload=normalized,
@@ -1147,7 +1148,7 @@ class V380Client:
         best_score = -10**9
         best_payload: Optional[bytes] = None
 
-        # Always test offset 16 first! V380 outer media frame headers are 16 bytes,
+        # Always test offset 16 first! Outer media frame headers are 16 bytes,
         # and AES 80-byte stride decryption MUST align with offset 16.
         for offset in (16, 20, 12, 8, 4, 0):
             if len(full) <= offset:
@@ -1260,7 +1261,7 @@ class V380Client:
 
     @staticmethod
     def _detect_video_codec(raw_type: int, payload: bytes) -> VideoCodec:
-        # V380 packet type tags explicitly distinguish HEVC (0x28/0x29) vs H.264 (0x00/0x01)
+        # Packet type tags explicitly distinguish HEVC (0x28/0x29) vs H.264 (0x00/0x01)
         if raw_type in (0x28, 0x29):
             return VideoCodec.H265
         if raw_type in (0x00, 0x01):
@@ -1376,46 +1377,46 @@ class V380Client:
 
     # --- Camera Control Commands ---
     def ptz_up(self) -> bool:
-        return self._send_raw(V380Commands.PTZ_UP)
+        return self._send_raw(LanCameraCommands.PTZ_UP)
 
     def ptz_down(self) -> bool:
-        return self._send_raw(V380Commands.PTZ_DOWN)
+        return self._send_raw(LanCameraCommands.PTZ_DOWN)
 
     def ptz_left(self) -> bool:
-        return self._send_raw(V380Commands.PTZ_LEFT)
+        return self._send_raw(LanCameraCommands.PTZ_LEFT)
 
     def ptz_right(self) -> bool:
-        return self._send_raw(V380Commands.PTZ_RIGHT)
+        return self._send_raw(LanCameraCommands.PTZ_RIGHT)
 
     def ptz_stop(self) -> bool:
-        return self._send_raw(V380Commands.PTZ_STOP)
+        return self._send_raw(LanCameraCommands.PTZ_STOP)
 
     def light_on(self) -> bool:
-        return self._send_raw(V380Commands.LIGHT_ON)
+        return self._send_raw(LanCameraCommands.LIGHT_ON)
 
     def light_off(self) -> bool:
-        return self._send_raw(V380Commands.LIGHT_OFF)
+        return self._send_raw(LanCameraCommands.LIGHT_OFF)
 
     def light_auto(self) -> bool:
-        ok1 = self._send_raw(V380Commands.LIGHT_AUTO)
+        ok1 = self._send_raw(LanCameraCommands.LIGHT_AUTO)
         time.sleep(0.03)
-        ok2 = self._send_raw(V380Commands.IMAGE_AUTO)
+        ok2 = self._send_raw(LanCameraCommands.IMAGE_AUTO)
         return ok1 or ok2
 
     def image_color(self) -> bool:
-        return self._send_raw(V380Commands.IMAGE_COLOR)
+        return self._send_raw(LanCameraCommands.IMAGE_COLOR)
 
     def image_bw(self) -> bool:
-        return self._send_raw(V380Commands.IMAGE_BW)
+        return self._send_raw(LanCameraCommands.IMAGE_BW)
 
     def image_auto(self) -> bool:
-        ok1 = self._send_raw(V380Commands.IMAGE_AUTO)
+        ok1 = self._send_raw(LanCameraCommands.IMAGE_AUTO)
         time.sleep(0.03)
-        ok2 = self._send_raw(V380Commands.LIGHT_AUTO)
+        ok2 = self._send_raw(LanCameraCommands.LIGHT_AUTO)
         return ok1 or ok2
 
     def image_flip(self) -> bool:
-        return self._send_raw(V380Commands.IMAGE_FLIP)
+        return self._send_raw(LanCameraCommands.IMAGE_FLIP)
 
     # --- Hardware PTZ Preset (PTZX) Commands ---
     def _send_ptzx_port8800(self, action: int, slot_id: int) -> bool:
@@ -1464,17 +1465,17 @@ class V380Client:
         - 100 (NV_PRESET_ACTION_ADD) to initialize an empty slot
         - 102 (NV_PRESET_ACTION_RESET, used by NVMediaPlayer.SetPTZXLocationID) to overwrite existing coordinates
         """
-        ok_add = self._send_ptzx_port8800(V380Commands.PTZX_ACTION_ADD, slot_id)
+        ok_add = self._send_ptzx_port8800(LanCameraCommands.PTZX_ACTION_ADD, slot_id)
         time.sleep(0.12)
-        ok_reset = self._send_ptzx_port8800(V380Commands.PTZX_ACTION_RESET, slot_id)
+        ok_reset = self._send_ptzx_port8800(LanCameraCommands.PTZX_ACTION_RESET, slot_id)
         return ok_add or ok_reset
 
     def ptz_preset_set(self, slot_id: int) -> bool:
         """Save current camera PTZ position into hardware preset slot (0..5)."""
         slot = max(0, min(5, int(slot_id)))
-        ok_add = self._send_raw(V380Commands.ptzx_packet(V380Commands.PTZX_ACTION_ADD, slot))
+        ok_add = self._send_raw(LanCameraCommands.ptzx_packet(LanCameraCommands.PTZX_ACTION_ADD, slot))
         time.sleep(0.04)
-        ok_reset = self._send_raw(V380Commands.ptzx_packet(V380Commands.PTZX_ACTION_RESET, slot))
+        ok_reset = self._send_raw(LanCameraCommands.ptzx_packet(LanCameraCommands.PTZX_ACTION_RESET, slot))
         threading.Thread(
             target=self._save_ptzx_port8800,
             args=(slot,),
@@ -1485,11 +1486,11 @@ class V380Client:
     def ptz_preset_goto(self, slot_id: int) -> bool:
         """Recall and auto-pan camera to hardware preset slot (0..5) via SetPTZXParam (0xAB, 103, slot)."""
         slot = max(0, min(5, int(slot_id)))
-        ok_stream = self._send_raw(V380Commands.ptzx_packet(V380Commands.PTZX_ACTION_GOTO, slot))
+        ok_stream = self._send_raw(LanCameraCommands.ptzx_packet(LanCameraCommands.PTZX_ACTION_GOTO, slot))
         if not ok_stream:
             threading.Thread(
                 target=self._send_ptzx_port8800,
-                args=(V380Commands.PTZX_ACTION_GOTO, slot),
+                args=(LanCameraCommands.PTZX_ACTION_GOTO, slot),
                 daemon=True,
             ).start()
         return ok_stream
@@ -1497,15 +1498,15 @@ class V380Client:
     def ptz_preset_clear(self, slot_id: int) -> bool:
         """Delete hardware preset slot (0..5)."""
         slot = max(0, min(5, int(slot_id)))
-        ok_stream = self._send_raw(V380Commands.ptzx_packet(V380Commands.PTZX_ACTION_DEL, slot))
+        ok_stream = self._send_raw(LanCameraCommands.ptzx_packet(LanCameraCommands.PTZX_ACTION_DEL, slot))
         threading.Thread(
             target=self._send_ptzx_port8800,
-            args=(V380Commands.PTZX_ACTION_DEL, slot),
+            args=(LanCameraCommands.PTZX_ACTION_DEL, slot),
             daemon=True,
         ).start()
         return ok_stream
 
-    # --- On-Camera microSD Card Segment Search & Playback (SDK 6.0 `361`/`362`/`363`/`364`) ---
+    # --- On-Camera microSD Card Segment Search & Playback (`361`/`362`/`363`/`364`) ---
     @staticmethod
     def _put_wall_clock(buf: bytearray, offset: int, ts_sec: int) -> None:
         dt = datetime.fromtimestamp(max(0, int(ts_sec)), timezone.utc)
@@ -1523,10 +1524,10 @@ class V380Client:
 
     def list_sd_recordings(
         self, year: int, month: int, day: int
-    ) -> Tuple[bool, str, List[V380RecordingSegment]]:
+    ) -> Tuple[bool, str, List[RecordingSegment]]:
         """
         Query the camera's microSD card for all recording segments on `(year, month, day)`
-        using the Macrovideo SDK 6.0 Segment Search protocol (`cmd 361` -> `resp 461`, `cmd 362` -> `resp 462`).
+        using the Segment Search protocol (`cmd 361` -> `resp 461`, `cmd 362` -> `resp 462`).
         """
         msg = "Connection failed"
         for attempt in range(3):
@@ -1548,7 +1549,7 @@ class V380Client:
                 res, msg = self.authenticate(skip_cloud_wake=True)
                 if res != 1:
                     break
-            segments: List[V380RecordingSegment] = []
+            segments: List[RecordingSegment] = []
             s: Optional[socket.socket] = None
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1606,7 +1607,7 @@ class V380Client:
                         st, et = struct.unpack_from("<II", blk, o + 5)
                         if sid > 0 and et >= st:
                             segments.append(
-                                V380RecordingSegment(
+                                RecordingSegment(
                                     seg_id=int(sid),
                                     raw_type=int(rtype),
                                     start_ts=int(st),
@@ -1636,10 +1637,10 @@ class V380Client:
 
     def stream_sd_segment(
         self,
-        segment: V380RecordingSegment,
+        segment: RecordingSegment,
         start_ts: Optional[int] = None,
         stop_event: Optional[threading.Event] = None,
-        on_frame: Optional[Callable[[V380Frame], None]] = None,
+        on_frame: Optional[Callable[[CameraFrame], None]] = None,
     ) -> Tuple[bool, str]:
         """
         Stream a recorded SD card segment starting at `start_ts` (`cmd 363` -> `resp 463`, `cmd 364`).
@@ -1770,7 +1771,7 @@ class V380Client:
                             codec = VideoCodec.H265 if ftype in (40, 41, 50, 51, 52, 53) else VideoCodec.H264
                             is_key = ftype in (0, 40, 50, 52)
                             cb(
-                                V380Frame(
+                                CameraFrame(
                                     is_audio=False,
                                     raw_type=ftype,
                                     payload=norm,
@@ -1794,7 +1795,7 @@ class V380Client:
                             else:
                                 acodec = "adpcm"
                             cb(
-                                V380Frame(
+                                CameraFrame(
                                     is_audio=True,
                                     raw_type=ftype,
                                     payload=bytes(fbody),

@@ -1,8 +1,8 @@
 [
   {
-    "cam_id": "v380_example01",
+    "cam_id": "cam_example01",
     "name": "Camera 01",
-    "protocol": "v380",
+    "protocol": "lan8800",
     "ip": "192.168.1.100",
     "port": 8800,
     "device_id": "12345678",

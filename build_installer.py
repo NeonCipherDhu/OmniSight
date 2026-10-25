@@ -1,9 +1,10 @@
 """
-Build script for V380 Protect Windows Application & Standalone Setup Installer.
+Build script for OmniSight Windows Application & Standalone Setup Installer.
+Unofficial client compatible with V380 cameras.
 
 Produces:
-1. `installer/V380Protect_Setup.exe` — Single-file GUI Windows Installer (bundles V380Protect, FFmpeg, and cameras.json)
-2. `installer/V380Protect_Portable.zip` — Portable ZIP archive of the standalone application
+1. `installer/OmniSight_Setup.exe` — Single-file GUI Windows Installer (bundles OmniSight, FFmpeg, and YOLOv8n)
+2. `installer/OmniSight_Portable.zip` — Portable ZIP archive of the standalone application
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import zipfile
 from pathlib import Path
 
 import imageio_ffmpeg
-from PyQt6.QtCore import QByteArray, QBuffer, QIODevice, QRectF, Qt
+from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QRectF, Qt
 from PyQt6.QtGui import QColor, QGuiApplication, QImage, QPainter, QPen
 from PyQt6.QtSvg import QSvgRenderer
 
@@ -27,11 +28,11 @@ ROOT = Path(__file__).resolve().parent
 BUILD_DIR = ROOT / "build"
 DIST_DIR = ROOT / "dist"
 INSTALLER_DIR = ROOT / "installer"
-ICO_PATH = ROOT / "v380_protect.ico"
+ICO_PATH = ROOT / "omnisight.ico"
 
 
 def generate_ico(ico_path: Path) -> None:
-    """Render a crisp multi-resolution Windows .ico file for V380 Protect."""
+    """Render a crisp multi-resolution Windows .ico file for OmniSight."""
     _app = QGuiApplication.instance() or QGuiApplication([])
     svg_xml = (
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" '
@@ -93,10 +94,9 @@ def build_app() -> Path:
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
     shutil.copy2(ff_src, ff_copy)
 
-    cams_file = ROOT / "cameras.json"
     ts = int(time.time())
-    work_dir = Path(tempfile.gettempdir()) / f"v380_app_work_{ts}"
-    dist_tmp = Path(tempfile.gettempdir()) / f"v380_app_dist_{ts}"
+    work_dir = Path(tempfile.gettempdir()) / f"omnisight_app_work_{ts}"
+    dist_tmp = Path(tempfile.gettempdir()) / f"omnisight_app_dist_{ts}"
     cmd = [
         sys.executable,
         "-m",
@@ -105,7 +105,7 @@ def build_app() -> Path:
         "--onedir",
         "--noconsole",
         "--name",
-        "V380Protect",
+        "OmniSight",
         "--workpath",
         str(work_dir),
         "--specpath",
@@ -130,18 +130,18 @@ def build_app() -> Path:
     yolo_model = ROOT / "models" / "yolov8n.onnx"
     if yolo_model.is_file():
         cmd.extend(["--add-data", f"{yolo_model};models"])
-    cmd.append(str(ROOT / "v380_app.py"))
-    print("[2/4] Building standalone V380Protect application via PyInstaller...")
+    cmd.append(str(ROOT / "omnisight_app.py"))
+    print("[2/4] Building standalone OmniSight application via PyInstaller...")
     subprocess.run(cmd, cwd=str(ROOT), check=True)
 
-    app_dist = dist_tmp / "V380Protect"
+    app_dist = dist_tmp / "OmniSight"
     return app_dist
 
 
 def create_payload_zip(app_dist: Path) -> Path:
     INSTALLER_DIR.mkdir(parents=True, exist_ok=True)
-    payload_zip = BUILD_DIR / "V380Protect_Payload.zip"
-    portable_zip = INSTALLER_DIR / "V380Protect_Portable.zip"
+    payload_zip = BUILD_DIR / "OmniSight_Payload.zip"
+    portable_zip = INSTALLER_DIR / "OmniSight_Portable.zip"
 
     print(f"[3/4] Compressing application payload -> {payload_zip} ...")
     with zipfile.ZipFile(payload_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
@@ -155,8 +155,8 @@ def create_payload_zip(app_dist: Path) -> Path:
 
 
 def build_setup_exe(payload_zip: Path) -> Path:
-    print("[4/4] Building single-file Windows installer: installer/V380Protect_Setup.exe ...")
-    work_dir = Path(tempfile.gettempdir()) / f"v380_setup_work_{int(time.time())}"
+    print("[4/4] Building single-file Windows installer: installer/OmniSight_Setup.exe ...")
+    work_dir = Path(tempfile.gettempdir()) / f"omnisight_setup_work_{int(time.time())}"
     cmd = [
         sys.executable,
         "-m",
@@ -165,7 +165,7 @@ def build_setup_exe(payload_zip: Path) -> Path:
         "--onefile",
         "--noconsole",
         "--name",
-        "V380Protect_Setup",
+        "OmniSight_Setup",
         "--workpath",
         str(work_dir),
         "--specpath",
@@ -181,14 +181,14 @@ def build_setup_exe(payload_zip: Path) -> Path:
         str(ROOT / "installer_main.py"),
     ]
     subprocess.run(cmd, cwd=str(ROOT), check=True)
-    setup_exe = INSTALLER_DIR / "V380Protect_Setup.exe"
+    setup_exe = INSTALLER_DIR / "OmniSight_Setup.exe"
     print(f"Done! Installer created at: {setup_exe}")
     return setup_exe
 
 
 def _detect_installed_dir() -> Path:
-    """Locate an existing V380Protect installation directory dynamically."""
-    env_dir = os.environ.get("V380_INSTALL_DIR", "").strip()
+    """Locate an existing installation directory dynamically."""
+    env_dir = os.environ.get("OMNISIGHT_INSTALL_DIR", "").strip()
     if env_dir:
         return Path(env_dir)
 
@@ -198,7 +198,7 @@ def _detect_installed_dir() -> Path:
 
             with winreg.OpenKey(
                 winreg.HKEY_CURRENT_USER,
-                r"Software\Microsoft\Windows\CurrentVersion\Uninstall\V380Protect",
+                r"Software\Microsoft\Windows\CurrentVersion\Uninstall\OmniSight",
             ) as key:
                 loc, _ = winreg.QueryValueEx(key, "InstallLocation")
                 if loc and Path(loc).exists():
@@ -207,12 +207,46 @@ def _detect_installed_dir() -> Path:
             pass
 
         for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
-            cand = Path(f"{letter}:\\Program Files\\V380Protect")
+            cand = Path(f"{letter}:\\Program Files\\OmniSight")
             if cand.exists():
                 return cand
 
+        for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+            pf = Path(f"{letter}:\\Program Files")
+            if not pf.is_dir():
+                continue
+            try:
+                for sub in pf.iterdir():
+                    if sub.is_dir() and (sub / "_internal").is_dir() and (sub / "cameras.json").is_file():
+                        return sub
+            except Exception:
+                continue
+
     local_app_data = os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))
-    return Path(local_app_data) / "Programs" / "V380Protect"
+    return Path(local_app_data) / "Programs" / "OmniSight"
+
+
+def _stop_running_instances(install_dir: Path | None = None) -> None:
+    exe_names = {"OmniSight.exe"}
+    if install_dir is not None:
+        exe_names.add(f"{install_dir.name}.exe")
+    for exe_name in exe_names:
+        subprocess.run(
+            ["taskkill", "/F", "/IM", exe_name, "/T"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+def _sync_legacy_exe_alias(install_dir: Path) -> None:
+    """If patching an existing installation folder with a custom folder name, sync its main executable."""
+    new_exe = install_dir / "OmniSight.exe"
+    folder_exe = install_dir / f"{install_dir.name}.exe"
+    if new_exe.is_file() and folder_exe != new_exe and folder_exe.exists():
+        try:
+            shutil.copy2(new_exe, folder_exe)
+        except Exception:
+            pass
 
 
 def patch_installed_app(
@@ -226,14 +260,9 @@ def patch_installed_app(
         return False
 
     print(f"[5/5] Patching installed application directly at: {install_dir} ...")
-    subprocess.run(
-        ["taskkill", "/F", "/IM", "V380Protect.exe"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    _stop_running_instances(install_dir)
     time.sleep(0.4)
 
-    # Test if install_dir is directly writable without elevation
     test_file = install_dir / ".write_probe"
     can_write = False
     try:
@@ -244,10 +273,9 @@ def patch_installed_app(
         can_write = False
 
     if not can_write:
-        # Grant Users Full Control on the installation folder once via elevated PowerShell script
-        ps1_path = Path(tempfile.gettempdir()) / "v380_grant_and_patch.ps1"
+        ps1_path = Path(tempfile.gettempdir()) / "omnisight_grant_and_patch.ps1"
         ps1_path.write_text(
-            f'Stop-Process -Name "V380Protect" -Force -ErrorAction SilentlyContinue\n'
+            f'Stop-Process -Name "OmniSight" -Force -ErrorAction SilentlyContinue\n'
             f'icacls "{install_dir}" /grant "*S-1-5-32-545:(OI)(CI)F" /T /C /Q\n',
             encoding="utf-8",
         )
@@ -268,6 +296,7 @@ def patch_installed_app(
                 if Path(member.filename).name.lower() in preserved_names:
                     continue
                 zf.extract(member, install_dir)
+        _sync_legacy_exe_alias(install_dir)
         print(f"      Successfully patched {install_dir} (preserved cameras.json & user data).")
         return True
     except Exception as exc:
@@ -286,11 +315,7 @@ def patch_installed_from_dir(
         return False
 
     print(f"Patching installed application directly at: {install_dir} ...")
-    subprocess.run(
-        ["taskkill", "/F", "/IM", "V380Protect.exe", "/T"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    _stop_running_instances(install_dir)
     time.sleep(0.8)
 
     preserved_names = {"cameras.json", "camera_names.json"}
@@ -306,10 +331,10 @@ def patch_installed_from_dir(
             try:
                 shutil.copy2(src_file, dst_file)
             except PermissionError:
-                # Skip locked binary dependencies (e.g. ffmpeg.exe or Qt6 DLLs) if already identical in size
                 if dst_file.exists() and dst_file.stat().st_size == src_file.stat().st_size:
                     continue
                 raise
+        _sync_legacy_exe_alias(install_dir)
         print(f"Successfully patched {install_dir} (preserved cameras.json & user data).")
         return True
     except Exception as exc:

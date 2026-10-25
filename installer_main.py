@@ -1,13 +1,13 @@
 """
-Standalone Windows Setup Installer for V380 Protect — Local NVR.
-Extracts the bundled application payload (including FFmpeg, PyQt6, OpenCV, and default cameras.json),
-creates Desktop & Start Menu shortcuts, registers with Windows Installed Apps, and launches V380 Protect.
+Standalone Windows Setup Installer for OmniSight — Local NVR.
+Unofficial client compatible with V380 cameras.
+Extracts the bundled application payload (including FFmpeg, PyQt6, OpenCV, and ONNX Runtime),
+creates Desktop & Start Menu shortcuts, registers with Windows Installed Apps, and launches OmniSight.
 """
 
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 import threading
@@ -16,7 +16,7 @@ import zipfile
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, pyqtSignal, QObject
+from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
     QApplication,
@@ -33,11 +33,11 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-APP_NAME = "V380 Protect"
-APP_EXE = "V380Protect.exe"
+APP_NAME = "OmniSight"
+APP_EXE = "OmniSight.exe"
 APP_VERSION = "1.2.0"
-APP_PUBLISHER = "V380 Protect NVR"
-UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\V380Protect"
+APP_PUBLISHER = "OmniSight Open Source NVR"
+UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\OmniSight"
 
 
 def _bundle_dir() -> Path:
@@ -46,7 +46,7 @@ def _bundle_dir() -> Path:
 
 def _default_install_dir() -> Path:
     local_app_data = os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))
-    return Path(local_app_data) / "Programs" / "V380Protect"
+    return Path(local_app_data) / "Programs" / "OmniSight"
 
 
 def _create_shortcut(target_exe: Path, shortcut_path: Path, working_dir: Path, description: str) -> None:
@@ -69,11 +69,11 @@ def _create_shortcut(target_exe: Path, shortcut_path: Path, working_dir: Path, d
 
 
 def _register_uninstaller(install_dir: Path, exe_path: Path) -> None:
-    uninstaller_bat = install_dir / "Uninstall_V380Protect.bat"
+    uninstaller_bat = install_dir / "Uninstall_OmniSight.bat"
     uninstaller_bat.write_text(
         "@echo off\r\n"
-        "echo Uninstalling V380 Protect...\r\n"
-        "taskkill /F /IM V380Protect.exe >nul 2>&1\r\n"
+        "echo Uninstalling OmniSight...\r\n"
+        f"taskkill /F /IM {APP_EXE} >nul 2>&1\r\n"
         f'del /F /Q "%USERPROFILE%\\Desktop\\{APP_NAME}.lnk" >nul 2>&1\r\n'
         f'rmdir /S /Q "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\{APP_NAME}" >nul 2>&1\r\n'
         f'reg delete "HKCU\\{UNINSTALL_KEY}" /f >nul 2>&1\r\n'
@@ -112,12 +112,12 @@ class InstallWorker(QObject):
 
     def run(self) -> None:
         try:
-            payload_zip = _bundle_dir() / "V380Protect_Payload.zip"
+            payload_zip = _bundle_dir() / "OmniSight_Payload.zip"
             if not payload_zip.is_file():
                 self.finished.emit(False, "Installer payload archive not found.", "")
                 return
 
-            self.progress.emit(5, "Stopping any running V380 Protect instances...")
+            self.progress.emit(5, "Stopping any running OmniSight instances...")
             creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
             subprocess.run(
                 ["taskkill", "/F", "/IM", APP_EXE],
@@ -145,7 +145,7 @@ class InstallWorker(QObject):
                     exe_path,
                     desktop_dir / f"{APP_NAME}.lnk",
                     self.install_dir,
-                    "V380 Protect — Local NVR Security Monitor",
+                    "OmniSight — Unofficial client compatible with V380 cameras",
                 )
 
             if self.create_start_menu:
@@ -162,14 +162,14 @@ class InstallWorker(QObject):
                     exe_path,
                     start_menu_dir / f"{APP_NAME}.lnk",
                     self.install_dir,
-                    "V380 Protect — Local NVR Security Monitor",
+                    "OmniSight — Unofficial client compatible with V380 cameras",
                 )
 
             self.progress.emit(97, "Registering application...")
             _register_uninstaller(self.install_dir, exe_path)
 
             self.progress.emit(100, "Installation complete.")
-            self.finished.emit(True, "V380 Protect has been installed successfully.", str(exe_path))
+            self.finished.emit(True, "OmniSight has been installed successfully.", str(exe_path))
         except Exception as exc:
             self.finished.emit(False, f"Installation failed: {exc}", "")
 
@@ -180,7 +180,7 @@ class InstallerWindow(QWidget):
         self.setObjectName("installerRoot")
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — Setup")
         self.setFixedSize(540, 420)
-        ico = _bundle_dir() / "v380_protect.ico"
+        ico = _bundle_dir() / "omnisight.ico"
         if ico.is_file():
             self.setWindowIcon(QIcon(str(ico)))
 
@@ -264,7 +264,8 @@ class InstallerWindow(QWidget):
         root.setSpacing(12)
 
         sub = QLabel(
-            "Install V380 Protect Local NVR with bundled FFmpeg video and audio decoding engine."
+            "Install OmniSight Local NVR (Unofficial client compatible with V380 cameras) "
+            "with bundled FFmpeg video and audio decoding engine."
         )
         sub.setWordWrap(True)
         sub.setStyleSheet("color: #a1a1aa; font-size: 12px;")
@@ -300,7 +301,7 @@ class InstallerWindow(QWidget):
         self.chk_start.setChecked(True)
         c_vbox.addWidget(self.chk_start)
 
-        self.chk_launch = QCheckBox("Launch V380 Protect when installation finishes")
+        self.chk_launch = QCheckBox("Launch OmniSight when installation finishes")
         self.chk_launch.setChecked(True)
         c_vbox.addWidget(self.chk_launch)
 
@@ -339,7 +340,7 @@ class InstallerWindow(QWidget):
     def _browse_dir(self) -> None:
         chosen = QFileDialog.getExistingDirectory(self, "Select Installation Folder", self.edt_dir.text())
         if chosen:
-            self.edt_dir.setText(str(Path(chosen) / "V380Protect"))
+            self.edt_dir.setText(str(Path(chosen) / "OmniSight"))
 
     def _start_install(self) -> None:
         if self._installed_exe:

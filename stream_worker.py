@@ -1,10 +1,11 @@
 """
-Multi-Camera Video & Audio Stream Worker for V380 Windows Studio.
+Multi-Camera Video & Audio Stream Worker for OmniSight NVR.
+Unofficial client compatible with V380 cameras.
 
 Supports three connection modes per camera:
-1. `v380` — Native V380 Port 8800 protocol (H.264 / H.265 via low-latency FFmpeg pipe + AAC / IMA-ADPCM 8kHz audio)
+1. `lan8800` — LAN Port 8800 protocol (H.264 / H.265 via low-latency FFmpeg pipe + AAC / IMA-ADPCM 8kHz audio)
 2. `rtsp` — Standard RTSP / HTTP stream (e.g. `rtsp://admin:pass@ip:554/live/ch00_1` via OpenCV/FFmpeg)
-3. `demo` — Interactive V380 Pro Camera Simulator (supports PTZ pan/tilt, IR/Night mode, image flip, audio, OSD)
+3. `demo` — Interactive Camera Simulator (supports PTZ pan/tilt, IR/Night mode, image flip, audio, OSD)
 """
 
 from __future__ import annotations
@@ -28,13 +29,13 @@ from PyQt6.QtCore import QByteArray, QIODevice, QObject, QThread, pyqtSignal
 from PyQt6.QtGui import QImage
 from PyQt6.QtMultimedia import QAudioFormat, QAudioSink, QMediaDevices
 
-from v380_protocol import (
-    V380Client,
-    V380Frame,
-    V380RecordingSegment,
+from omnisight_protocol import (
+    CameraFrame,
+    LanCameraClient,
+    RecordingSegment,
     VideoCodec,
-    decode_v380_adpcm_to_pcm16,
-    decode_v380_alaw_to_pcm16,
+    decode_adpcm_to_pcm16,
+    decode_alaw_to_pcm16,
 )
 
 
@@ -144,7 +145,7 @@ def get_gpu_capabilities() -> Dict[str, Any]:
 class CameraConfig:
     cam_id: str
     name: str
-    protocol: str = "v380"  # "v380" | "rtsp" | "demo"
+    protocol: str = "lan8800"  # "lan8800" | "rtsp" | "demo"
     ip: str = "192.168.1.100"
     port: int = 8800
     device_id: str = ""
@@ -168,6 +169,8 @@ class CameraConfig:
     def from_dict(cls, data: dict) -> "CameraConfig":
         valid_keys = {f.name for f in cls.__dataclass_fields__.values()}
         filtered = {k: v for k, v in data.items() if k in valid_keys}
+        if str(filtered.get("protocol", "")).lower() == "v380":
+            filtered["protocol"] = "lan8800"
         return cls(**filtered)
 
 
@@ -508,7 +511,7 @@ class ClassicalPersonDetector:
         _, step_bin = cv2.threshold(step_diff, 8, 255, cv2.THRESH_BINARY)
         raw_motion = cv2.bitwise_or(bg_bin, step_bin)
 
-        # Mask out V380 OSD timestamp (top-right) and REC watermark (bottom-right)
+        # Mask out OSD timestamp (top-right) and REC watermark (bottom-right)
         raw_motion[: int(mh * 0.11), int(mw * 0.64) :] = 0
         raw_motion[int(mh * 0.89) :, int(mw * 0.85) :] = 0
 
@@ -912,8 +915,8 @@ class CameraStreamWorker(QThread):
         self._hwaccel_failed: bool = False
         self._decoded_any_frame: bool = False
 
-        # Native V380 client reference for live PTZ / Light / Flip commands
-        self._v380_client: Optional[V380Client] = None
+        # LAN client reference for live PTZ / Light / Flip commands
+        self._lan_client: Optional[LanCameraClient] = None
         self._ffmpeg_proc: Optional[subprocess.Popen] = None
         self._ffmpeg_audio_proc: Optional[subprocess.Popen] = None
         self._ffmpeg_lock = threading.Lock()
@@ -955,8 +958,8 @@ class CameraStreamWorker(QThread):
     def stop_stream(self) -> None:
         self._stop_flag.set()
         self._det_event.set()
-        if self._v380_client is not None:
-            self._v380_client.stop()
+        if self._lan_client is not None:
+            self._lan_client.stop()
         self._stop_ffmpeg()
         self.stop_recording()
 
@@ -967,9 +970,9 @@ class CameraStreamWorker(QThread):
         self._seen_keyframe = False
         with self._ffmpeg_lock:
             self._stop_ffmpeg_video_unlocked()
-        if self._v380_client is not None:
-            self._v380_client.set_stream_quality(new_q)
-        elif (self.config.protocol or "v380").lower() == "demo":
+        if self._lan_client is not None:
+            self._lan_client.set_stream_quality(new_q)
+        elif (self.config.protocol or "lan8800").lower() == "demo":
             res_label = "HD 1080p" if new_q == 1 else "SD 360p"
             self.status_changed.emit(self.config.cam_id, f"Streaming ({res_label} • Port 8800 Sim)", True)
 
@@ -1015,7 +1018,7 @@ class CameraStreamWorker(QThread):
                 self._demo_tilt_vel = 0.0
             return
 
-        client = self._v380_client
+        client = self._lan_client
         if client is None:
             return
         if direction == "up":
@@ -1034,8 +1037,8 @@ class CameraStreamWorker(QThread):
         self._preset_autopan_token += 1
         if self.config.protocol == "demo":
             return (round(self._demo_pan, 2), round(self._demo_tilt, 2))
-        if self._v380_client is not None:
-            self._v380_client.ptz_preset_set(slot_id)
+        if self._lan_client is not None:
+            self._lan_client.ptz_preset_set(slot_id)
         return (0.0, 0.0)
 
     def _get_live_gray320(self) -> Optional[np.ndarray]:
@@ -1078,7 +1081,7 @@ class CameraStreamWorker(QThread):
         for _ in range(28):
             if self._stop_flag.is_set() or self._preset_autopan_token != token:
                 return
-            client = self._v380_client
+            client = self._lan_client
             if client is None:
                 return
             live = self._get_live_gray320()
@@ -1137,8 +1140,8 @@ class CameraStreamWorker(QThread):
                 self._demo_target_pan = float(demo_coords[0])
                 self._demo_target_tilt = float(demo_coords[1])
             return
-        if self._v380_client is not None:
-            self._v380_client.ptz_preset_goto(slot_id)
+        if self._lan_client is not None:
+            self._lan_client.ptz_preset_goto(slot_id)
             if thumb_path:
                 threading.Thread(
                     target=self._visual_autopan_fallback,
@@ -1148,8 +1151,8 @@ class CameraStreamWorker(QThread):
 
     def ptz_preset_clear(self, slot_id: int) -> None:
         """Clear hardware preset slot (0..5)."""
-        if self.config.protocol != "demo" and self._v380_client is not None:
-            self._v380_client.ptz_preset_clear(slot_id)
+        if self.config.protocol != "demo" and self._lan_client is not None:
+            self._lan_client.ptz_preset_clear(slot_id)
 
     def capture_preset_thumbnail(self, output_dir: Path, slot_id: int) -> Optional[str]:
         """Save a 320x180 JPEG thumbnail of the current live frame for a PTZ preset slot."""
@@ -1171,7 +1174,7 @@ class CameraStreamWorker(QThread):
         if self.config.protocol == "demo":
             self._demo_light_mode = mode
             return
-        client = self._v380_client
+        client = self._lan_client
         if client is None:
             return
         if mode == "on":
@@ -1185,7 +1188,7 @@ class CameraStreamWorker(QThread):
         if self.config.protocol == "demo":
             self._demo_image_mode = mode
             return
-        client = self._v380_client
+        client = self._lan_client
         if client is None:
             return
         if mode == "color":
@@ -1199,8 +1202,8 @@ class CameraStreamWorker(QThread):
         if self.config.protocol == "demo":
             self._demo_flipped = not self._demo_flipped
             return
-        if self._v380_client is not None:
-            self._v380_client.image_flip()
+        if self._lan_client is not None:
+            self._lan_client.image_flip()
 
     # --- Snapshot & Recording ---
     def take_snapshot(self, output_dir: Path) -> Optional[str]:
@@ -1278,13 +1281,13 @@ class CameraStreamWorker(QThread):
         det_thread.start()
 
         try:
-            proto = (self.config.protocol or "v380").lower()
+            proto = (self.config.protocol or "lan8800").lower()
             if proto == "demo":
                 self._run_demo_loop()
             elif proto == "rtsp":
                 self._run_rtsp_loop()
             else:
-                self._run_v380_loop()
+                self._run_lan_loop()
         except Exception as exc:
             self.status_changed.emit(self.config.cam_id, f"Stream Error: {exc}", False)
         finally:
@@ -1354,8 +1357,8 @@ class CameraStreamWorker(QThread):
             except Exception:
                 pass
 
-    # --- Mode 1: Native V380 Port 8800 ---
-    def _run_v380_loop(self) -> None:
+    # --- Mode 1: LAN Port 8800 Protocol ---
+    def _run_lan_loop(self) -> None:
         def on_status(msg: str) -> None:
             connected = msg.startswith("Streaming")
             if connected:
@@ -1366,7 +1369,7 @@ class CameraStreamWorker(QThread):
                 self._seen_keyframe = False
             self.status_changed.emit(self.config.cam_id, msg, connected)
 
-        def on_frame(frame: V380Frame) -> None:
+        def on_frame(frame: CameraFrame) -> None:
             if self._stop_flag.is_set():
                 return
             self._bytes_window += len(frame.payload)
@@ -1375,12 +1378,12 @@ class CameraStreamWorker(QThread):
                 if frame.audio_codec == "aac":
                     self._feed_aac_to_ffmpeg(frame.payload)
                 elif frame.audio_codec == "alaw":
-                    pcm = decode_v380_alaw_to_pcm16(frame.payload)
+                    pcm = decode_alaw_to_pcm16(frame.payload)
                     if pcm:
                         level = self._compute_pcm_level(pcm)
                         self.audio_ready.emit(self.config.cam_id, pcm, level)
                 else:
-                    pcm = decode_v380_adpcm_to_pcm16(frame.payload)
+                    pcm = decode_adpcm_to_pcm16(frame.payload)
                     if pcm:
                         level = self._compute_pcm_level(pcm)
                         self.audio_ready.emit(self.config.cam_id, pcm, level)
@@ -1401,7 +1404,7 @@ class CameraStreamWorker(QThread):
             codec = self._active_codec if self._active_codec != VideoCodec.UNKNOWN else VideoCodec.H264
             self._feed_nal_to_ffmpeg(frame.payload, codec, is_first_keyframe=is_first_kf)
 
-        self._v380_client = V380Client(
+        self._lan_client = LanCameraClient(
             ip=self.config.ip,
             port=self.config.port,
             device_id=self.config.device_id,
@@ -1412,7 +1415,7 @@ class CameraStreamWorker(QThread):
             on_frame=on_frame,
             on_status=on_status,
         )
-        self._v380_client.run_forever()
+        self._lan_client.run_forever()
 
     def _ensure_ffmpeg_started(self, codec: VideoCodec) -> None:
         with self._ffmpeg_lock:
@@ -1677,9 +1680,9 @@ class CameraStreamWorker(QThread):
                 self.status_changed.emit(self.config.cam_id, "RTSP Lost — Reconnecting...", False)
                 self._stop_flag.wait(2.0)
 
-    # --- Mode 3: Interactive V380 Pro Simulator (Demo Mode) ---
+    # --- Mode 3: Interactive Simulator (Demo Mode) ---
     def _run_demo_loop(self) -> None:
-        self.status_changed.emit(self.config.cam_id, "Connecting V380 Pro Simulator...", False)
+        self.status_changed.emit(self.config.cam_id, "Connecting Camera Simulator...", False)
         self._stop_flag.wait(0.35)
         if self._stop_flag.is_set():
             return
@@ -2014,7 +2017,7 @@ def _mark_camera_sd_closed(ip: str) -> None:
 class SDCardListWorker(QThread):
     """Background worker that queries a camera's onboard microSD card for a calendar day's recordings."""
 
-    finished_list = pyqtSignal(bool, str, list)  # (ok, summary_msg, List[V380RecordingSegment])
+    finished_list = pyqtSignal(bool, str, list)  # (ok, summary_msg, List[RecordingSegment])
 
     def __init__(
         self,
@@ -2030,7 +2033,7 @@ class SDCardListWorker(QThread):
         self.month = int(month)
         self.day = int(day)
         self._stop_flag = threading.Event()
-        self._client: Optional[V380Client] = None
+        self._client: Optional[LanCameraClient] = None
 
     def request_stop(self) -> None:
         self._stop_flag.set()
@@ -2038,14 +2041,14 @@ class SDCardListWorker(QThread):
             self._client.stop()
 
     def run(self) -> None:
-        proto = (self.config.protocol or "v380").lower()
+        proto = (self.config.protocol or "lan8800").lower()
         if proto == "demo":
             self._stop_flag.wait(0.25)
             if self._stop_flag.is_set():
                 return
             day_dt = datetime(self.year, self.month, self.day, 0, 0, 0, tzinfo=timezone.utc)
             base_ts = int(day_dt.timestamp())
-            segments: List[V380RecordingSegment] = []
+            segments: List[RecordingSegment] = []
             # Create realistic synthetic continuous + anomaly segments up to 08:30
             cur = base_ts + 3600
             seg_idx = 1
@@ -2055,7 +2058,7 @@ class SDCardListWorker(QThread):
                 rtype = 3 if is_alarm else (2 if is_motion else 1)
                 dur = 26 if rtype in (2, 3) else 600
                 segments.append(
-                    V380RecordingSegment(
+                    RecordingSegment(
                         seg_id=cur - 28800 + seg_idx,
                         raw_type=rtype,
                         start_ts=cur,
@@ -2069,7 +2072,7 @@ class SDCardListWorker(QThread):
                 self.finished_list.emit(True, f"{len(segments)} clips ({anom} anomalies • Demo SD)", segments)
             return
 
-        client = V380Client(
+        client = LanCameraClient(
             ip=self.config.ip,
             port=self.config.port,
             device_id=self.config.device_id,
@@ -2096,7 +2099,7 @@ class SDCardListWorker(QThread):
 class SDCardPlaybackWorker(QThread):
     """
     Streams and decodes either:
-    1. An on-camera microSD card `V380RecordingSegment` (via SDK 6.0 `cmd 363`/`364` + FFmpeg pipe), OR
+    1. An on-camera microSD card `RecordingSegment` (via `cmd 363`/`364` + FFmpeg pipe), OR
     2. A local `.mp4` recording file from `captures/recordings/`.
     Supports pause/resume, variable playback speed (1x, 2x, 4x, 8x, 16x), and audio output.
     """
@@ -2109,7 +2112,7 @@ class SDCardPlaybackWorker(QThread):
     def __init__(
         self,
         config: CameraConfig,
-        segment: Optional[V380RecordingSegment] = None,
+        segment: Optional[RecordingSegment] = None,
         start_ts: Optional[int] = None,
         local_file: Optional[str] = None,
         speed: float = 1.0,
@@ -2128,7 +2131,7 @@ class SDCardPlaybackWorker(QThread):
         self._rebase_clock = False
         self._current_ts: int = int(start_ts or (segment.start_ts if segment else 0))
 
-        self._v380_client: Optional[V380Client] = None
+        self._lan_client: Optional[LanCameraClient] = None
         self._ffmpeg_proc: Optional[subprocess.Popen] = None
         self._ffmpeg_reader_thread: Optional[threading.Thread] = None
         self._ffmpeg_audio_proc: Optional[subprocess.Popen] = None
@@ -2166,7 +2169,7 @@ class SDCardPlaybackWorker(QThread):
         as closing an anonymous pipe while a worker thread is blocked in ReadFile/WriteFile deadlocks CRT.
         """
         self._stop_flag.set()
-        client = self._v380_client
+        client = self._lan_client
         if client is not None:
             client.stop()
         proc = self._ffmpeg_proc
@@ -2186,7 +2189,7 @@ class SDCardPlaybackWorker(QThread):
             if self.local_file:
                 self._run_local_file_playback()
             elif self.segment is not None:
-                if (self.config.protocol or "v380").lower() == "demo":
+                if (self.config.protocol or "lan8800").lower() == "demo":
                     self._run_demo_sd_playback()
                 else:
                     self._run_sd_segment_playback()
@@ -2375,10 +2378,10 @@ class SDCardPlaybackWorker(QThread):
         ts_label = datetime.fromtimestamp(from_ts, timezone.utc).strftime("%I:%M:%S %p")
         self.status_changed.emit(f"Loading SD Card @ {ts_label}...", False)
 
-        frame_q: "queue.Queue[Optional[V380Frame]]" = queue.Queue(maxsize=650)
+        frame_q: "queue.Queue[Optional[CameraFrame]]" = queue.Queue(maxsize=650)
         stream_result: List[Tuple[bool, str]] = []
 
-        def on_sd_frame(frame: V380Frame) -> None:
+        def on_sd_frame(frame: CameraFrame) -> None:
             while not self._stop_flag.is_set():
                 try:
                     frame_q.put(frame, timeout=0.15)
@@ -2386,7 +2389,7 @@ class SDCardPlaybackWorker(QThread):
                 except queue.Full:
                     continue
 
-        client = V380Client(
+        client = LanCameraClient(
             ip=self.config.ip,
             port=self.config.port,
             device_id=self.config.device_id,
@@ -2394,7 +2397,7 @@ class SDCardPlaybackWorker(QThread):
             password=self.config.password,
             enable_audio=True,
         )
-        self._v380_client = client
+        self._lan_client = client
 
         def reader_thread_fn() -> None:
             with _get_camera_sd_lock(self.config.ip):
@@ -2475,12 +2478,12 @@ class SDCardPlaybackWorker(QThread):
             if frame.is_audio:
                 if abs(speed - 1.0) < 0.05:
                     if frame.audio_codec == "alaw":
-                        pcm = decode_v380_alaw_to_pcm16(frame.payload)
+                        pcm = decode_alaw_to_pcm16(frame.payload)
                         if pcm:
                             lvl = CameraStreamWorker._compute_pcm_level(pcm)
                             self.audio_ready.emit(pcm, lvl)
                     elif frame.audio_codec == "adpcm":
-                        pcm = decode_v380_adpcm_to_pcm16(frame.payload)
+                        pcm = decode_adpcm_to_pcm16(frame.payload)
                         if pcm:
                             lvl = CameraStreamWorker._compute_pcm_level(pcm)
                             self.audio_ready.emit(pcm, lvl)
@@ -2684,7 +2687,7 @@ class SDCardExportWorker(QThread):
     def __init__(
         self,
         config: CameraConfig,
-        segment: V380RecordingSegment,
+        segment: RecordingSegment,
         start_ts: int,
         end_ts: int,
         output_path: str,
@@ -2698,7 +2701,7 @@ class SDCardExportWorker(QThread):
         self.output_path = output_path
         self._stop_flag = threading.Event()
         self._cancelled = threading.Event()
-        self._client: Optional[V380Client] = None
+        self._client: Optional[LanCameraClient] = None
         self._ffmpeg_proc: Optional[subprocess.Popen] = None
 
     def request_stop(self) -> None:
@@ -2720,7 +2723,7 @@ class SDCardExportWorker(QThread):
         Path(self.output_path).parent.mkdir(parents=True, exist_ok=True)
         total_sec = max(1.0, float(self.end_ts - self.start_ts))
 
-        if (self.config.protocol or "v380").lower() == "demo":
+        if (self.config.protocol or "lan8800").lower() == "demo":
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             writer = cv2.VideoWriter(self.output_path, fourcc, 20.0, (960, 540))
             steps = int(min(120, total_sec * 10))
@@ -2756,7 +2759,7 @@ class SDCardExportWorker(QThread):
                 self.export_finished.emit(True, f"Saved {Path(self.output_path).name}", self.output_path)
             return
 
-        client = V380Client(
+        client = LanCameraClient(
             ip=self.config.ip,
             port=self.config.port,
             device_id=self.config.device_id,
@@ -2771,7 +2774,7 @@ class SDCardExportWorker(QThread):
         video_frames_written = 0
         reached_end = False
 
-        def on_export_frame(frame: V380Frame) -> None:
+        def on_export_frame(frame: CameraFrame) -> None:
             nonlocal ffmpeg_proc, seen_key, video_frames_written, reached_end
             if self._stop_flag.is_set() or frame.is_audio:
                 return
@@ -2880,7 +2883,7 @@ def _safe_camera_folder_name(cfg: CameraConfig) -> str:
     return clean.replace(" ", "_") or f"Cam_{cfg.device_id or cfg.cam_id}"
 
 
-def get_segment_backup_path(backup_root: Path, cfg: CameraConfig, seg: V380RecordingSegment) -> Path:
+def get_segment_backup_path(backup_root: Path, cfg: CameraConfig, seg: RecordingSegment) -> Path:
     """
     Canonical local backup `.mp4` path for an SD card recording segment:
     `captures/recordings/backups/<CameraName>/<YYYY-MM-DD>/<HH-MM-SS>_<kind>_seg<id>.mp4`
@@ -2892,7 +2895,7 @@ def get_segment_backup_path(backup_root: Path, cfg: CameraConfig, seg: V380Recor
     return backup_root / cam_dir / day_dir / fname
 
 
-def find_segment_backup_file(backup_root: Path, cfg: CameraConfig, seg: V380RecordingSegment) -> Optional[Path]:
+def find_segment_backup_file(backup_root: Path, cfg: CameraConfig, seg: RecordingSegment) -> Optional[Path]:
     """Return the local `.mp4` backup Path if `seg` has already been backed up to disk, else None."""
     target = get_segment_backup_path(backup_root, cfg, seg)
     if target.is_file() and target.stat().st_size > 512:
@@ -2905,7 +2908,7 @@ def find_segment_backup_file(backup_root: Path, cfg: CameraConfig, seg: V380Reco
     return None
 
 
-def save_segment_backup_meta(backup_root: Path, cfg: CameraConfig, segments: List[V380RecordingSegment]) -> None:
+def save_segment_backup_meta(backup_root: Path, cfg: CameraConfig, segments: List[RecordingSegment]) -> None:
     """
     Persist exact segment metadata (`seg_id`, `raw_type`, `start_ts`, `end_ts`) in
     `captures/recordings/backups/<Camera>/<YYYY-MM-DD>/segments_meta.json` so backed-up clips
@@ -2913,7 +2916,7 @@ def save_segment_backup_meta(backup_root: Path, cfg: CameraConfig, segments: Lis
     """
     import json
 
-    by_day: Dict[str, List[V380RecordingSegment]] = {}
+    by_day: Dict[str, List[RecordingSegment]] = {}
     for s in segments:
         by_day.setdefault(s.iso_date_str, []).append(s)
 
@@ -2952,9 +2955,9 @@ def save_segment_backup_meta(backup_root: Path, cfg: CameraConfig, segments: Lis
 
 def load_local_backup_segments(
     backup_root: Path, cfg: CameraConfig, year: int, month: int, day: int
-) -> List[V380RecordingSegment]:
+) -> List[RecordingSegment]:
     """
-    Reconstruct `V380RecordingSegment` items for all backed-up `.mp4` files on `(year, month, day)`
+    Reconstruct `RecordingSegment` items for all backed-up `.mp4` files on `(year, month, day)`
     in `captures/recordings/backups/<Camera>/<YYYY-MM-DD>/`.
     Used by the On-Camera SD Card view so local backups are always previewed alongside SD card clips
     every time the app starts (even before the camera responds or if the SD card overwrites old clips).
@@ -2978,7 +2981,7 @@ def load_local_backup_segments(
             pass
 
     pat = re.compile(r"^(\d{2})-(\d{2})-(\d{2})_([a-zA-Z]+)_seg(\d+)\.mp4$", re.IGNORECASE)
-    results: List[V380RecordingSegment] = []
+    results: List[RecordingSegment] = []
     meta_dirty = False
 
     for mp4_file in sorted(day_folder.glob("*_seg*.mp4")):
@@ -2998,7 +3001,7 @@ def load_local_backup_segments(
         cached = meta_map.get(str(seg_id))
         if isinstance(cached, dict) and "start_ts" in cached and "end_ts" in cached:
             results.append(
-                V380RecordingSegment(
+                RecordingSegment(
                     seg_id=int(cached.get("seg_id", seg_id)),
                     raw_type=int(cached.get("raw_type", 3 if kind_str == "alarm" else (2 if kind_str == "motion" else 1))),
                     start_ts=int(cached["start_ts"]),
@@ -3021,7 +3024,7 @@ def load_local_backup_segments(
         except Exception:
             pass
         end_ts = start_ts + dur_sec
-        seg = V380RecordingSegment(seg_id=seg_id, raw_type=raw_type, start_ts=start_ts, end_ts=end_ts)
+        seg = RecordingSegment(seg_id=seg_id, raw_type=raw_type, start_ts=start_ts, end_ts=end_ts)
         results.append(seg)
         meta_map[str(seg_id)] = {
             "seg_id": seg_id,
@@ -3060,7 +3063,7 @@ class SDCardBulkBackupWorker(QThread):
         event_filter: str,
         backup_root: Path,
         skip_existing: bool = True,
-        segments_override: Optional[List[V380RecordingSegment]] = None,
+        segments_override: Optional[List[RecordingSegment]] = None,
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
@@ -3087,7 +3090,7 @@ class SDCardBulkBackupWorker(QThread):
         cam_folder.mkdir(parents=True, exist_ok=True)
 
         # 1. Gather candidate segments across the date range (or use override list)
-        candidates: List[V380RecordingSegment] = []
+        candidates: List[RecordingSegment] = []
         if self.segments_override is not None:
             candidates = list(self.segments_override)
         else:
@@ -3100,14 +3103,14 @@ class SDCardBulkBackupWorker(QThread):
                 self.status_updated.emit(
                     f"Scanning SD card ({cur_dt.strftime('%b %d, %Y')})...", 0, 0, 0
                 )
-                if (self.config.protocol or "v380").lower() == "demo":
+                if (self.config.protocol or "lan8800").lower() == "demo":
                     lw = SDCardListWorker(self.config, cur_dt.year, cur_dt.month, cur_dt.day)
-                    res_list: List[V380RecordingSegment] = []
+                    res_list: List[RecordingSegment] = []
                     lw.finished_list.connect(lambda ok, m, segs: res_list.extend(segs))
                     lw.run()
                     candidates.extend(res_list)
                 else:
-                    client = V380Client(
+                    client = LanCameraClient(
                         ip=self.config.ip,
                         port=self.config.port,
                         device_id=self.config.device_id,
@@ -3120,7 +3123,7 @@ class SDCardBulkBackupWorker(QThread):
                 cur_dt += timedelta(days=1)
 
             # Filter by time range overlap and event type
-            filtered: List[V380RecordingSegment] = []
+            filtered: List[RecordingSegment] = []
             for seg in candidates:
                 if seg.end_ts < self.start_ts or seg.start_ts > self.end_ts:
                     continue

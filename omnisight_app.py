@@ -1,11 +1,12 @@
 """
-V380 Protect — Minimalist NVR / VMS Desktop Client for Windows.
+OmniSight — Minimalist NVR / VMS Desktop Client for Windows.
+Unofficial client compatible with V380 cameras.
 
 Design System:
 - Inspired by Ubiquiti UniFi Protect & Frigate NVR (Zinc/Obsidian dark palette, zero emojis)
 - Built-in Lucide 24x24 vector SVG icon renderer (HiDPI-aware via PyQt6.QtSvg)
 - Video-first edge-to-edge camera grid with collapsible PTZ & device inspector drawer
-- Persistent camera configuration & custom name registry (cameras.json + %APPDATA%\\V380Studio)
+- Persistent camera configuration & custom name registry (cameras.json + camera_names.json)
 """
 
 from __future__ import annotations
@@ -102,10 +103,10 @@ from stream_worker import (
     load_local_backup_segments,
     save_segment_backup_meta,
 )
-from v380_protocol import (
+from omnisight_protocol import (
     DiscoveredCamera,
-    V380Discovery,
-    V380RecordingSegment,
+    LanCameraDiscovery,
+    RecordingSegment,
     get_local_ipv4_addresses,
 )
 
@@ -668,7 +669,7 @@ class DiscoveryWorker(QThread):
         self.scan_tcp = scan_tcp
 
     def run(self) -> None:
-        cams = V380Discovery.discover(
+        cams = LanCameraDiscovery.discover(
             timeout_sec=2.0,
             scan_tcp_8800=self.scan_tcp,
             progress_cb=lambda msg: self.progress.emit(msg),
@@ -677,7 +678,7 @@ class DiscoveryWorker(QThread):
 
 
 class DiscoveryDialog(QDialog):
-    """Modal dialog to scan the local network for V380 cameras on UDP 10008 and TCP 8800."""
+    """Modal dialog to scan the local network for compatible cameras on UDP 10008 and TCP 8800."""
 
     def __init__(
         self,
@@ -685,7 +686,7 @@ class DiscoveryDialog(QDialog):
         existing_cameras: Optional[List[CameraConfig]] = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Network Discovery — V380 Port 8800 & UDP 10008")
+        self.setWindowTitle("Network Discovery — Port 8800 & UDP 10008 (Compatible with V380 Cameras)")
         self.resize(740, 420)
         self.selected_camera: Optional[DiscoveredCamera] = None
         self._all_discovered: List[DiscoveredCamera] = []
@@ -831,7 +832,7 @@ class DiscoveryDialog(QDialog):
 
         total = len(self._all_discovered)
         if total == 0:
-            self.status_lbl.setText("No V380 cameras responded on the network. Enter IP and Device ID manually.")
+            self.status_lbl.setText("No compatible cameras responded on the network. Enter IP and Device ID manually.")
         elif new_count > 0:
             self.status_lbl.setText(
                 f"Discovered {total} camera(s): {new_count} new camera(s) ready to add, {added_count} already added."
@@ -845,7 +846,7 @@ class DiscoveryDialog(QDialog):
                 )
             else:
                 self.status_lbl.setText(
-                    f"Discovered {total} camera(s) on network — all {added_count} are already added to V380 Protect."
+                    f"Discovered {total} camera(s) on network — all {added_count} are already added to OmniSight."
                 )
                 self.table.selectRow(0)
 
@@ -879,11 +880,12 @@ class CameraConfigDialog(QDialog):
         form.addRow("Camera Name", self.edt_name)
 
         self.cmb_proto = QComboBox()
-        self.cmb_proto.addItem("V380 Native Protocol (TCP 8800)", "v380")
+        self.cmb_proto.addItem("LAN Protocol TCP 8800 (Compatible with V380 cameras)", "lan8800")
         self.cmb_proto.addItem("RTSP / ONVIF Stream (TCP 554)", "rtsp")
         self.cmb_proto.addItem("Synthetic Test Pattern (Simulator)", "demo")
         if config:
-            idx = self.cmb_proto.findData(config.protocol)
+            norm_proto = "lan8800" if config.protocol in ("lan8800", "v380") else config.protocol
+            idx = self.cmb_proto.findData(norm_proto)
             if idx >= 0:
                 self.cmb_proto.setCurrentIndex(idx)
         self.cmb_proto.currentIndexChanged.connect(self._update_field_states)
@@ -974,8 +976,8 @@ class CameraConfigDialog(QDialog):
 
         self.edt_ip.setEnabled(not is_demo)
         self.btn_scan.setEnabled(not is_demo)
-        self.spn_port.setEnabled(proto == "v380")
-        self.edt_dev_id.setEnabled(proto == "v380")
+        self.spn_port.setEnabled(proto in ("lan8800", "v380"))
+        self.edt_dev_id.setEnabled(proto in ("lan8800", "v380"))
         self.edt_user.setEnabled(not is_demo)
         self.edt_pass.setEnabled(not is_demo)
         self.edt_rtsp.setEnabled(is_rtsp)
@@ -2003,12 +2005,12 @@ class CameraTileWidget(QFrame):
             self.delete_requested.emit(self.config.cam_id)
 
     def _protocol_badge(self) -> str:
-        p = (self.config.protocol or "v380").lower()
+        p = (self.config.protocol or "lan8800").lower()
         if p == "demo":
             return "SIM"
         if p == "rtsp":
             return "RTSP"
-        return "V380"
+        return "LAN"
 
     def set_selected(self, selected: bool) -> None:
         self._is_selected = selected
@@ -2106,7 +2108,7 @@ class CameraTileWidget(QFrame):
         drag_pix = QPixmap.fromImage(ghost_img)
 
         mime = QMimeData()
-        mime.setData("application/x-v380-camera-id", self.config.cam_id.encode("utf-8"))
+        mime.setData("application/x-omnisight-camera-id", self.config.cam_id.encode("utf-8"))
 
         drag = QDrag(self)
         drag.setMimeData(mime)
@@ -2140,8 +2142,8 @@ class CameraTileWidget(QFrame):
         if self._is_maximized or self._monitor_mode:
             event.ignore()
             return
-        if event.mimeData().hasFormat("application/x-v380-camera-id"):
-            src_id = bytes(event.mimeData().data("application/x-v380-camera-id")).decode("utf-8")
+        if event.mimeData().hasFormat("application/x-omnisight-camera-id"):
+            src_id = bytes(event.mimeData().data("application/x-omnisight-camera-id")).decode("utf-8")
             if src_id != self.config.cam_id:
                 self.set_drop_target_state(True)
                 event.acceptProposedAction()
@@ -2149,8 +2151,8 @@ class CameraTileWidget(QFrame):
         event.ignore()
 
     def dragMoveEvent(self, event: QDragMoveEvent) -> None:
-        if event.mimeData().hasFormat("application/x-v380-camera-id"):
-            src_id = bytes(event.mimeData().data("application/x-v380-camera-id")).decode("utf-8")
+        if event.mimeData().hasFormat("application/x-omnisight-camera-id"):
+            src_id = bytes(event.mimeData().data("application/x-omnisight-camera-id")).decode("utf-8")
             if src_id != self.config.cam_id:
                 event.acceptProposedAction()
                 return
@@ -2162,8 +2164,8 @@ class CameraTileWidget(QFrame):
 
     def dropEvent(self, event: QDropEvent) -> None:
         self.set_drop_target_state(False)
-        if event.mimeData().hasFormat("application/x-v380-camera-id"):
-            src_id = bytes(event.mimeData().data("application/x-v380-camera-id")).decode("utf-8")
+        if event.mimeData().hasFormat("application/x-omnisight-camera-id"):
+            src_id = bytes(event.mimeData().data("application/x-omnisight-camera-id")).decode("utf-8")
             if src_id != self.config.cam_id:
                 event.acceptProposedAction()
                 self.reorder_requested.emit(src_id, self.config.cam_id)
@@ -2787,7 +2789,7 @@ class DayTimelineWidget(QWidget):
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._day_start_ts: int = 0
-        self._segments: List[V380RecordingSegment] = []
+        self._segments: List[RecordingSegment] = []
         self._backed_up_ids: set = set()
         self._playhead_ts: int = 0
         self._hover_ts: Optional[int] = None
@@ -2803,7 +2805,7 @@ class DayTimelineWidget(QWidget):
     def set_day_and_segments(
         self,
         day_start_ts: int,
-        segments: List[V380RecordingSegment],
+        segments: List[RecordingSegment],
         backed_up_ids: Optional[set] = None,
     ) -> None:
         day_changed = (int(day_start_ts) != self._day_start_ts)
@@ -3438,7 +3440,7 @@ class FootageReviewWorkspace(QWidget):
     - Local PC Captures (`captures/recordings/*.mp4` and `captures/snapshots/*.jpg`)
     """
 
-    def __init__(self, main_win: "V380MainWindow", parent: Optional[QWidget] = None) -> None:
+    def __init__(self, main_win: "OmniSightMainWindow", parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.main_win = main_win
         self.cameras: List[CameraConfig] = []
@@ -3447,10 +3449,10 @@ class FootageReviewWorkspace(QWidget):
         self.event_filter: str = "all"    # "all" | "anomaly" | "normal"
         self.sort_newest_first: bool = True  # True = New -> Old, False = Old -> New
 
-        self.all_segments: List[V380RecordingSegment] = []
-        self.filtered_segments: List[V380RecordingSegment] = []
+        self.all_segments: List[RecordingSegment] = []
+        self.filtered_segments: List[RecordingSegment] = []
         self.local_files: List[Path] = []
-        self.current_segment: Optional[V380RecordingSegment] = None
+        self.current_segment: Optional[RecordingSegment] = None
         self.current_local_file: Optional[Path] = None
 
         self.list_worker: Optional[SDCardListWorker] = None
@@ -3458,7 +3460,7 @@ class FootageReviewWorkspace(QWidget):
         self.export_worker: Optional[SDCardExportWorker] = None
         self.bulk_worker: Optional[SDCardBulkBackupWorker] = None
         self._retiring_workers: List[QThread] = []
-        self._pending_sd_play: Optional[Tuple[CameraConfig, V380RecordingSegment, int]] = None
+        self._pending_sd_play: Optional[Tuple[CameraConfig, RecordingSegment, int]] = None
         self._sd_play_timer = QTimer(self)
         self._sd_play_timer.setSingleShot(True)
         self._sd_play_timer.timeout.connect(self._start_pending_sd_play)
@@ -4123,7 +4125,7 @@ class FootageReviewWorkspace(QWidget):
         self.list_worker.finished_list.connect(self._on_sd_list_finished)
         self.list_worker.start()
 
-    def _compute_backed_up_ids(self, segments: List[V380RecordingSegment]) -> set:
+    def _compute_backed_up_ids(self, segments: List[RecordingSegment]) -> set:
         cfg = self._active_config()
         if cfg is None:
             return set()
@@ -4144,7 +4146,7 @@ class FootageReviewWorkspace(QWidget):
 
         # Merge live SD card segments with local backup segments so backed-up clips are ALWAYS
         # previewed in the On-Camera SD Card list (even if camera is offline or overwrote old clips)
-        merged_by_id: Dict[int, V380RecordingSegment] = {s.seg_id: s for s in local_bk_segs}
+        merged_by_id: Dict[int, RecordingSegment] = {s.seg_id: s for s in local_bk_segs}
         for s in segments:
             merged_by_id[s.seg_id] = s
 
@@ -4182,7 +4184,7 @@ class FootageReviewWorkspace(QWidget):
             )
 
     @staticmethod
-    def _apply_segment_item_appearance(item: QListWidgetItem, seg: V380RecordingSegment, has_backup: bool) -> None:
+    def _apply_segment_item_appearance(item: QListWidgetItem, seg: RecordingSegment, has_backup: bool) -> None:
         if seg.raw_type == 3:
             ev_ico, ev_col, fg = "alert_triangle", "#ef4444", "#fca5a5"
         elif seg.raw_type == 2:
@@ -4263,19 +4265,19 @@ class FootageReviewWorkspace(QWidget):
     # --- Playback Controls (Auto-Plays Local Backup When Available!) ---
     def _on_clip_item_clicked(self, item: QListWidgetItem) -> None:
         data = item.data(Qt.ItemDataRole.UserRole)
-        if self.source_mode == "sdcard" and isinstance(data, V380RecordingSegment):
+        if self.source_mode == "sdcard" and isinstance(data, RecordingSegment):
             self.play_sd_segment(data, start_ts=data.start_ts)
         elif self.source_mode == "local" and isinstance(data, str):
             self.play_local_capture(Path(data))
 
-    def _select_clip_in_list(self, segment: V380RecordingSegment) -> None:
+    def _select_clip_in_list(self, segment: RecordingSegment) -> None:
         """Select and scroll to `segment` in `self.clip_list` (switching filter to All if hidden)."""
         found_item: Optional[QListWidgetItem] = None
         for i in range(self.clip_list.count()):
             it = self.clip_list.item(i)
             if it is not None:
                 data = it.data(Qt.ItemDataRole.UserRole)
-                if isinstance(data, V380RecordingSegment) and data.seg_id == segment.seg_id:
+                if isinstance(data, RecordingSegment) and data.seg_id == segment.seg_id:
                     found_item = it
                     break
 
@@ -4285,7 +4287,7 @@ class FootageReviewWorkspace(QWidget):
                 it = self.clip_list.item(i)
                 if it is not None:
                     data = it.data(Qt.ItemDataRole.UserRole)
-                    if isinstance(data, V380RecordingSegment) and data.seg_id == segment.seg_id:
+                    if isinstance(data, RecordingSegment) and data.seg_id == segment.seg_id:
                         found_item = it
                         break
 
@@ -4297,7 +4299,7 @@ class FootageReviewWorkspace(QWidget):
 
     def play_sd_segment(
         self,
-        segment: V380RecordingSegment,
+        segment: RecordingSegment,
         start_ts: Optional[int] = None,
         force_sd_stream: bool = False,
     ) -> None:
@@ -4659,7 +4661,7 @@ class FootageReviewWorkspace(QWidget):
             if it is None:
                 continue
             seg = it.data(Qt.ItemDataRole.UserRole)
-            if isinstance(seg, V380RecordingSegment) and seg.seg_id == seg_id:
+            if isinstance(seg, RecordingSegment) and seg.seg_id == seg_id:
                 self._apply_segment_item_appearance(it, seg, has_backup=True)
         if self.current_segment is not None and self.current_segment.seg_id == seg_id:
             self.lbl_backup_badge.setVisible(True)
@@ -4675,7 +4677,7 @@ class FootageReviewWorkspace(QWidget):
         data = item.data(Qt.ItemDataRole.UserRole)
         menu = QMenu(self)
 
-        if self.source_mode == "sdcard" and isinstance(data, V380RecordingSegment):
+        if self.source_mode == "sdcard" and isinstance(data, RecordingSegment):
             cfg = self._active_config()
             existing_bk = find_segment_backup_file(BACKUP_DIR, cfg, data) if cfg else None
             act_play = menu.addAction(
@@ -4713,7 +4715,7 @@ class FootageReviewWorkspace(QWidget):
             elif chosen == act_open:
                 self.main_win._open_folder(fp.parent)
 
-    def backup_single_segment(self, seg: V380RecordingSegment) -> None:
+    def backup_single_segment(self, seg: RecordingSegment) -> None:
         cfg = self._active_config()
         if cfg is None:
             return
@@ -4983,12 +4985,12 @@ class FootageReviewWorkspace(QWidget):
 # ---------------------------------------------------------------------------
 # Main Video-First NVR Window
 # ---------------------------------------------------------------------------
-class V380MainWindow(QMainWindow):
+class OmniSightMainWindow(QMainWindow):
     """UniFi Protect / Frigate NVR style video-first multi-camera client."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("V380 Protect — Local NVR")
+        self.setWindowTitle("OmniSight — Unofficial Client Compatible with V380 Cameras")
         self.resize(1440, 860)
         self.setStyleSheet(NVR_STYLESHEET)
         self.setWindowIcon(lucide_icon("cctv", "#3b82f6", 24))
@@ -5067,7 +5069,7 @@ class V380MainWindow(QMainWindow):
         btn_discover = QPushButton("Discover")
         btn_discover.setIcon(lucide_icon("radar", "#e4e4e7", 14))
         btn_discover.setFixedHeight(28)
-        btn_discover.setToolTip("Scan LAN for V380 Cameras (UDP 10008 / TCP 8800)")
+        btn_discover.setToolTip("Scan LAN for Compatible Cameras (UDP 10008 / TCP 8800)")
         btn_discover.clicked.connect(self.discover_cameras_dialog)
         hb.addWidget(btn_discover)
 
@@ -5998,7 +6000,7 @@ class V380MainWindow(QMainWindow):
             preset = CameraConfig(
                 cam_id=uuid.uuid4().hex[:8],
                 name=found.name or "Camera",
-                protocol="v380",
+                protocol="lan8800",
                 ip=found.ip,
                 port=found.port,
                 device_id=found.dev_id,
@@ -6053,7 +6055,7 @@ class V380MainWindow(QMainWindow):
         ans = QMessageBox.question(
             self,
             "Remove Camera",
-            f"Remove '{cfg.name}' from V380 Protect?",
+            f"Remove '{cfg.name}' from OmniSight?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if ans != QMessageBox.StandardButton.Yes:
@@ -6425,8 +6427,8 @@ class V380MainWindow(QMainWindow):
 
 def main() -> None:
     app = QApplication(sys.argv)
-    app.setApplicationName("V380 Protect")
-    win = V380MainWindow()
+    app.setApplicationName("OmniSight")
+    win = OmniSightMainWindow()
     win.show()
     sys.exit(app.exec())
 
