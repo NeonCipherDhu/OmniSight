@@ -316,6 +316,26 @@ LUCIDE_PATHS: Dict[str, str] = {
         '<line x1="10" x2="10.01" y1="16" y2="16"/>'
     ),
     "clock": '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
+    "wifi": (
+        '<path d="M12 20h.01"/>'
+        '<path d="M2 8.82a15 15 0 0 1 20 0"/>'
+        '<path d="M5 12.859a10 10 0 0 1 14 0"/>'
+        '<path d="M8.5 16.429a5 5 0 0 1 7 0"/>'
+    ),
+    "wifi_off": (
+        '<line x1="2" x2="22" y1="2" y2="22"/>'
+        '<path d="M8.5 16.429a5 5 0 0 1 7 0"/>'
+        '<path d="M5 12.859a10 10 0 0 1 5.17-2.69"/>'
+        '<path d="M19 12.859a10 10 0 0 0-2.007-1.523"/>'
+        '<path d="M2 8.82a15 15 0 0 1 4.177-2.643"/>'
+        '<path d="M22 8.82a15 15 0 0 0-11.288-3.764"/>'
+        '<path d="M12 20h.01"/>'
+    ),
+    "shield_alert": (
+        '<path fill="#ef4444" fill-opacity="0.22" d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/>'
+        '<path d="M12 8v4"/>'
+        '<path d="M12 16h.01"/>'
+    ),
 }
 
 _ICON_CACHE: Dict[str, QIcon] = {}
@@ -1158,11 +1178,16 @@ class VideoCanvas(QWidget):
     clicked = pyqtSignal()
     double_clicked = pyqtSignal()
     drag_requested = pyqtSignal()
+    reconnect_requested = pyqtSignal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setMinimumSize(240, 150)
         self._qimage: Optional[QImage] = None
+        self._last_frame: Optional[QImage] = None
+        self._blurred_last_frame: Optional[QImage] = None
+        self._show_reconnect_overlay: bool = False
+        self._has_disconnected: bool = False
         self._status_text: str = "Standby"
         self._is_connected: bool = False
         self._download_progress: Optional[int] = None
@@ -1196,6 +1221,142 @@ class VideoCanvas(QWidget):
         self._toast = CanvasToast(self)
         self._toast.hide()
 
+        # Reconnect button overlay for disconnected camera state
+        self.btn_reconnect = QPushButton("  Reconnect", self)
+        self.btn_reconnect.setIcon(lucide_icon("refresh", "#ffffff", 14))
+        self.btn_reconnect.setIconSize(QSize(14, 14))
+        self.btn_reconnect.setFixedSize(134, 34)
+        self.btn_reconnect.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_reconnect.setToolTip("Reconnect to camera live stream")
+        self.btn_reconnect.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(37, 99, 235, 0.92);
+                border: 1px solid #60a5fa;
+                border-radius: 17px;
+                color: #ffffff;
+                font-family: "Segoe UI", sans-serif;
+                font-size: 12px;
+                font-weight: 600;
+                padding: 0 14px;
+            }
+            QPushButton:hover {
+                background-color: #3b82f6;
+                border-color: #93c5fd;
+                color: #ffffff;
+            }
+            QPushButton:pressed {
+                background-color: #1d4ed8;
+            }
+        """)
+        self.btn_reconnect.hide()
+        self.btn_reconnect.clicked.connect(self.reconnect_requested.emit)
+
+    def set_reconnect_overlay_enabled(self, enabled: bool) -> None:
+        self._show_reconnect_overlay = bool(enabled)
+        self._sync_reconnect_button()
+
+    def set_last_frame(self, image: Optional[QImage]) -> None:
+        if image is not None and not image.isNull():
+            self._last_frame = image.copy()
+            self._blurred_last_frame = None
+            self.update()
+
+    def _get_blurred_last_frame(self) -> Optional[QImage]:
+        if self._last_frame is None or self._last_frame.isNull():
+            return None
+        if self._blurred_last_frame is not None and not self._blurred_last_frame.isNull():
+            return self._blurred_last_frame
+        try:
+            import cv2
+            import numpy as np
+
+            small = self._last_frame.scaled(
+                320,
+                180,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            ).convertToFormat(QImage.Format.Format_RGB888)
+            w, h = small.width(), small.height()
+            bpl = small.bytesPerLine()
+            ptr = small.bits()
+            ptr.setsize(h * bpl)
+            arr = np.frombuffer(ptr, dtype=np.uint8).reshape((h, bpl))[:, : w * 3].reshape((h, w, 3)).copy()
+            blurred = cv2.GaussianBlur(arr, (35, 35), 11.0)
+            blurred = cv2.GaussianBlur(blurred, (25, 25), 7.0)
+            blurred = (blurred.astype(np.float32) * 0.62).astype(np.uint8)
+            self._blurred_last_frame = QImage(
+                blurred.data, w, h, w * 3, QImage.Format.Format_RGB888
+            ).copy()
+            return self._blurred_last_frame
+        except Exception:
+            tiny = self._last_frame.scaled(
+                48,
+                27,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self._blurred_last_frame = tiny.scaled(
+                320,
+                180,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            return self._blurred_last_frame
+
+    def _reposition_reconnect_button(self) -> None:
+        if hasattr(self, "btn_reconnect"):
+            r = self.rect()
+            bx = (r.width() - self.btn_reconnect.width()) // 2
+            by = r.center().y() + 8
+            self.btn_reconnect.move(max(4, bx), max(4, by))
+
+    def _is_disconnected_state(self) -> bool:
+        if self._is_connected or (self._qimage is not None and not self._qimage.isNull()):
+            return False
+        st = (self._status_text or "").lower()
+        is_downloading = (
+            self._download_progress is not None
+            or any(w in st for w in ("downloading", "backing up", "exporting"))
+        )
+        if is_downloading:
+            return False
+        is_disc_word = any(
+            w in st
+            for w in (
+                "stopped",
+                "standby",
+                "offline",
+                "idle",
+                "disconnected",
+                "error",
+                "failed",
+                "invalid",
+                "lost",
+                "cannot connect",
+                "retrying",
+                "reconnecting",
+            )
+        )
+        return is_disc_word or self._has_disconnected
+
+    def _sync_reconnect_button(self) -> None:
+        if not hasattr(self, "btn_reconnect"):
+            return
+        should_show = self._show_reconnect_overlay and self._is_disconnected_state()
+        if should_show:
+            self._reposition_reconnect_button()
+            if not self.btn_reconnect.isVisible():
+                self.btn_reconnect.show()
+                self.btn_reconnect.raise_()
+        else:
+            if self.btn_reconnect.isVisible():
+                self.btn_reconnect.hide()
+
+    def notify_manual_connect_started(self) -> None:
+        self._has_disconnected = False
+        self._sync_reconnect_button()
+        self.update()
+
     def set_camera_info(self, name: str, endpoint: str) -> None:
         self._cam_name = name
         self._cam_endpoint = endpoint
@@ -1222,8 +1383,14 @@ class VideoCanvas(QWidget):
 
     def set_frame(self, image: QImage) -> None:
         self._qimage = image
+        self._is_connected = True
+        self._has_disconnected = False
+        if image is not None and not image.isNull():
+            self._last_frame = image
+            self._blurred_last_frame = None
         if self._anim_timer.isActive():
             self._anim_timer.stop()
+        self._sync_reconnect_button()
         self.update()
 
     def set_status(self, text: str, connected: bool) -> None:
@@ -1235,10 +1402,31 @@ class VideoCanvas(QWidget):
         if not connected:
             self._qimage = None
             self.set_detections([])
+            if any(
+                w in low
+                for w in (
+                    "stopped",
+                    "standby",
+                    "offline",
+                    "idle",
+                    "disconnected",
+                    "error",
+                    "failed",
+                    "invalid",
+                    "lost",
+                    "cannot connect",
+                    "retrying",
+                    "reconnecting",
+                )
+            ):
+                self._has_disconnected = True
             if not self._anim_timer.isActive():
                 self._anim_timer.start()
-        elif self._anim_timer.isActive():
-            self._anim_timer.stop()
+        else:
+            self._has_disconnected = False
+            if self._anim_timer.isActive():
+                self._anim_timer.stop()
+        self._sync_reconnect_button()
         self.update()
 
     def set_download_progress(self, pct: Optional[int]) -> None:
@@ -1274,6 +1462,7 @@ class VideoCanvas(QWidget):
         super().resizeEvent(event)
         if hasattr(self, "_toast") and self._toast.isVisible():
             self._toast._reposition()
+        self._reposition_reconnect_button()
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         delta = event.angleDelta().y()
@@ -1421,6 +1610,24 @@ class VideoCanvas(QWidget):
                     painter.setFont(QFont("Cascadia Mono", 9, QFont.Weight.DemiBold))
                     painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, f"{self._zoom:.1f}x")
         else:
+            # 0. Draw blurred last frame of footage if available
+            blurred_img = self._get_blurred_last_frame()
+            if blurred_img is not None and not blurred_img.isNull():
+                bw = blurred_img.width()
+                bh = blurred_img.height()
+                if bw > 0 and bh > 0:
+                    b_scale = min(rect.width() / bw, rect.height() / bh)
+                    b_draw_w = int(bw * b_scale)
+                    b_draw_h = int(bh * b_scale)
+                    b_target = QRect(
+                        rect.center().x() - b_draw_w // 2,
+                        rect.center().y() - b_draw_h // 2,
+                        b_draw_w,
+                        b_draw_h,
+                    )
+                    painter.drawImage(b_target, blurred_img)
+                    painter.fillRect(b_target, QColor(5, 5, 8, 110))
+
             # 1. Subtle camera viewport framing reticles (Corner L-brackets)
             p_pen = QPen(QColor("#1e1e24"), 1.5)
             painter.setPen(p_pen)
@@ -1441,7 +1648,10 @@ class VideoCanvas(QWidget):
             cy = rect.center().y() - 14
 
             st = (self._status_text or "").lower()
-            is_error = any(w in st for w in ("error", "failed", "invalid", "lost"))
+            is_error = any(
+                w in st
+                for w in ("error", "failed", "invalid", "lost", "cannot connect", "retrying", "reconnecting")
+            )
             is_downloading = (
                 self._download_progress is not None
                 or any(w in st for w in ("downloading", "backing up", "exporting"))
@@ -1463,8 +1673,18 @@ class VideoCanvas(QWidget):
                 and not is_error
                 and not is_downloading
             )
-            is_stopped = any(w in st for w in ("stopped", "standby", "offline", "idle")) and not is_error
-            is_connecting = not is_stopped and not is_error and not is_downloading and not is_review_idle
+            is_stopped = (
+                any(w in st for w in ("stopped", "standby", "offline", "idle", "disconnected"))
+                and not is_error
+            )
+            is_disconnected_tile = self._show_reconnect_overlay and self._is_disconnected_state()
+            is_connecting = (
+                not is_stopped
+                and not is_error
+                and not is_downloading
+                and not is_review_idle
+                and not is_disconnected_tile
+            )
 
             if is_downloading:
                 import math
@@ -1682,6 +1902,33 @@ class VideoCanvas(QWidget):
                 painter.setFont(QFont("Cascadia Mono", 8))
                 painter.drawText(QRect(rect.left() + 20, cy + 68, rect.width() - 40, 20), Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, sub_text)
 
+            elif is_disconnected_tile:
+                # Disconnected camera state: blurred last frame background + wifi_off badge + Reconnect button overlay
+                self._sync_reconnect_button()
+                icon_cy = rect.center().y() - 34
+                painter.setPen(QPen(QColor(82, 82, 91, 165), 1.2))
+                painter.setBrush(QColor(18, 18, 24, 215))
+                painter.drawEllipse(QPoint(cx, icon_cy), 20, 20)
+                wifi_off_px = lucide_pixmap("wifi_off", color="#a1a1aa", size=18, stroke_width=2.0)
+                painter.drawPixmap(cx - 9, icon_cy - 9, wifi_off_px)
+
+                import re
+                raw_err = (self._status_text or "").strip()
+                cleaned_err = re.sub(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?\b', '', raw_err)
+                cleaned_err = re.sub(r'\s*—\s*retrying.*$', '', cleaned_err, flags=re.I)
+                cleaned_err = re.sub(r'\s+\b(for|to|at)\b\s*$', '', cleaned_err, flags=re.I).strip(" (•-.,)")
+                if not cleaned_err or cleaned_err.lower() in ("stopped", "standby", "offline", "idle", "disconnected"):
+                    sub_lbl = "Camera Disconnected"
+                else:
+                    sub_lbl = "Camera Disconnected"
+                painter.setPen(QColor("#d4d4d8"))
+                painter.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
+                painter.drawText(
+                    QRect(rect.left() + 20, rect.center().y() + 48, rect.width() - 40, 20),
+                    Qt.AlignmentFlag.AlignCenter,
+                    sub_lbl,
+                )
+
             elif is_error:
                 # Error state: amber / red alert beacon
                 import math
@@ -1735,7 +1982,7 @@ class VideoCanvas(QWidget):
 
                 painter.setPen(QColor("#6b7280"))
                 painter.setFont(QFont("Segoe UI", 9))
-                painter.drawText(QRect(rect.left() + 20, cy + 66, rect.width() - 40, 20), Qt.AlignmentFlag.AlignCenter, 'Click "Connect" below to view live feed')
+                painter.drawText(QRect(rect.left() + 20, cy + 66, rect.width() - 40, 20), Qt.AlignmentFlag.AlignCenter, "Stream offline")
 
         # Camera shutter flash effect
         if self._shutter_alpha > 0.01:
@@ -1772,6 +2019,7 @@ class CameraTileWidget(QFrame):
         self._monitor_mode = False
         self._person_detected = False
         self._last_saved_snapshot: Optional[str] = None
+        self._last_thumb_save_ts: float = 0.0
         self._is_being_dragged = False
         self._is_drop_target = False
         self._is_landing_pulse = False
@@ -1833,12 +2081,11 @@ class CameraTileWidget(QFrame):
 
         h_layout.addStretch()
 
-        self.person_lbl = QLabel("PERSON")
-        self.person_lbl.setStyleSheet(
-            "background-color: #7f1d1d; color: #ffffff; border: 1px solid #ef4444; "
-            "border-radius: 3px; padding: 1px 6px; font-family: 'Cascadia Mono', 'Consolas', monospace; "
-            "font-weight: 700; font-size: 10px;"
-        )
+        self.person_lbl = QLabel()
+        self.person_lbl.setPixmap(lucide_pixmap("shield_alert", "#ef4444", 16, stroke_width=2.0))
+        self.person_lbl.setFixedSize(20, 20)
+        self.person_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.person_lbl.setToolTip("Person Detected")
         self.person_lbl.setVisible(False)
         h_layout.addWidget(self.person_lbl)
 
@@ -1874,12 +2121,15 @@ class CameraTileWidget(QFrame):
 
         # --- Video Canvas ---
         self.canvas = VideoCanvas(self)
+        self.canvas.set_reconnect_overlay_enabled(True)
         self.canvas.clicked.connect(lambda: self.selected.emit(self.config.cam_id))
         self.canvas.double_clicked.connect(lambda: self.maximize_requested.emit(self.config.cam_id))
         self.canvas.drag_requested.connect(self._start_trello_drag)
+        self.canvas.reconnect_requested.connect(self.reconnect_stream)
         self.canvas.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.canvas.customContextMenuRequested.connect(self._show_context_menu)
         self.canvas.set_camera_info(self.config.name, "Live Feed")
+        self._load_cached_last_frame()
         self._root_layout.addWidget(self.canvas, 1)
 
         # --- Bottom Control Bar (34px) ---
@@ -1890,12 +2140,12 @@ class CameraTileWidget(QFrame):
         c_layout.setContentsMargins(8, 0, 8, 0)
         c_layout.setSpacing(4)
 
-        self.btn_power = QPushButton("Connect")
+        self.btn_power = QPushButton()
         self.btn_power.setObjectName("ghostBtn")
-        self.btn_power.setIcon(lucide_icon("play", "#38bdf8", 13))
-        self.btn_power.setIconSize(QSize(13, 13))
-        self.btn_power.setFixedSize(76, 24)
-        self.btn_power.setToolTip("Connect to Live Stream")
+        self.btn_power.setIcon(lucide_icon("wifi_off", "#71717a", 14))
+        self.btn_power.setIconSize(QSize(14, 14))
+        self.btn_power.setFixedSize(26, 24)
+        self.btn_power.setToolTip("Disconnected — Click to Connect Stream")
         self.btn_power.clicked.connect(self.toggle_stream)
         c_layout.addWidget(self.btn_power)
 
@@ -2202,19 +2452,70 @@ class CameraTileWidget(QFrame):
         if was_running and stream_changed:
             self.start_stream()
 
+    def _last_frame_cache_path(self) -> Path:
+        return PRESET_THUMB_DIR / f"_last_frame_{self.config.cam_id}.jpg"
+
+    def _load_cached_last_frame(self) -> None:
+        try:
+            fp = self._last_frame_cache_path()
+            if fp.is_file():
+                qimg = QImage(str(fp))
+                if not qimg.isNull():
+                    self.canvas.set_last_frame(qimg)
+        except Exception:
+            pass
+
+    def _save_cached_last_frame(self, image: Optional[QImage]) -> None:
+        if image is None or image.isNull():
+            return
+        try:
+            PRESET_THUMB_DIR.mkdir(parents=True, exist_ok=True)
+            fp = self._last_frame_cache_path()
+            image.scaled(
+                480,
+                270,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            ).save(str(fp), "JPG", 82)
+        except Exception:
+            pass
+
+    def _update_wifi_btn(self, connected: bool) -> None:
+        self.btn_power.setText("")
+        self.btn_power.setFixedSize(26, 24)
+        self.btn_power.setIconSize(QSize(14, 14))
+        if connected:
+            self.btn_power.setIcon(lucide_icon("wifi", "#3b82f6", 14))
+            self.btn_power.setToolTip("Connected — Click to Disconnect Stream")
+        else:
+            self.btn_power.setIcon(lucide_icon("wifi_off", "#71717a", 14))
+            self.btn_power.setToolTip("Disconnected — Click to Connect Stream")
+
     def is_streaming(self) -> bool:
         return self.worker is not None and self.worker.isRunning()
 
     def toggle_stream(self) -> None:
         self.selected.emit(self.config.cam_id)
         if self.is_streaming():
-            self.stop_stream()
+            if self.canvas._is_disconnected_state():
+                self.reconnect_stream()
+            else:
+                self.stop_stream()
         else:
             self.start_stream()
+
+    def reconnect_stream(self) -> None:
+        self.selected.emit(self.config.cam_id)
+        if self.is_streaming():
+            self.stop_stream()
+        self.start_stream()
 
     def start_stream(self) -> None:
         if self.is_streaming():
             return
+        self.canvas.notify_manual_connect_started()
+        self.canvas.set_status("Connecting to camera stream...", False)
+        self.status_dot.set_state("connecting")
         self.worker = CameraStreamWorker(self.config, self)
         self.worker.frame_ready.connect(self._on_frame)
         self.worker.detections_ready.connect(self._on_detections)
@@ -2222,13 +2523,10 @@ class CameraTileWidget(QFrame):
         self.worker.status_changed.connect(self._on_status)
         self.worker.recording_changed.connect(self._on_recording_state)
         self.worker.start()
-        # Red stop icon without the word "Stop"
-        self.btn_power.setText("")
-        self.btn_power.setToolTip("Stop Stream")
-        self.btn_power.setIcon(lucide_icon("square", "#ef4444", 12))
-        self.btn_power.setFixedSize(26, 24)
 
     def stop_stream(self) -> None:
+        if self.canvas._last_frame is not None and not self.canvas._last_frame.isNull():
+            self._save_cached_last_frame(self.canvas._last_frame)
         self.audio_out.close()
         if self.worker is not None:
             worker = self.worker
@@ -2249,25 +2547,29 @@ class CameraTileWidget(QFrame):
         self._audio_decay_timer.stop()
         self._audio_meter_level = 0.0
         self.audio_bar.setValue(0)
-        # Show the word "Connect"
-        self.btn_power.setText("Connect")
-        self.btn_power.setToolTip("Connect to Live Stream")
-        self.btn_power.setIcon(lucide_icon("play", "#38bdf8", 13))
-        self.btn_power.setFixedSize(76, 24)
+        self._update_wifi_btn(False)
         self.btn_rec.setChecked(False)
         self.btn_rec.setIcon(lucide_icon("disc", "#a1a1aa", 14))
         self.rec_lbl.setVisible(False)
         self.person_lbl.setVisible(False)
         self._person_detected = False
         self._update_border()
-        self.canvas.set_status("Stopped", False)
+        self.canvas.set_status("Disconnected", False)
         self.status_dot.set_state("idle")
         self.stats_lbl.setText("0.0 FPS  0 kbps")
 
     def _on_frame(self, cam_id: str, image: QImage, fps: float, kbps: float) -> None:
         _ = cam_id
+        if not self.canvas._is_connected:
+            self._update_wifi_btn(True)
+            self.status_dot.set_state("live")
         self.canvas.set_frame(image)
         self.stats_lbl.setText(f"{fps:.1f} FPS  {kbps:.0f} kbps")
+        import time as _time
+        now_t = _time.monotonic()
+        if now_t - self._last_thumb_save_ts >= 20.0:
+            self._last_thumb_save_ts = now_t
+            self._save_cached_last_frame(image)
 
     def _on_detections(self, cam_id: str, boxes: list) -> None:
         _ = cam_id
@@ -2304,10 +2606,12 @@ class CameraTileWidget(QFrame):
 
     def _on_status(self, cam_id: str, status_text: str, is_connected: bool) -> None:
         _ = cam_id
+        self._update_wifi_btn(is_connected)
         self.canvas.set_status(status_text, is_connected)
+        low = (status_text or "").lower()
         if is_connected:
             self.status_dot.set_state("live")
-        elif "Error" in status_text or "Failed" in status_text or "Invalid" in status_text:
+        elif any(w in low for w in ("error", "failed", "invalid", "lost", "cannot connect", "retrying", "disconnected")):
             self.status_dot.set_state("error")
         else:
             self.status_dot.set_state("connecting")
