@@ -77,6 +77,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSlider,
     QSpinBox,
@@ -92,6 +93,7 @@ from PyQt6.QtWidgets import (
 from stream_worker import (
     CameraConfig,
     CameraStreamWorker,
+    DetectionChimePlayer,
     LiveAudioOutput,
     SDCardBulkBackupWorker,
     SDCardExportWorker,
@@ -336,6 +338,23 @@ LUCIDE_PATHS: Dict[str, str] = {
         '<path d="M12 8v4"/>'
         '<path d="M12 16h.01"/>'
     ),
+    "bell": (
+        '<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/>'
+        '<path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>'
+    ),
+    "bell_off": (
+        '<path d="M8.7 3A6 6 0 0 1 18 8a21.3 21.3 0 0 0 .6 5"/>'
+        '<path d="M17 17H3s3-2 3-9a4.67 4.67 0 0 1 .3-1.7"/>'
+        '<path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>'
+        '<path d="m2 2 20 20"/>'
+    ),
+    "scan": (
+        '<path d="M3 7V5a2 2 0 0 1 2-2h2"/>'
+        '<path d="M17 3h2a2 2 0 0 1 2 2v2"/>'
+        '<path d="M21 17v2a2 2 0 0 1-2 2h-2"/>'
+        '<path d="M7 21H5a2 2 0 0 1-2-2v-2"/>'
+        '<rect width="10" height="8" x="7" y="8" rx="1"/>'
+    ),
 }
 
 _ICON_CACHE: Dict[str, QIcon] = {}
@@ -466,6 +485,36 @@ QFrame#topHeaderBar {
 QFrame#inspectorDrawer {
     background-color: #0e0e11;
     border-left: 1px solid #1f1f24;
+}
+QScrollArea#drawerScrollArea {
+    background-color: transparent;
+    border: none;
+}
+QWidget#drawerContent {
+    background-color: #0e0e11;
+}
+QScrollBar:vertical {
+    background-color: #0e0e11;
+    width: 8px;
+    margin: 2px 1px 2px 1px;
+    border: none;
+}
+QScrollBar::handle:vertical {
+    background-color: #27272d;
+    min-height: 28px;
+    border-radius: 3px;
+}
+QScrollBar::handle:vertical:hover {
+    background-color: #3f3f46;
+}
+QScrollBar::handle:vertical:pressed {
+    background-color: #52525b;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0px;
+}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background: none;
 }
 QFrame#drawerSection {
     background-color: #141418;
@@ -964,6 +1013,22 @@ class CameraConfigDialog(QDialog):
                 self.cmb_sensitivity.setCurrentIndex(s_idx)
         form.addRow("Detection Sensitivity", self.cmb_sensitivity)
 
+        chime_row = QHBoxLayout()
+        self.chk_det_sound = QCheckBox("Play gentle chime on person detection")
+        self.chk_det_sound.setChecked(bool(getattr(config, "detection_sound", True)) if config else True)
+        chime_row.addWidget(self.chk_det_sound, 1)
+
+        self.cmb_det_cooldown = QComboBox()
+        self.cmb_det_cooldown.addItem("5s Cooldown", 5)
+        self.cmb_det_cooldown.addItem("10s Cooldown", 10)
+        self.cmb_det_cooldown.addItem("20s Cooldown", 20)
+        init_cd = int(getattr(config, "detection_sound_cooldown", 10) or 10) if config else 10
+        cd_idx = self.cmb_det_cooldown.findData(init_cd if init_cd in (5, 10, 20) else 10)
+        if cd_idx >= 0:
+            self.cmb_det_cooldown.setCurrentIndex(cd_idx)
+        chime_row.addWidget(self.cmb_det_cooldown)
+        form.addRow("Detection Chime", chime_row)
+
         gpu_caps = get_gpu_capabilities()
         gpu_summary = gpu_caps.get("summary", "OpenCL + D3D11VA")
         self.chk_gpu = QCheckBox(f"Use GPU Acceleration ({gpu_summary})")
@@ -1036,8 +1101,12 @@ class CameraConfigDialog(QDialog):
             flipped=self._initial.flipped if self._initial else False,
             person_detection=bool(getattr(self._initial, "person_detection", True)) if self._initial else True,
             detection_sensitivity=str(self.cmb_sensitivity.currentData() or "ultra"),
+            detection_sound=self.chk_det_sound.isChecked(),
+            detection_sound_cooldown=int(self.cmb_det_cooldown.currentData() or 10),
+            chime_zone=CameraConfig.normalize_chime_zone(getattr(self._initial, "chime_zone", None)) if self._initial else None,
             gpu_acceleration=self.chk_gpu.isChecked(),
             ptz_presets=list(self._initial.ptz_presets) if (self._initial and self._initial.ptz_presets) else [],
+            ignored_objects=list(getattr(self._initial, "ignored_objects", None) or []) if self._initial else [],
         )
 
 
@@ -1158,6 +1227,18 @@ class CanvasToast(QFrame):
         self.raise_()
         self._hide_timer.start(timeout_ms)
 
+    def show_info(self, msg: str, timeout_ms: int = 3200) -> None:
+        self._current_path = ""
+        self.icon_lbl.setPixmap(lucide_pixmap("check", "#10b981", 14))
+        self.msg_lbl.setText(msg)
+        self.btn_open.setVisible(False)
+        self.btn_folder.setVisible(False)
+        self.adjustSize()
+        self._reposition()
+        self.show()
+        self.raise_()
+        self._hide_timer.start(timeout_ms)
+
     def _reposition(self) -> None:
         if self.parentWidget():
             p_rect = self.parentWidget().rect()
@@ -1179,10 +1260,14 @@ class VideoCanvas(QWidget):
     double_clicked = pyqtSignal()
     drag_requested = pyqtSignal()
     reconnect_requested = pyqtSignal()
+    dismiss_detection_requested = pyqtSignal(tuple)
+    chime_zone_changed = pyqtSignal(object)
+    chime_zone_edit_toggled = pyqtSignal(bool)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setMinimumSize(240, 150)
+        self.setMouseTracking(True)
         self._qimage: Optional[QImage] = None
         self._last_frame: Optional[QImage] = None
         self._blurred_last_frame: Optional[QImage] = None
@@ -1195,11 +1280,28 @@ class VideoCanvas(QWidget):
         self._pan_offset = QPoint(0, 0)
         self._drag_last: Optional[QPoint] = None
         self._mouse_down_pos: Optional[QPoint] = None
+        self._hover_pos: Optional[QPoint] = None
         self._detections: List[tuple] = []
+        self._live_detections: List[tuple] = []
+        self._pinned_detections: List[tuple] = []
+        self._last_detection_ts: float = 0.0
+        self._dismiss_hit_rects: List[Tuple[QRect, tuple]] = []
+        self._box_hit_rects: List[Tuple[QRect, tuple]] = []
+        self._chime_zone: Optional[List[float]] = None
+        self._editing_chime_zone: bool = False
+        self._chime_drag_start: Optional[Tuple[float, float]] = None
+        self._chime_drag_curr: Optional[Tuple[float, float]] = None
+        self._chime_done_rect: QRect = QRect()
+        self._chime_reset_rect: QRect = QRect()
         self._flash_step: int = 0
         self._flash_timer = QTimer(self)
         self._flash_timer.setInterval(95)
         self._flash_timer.timeout.connect(self._on_flash_tick)
+
+        # Hold timer so detection boxes don't disappear while user moves mouse to mark 'Not a Person'
+        self._det_hold_timer = QTimer(self)
+        self._det_hold_timer.setSingleShot(True)
+        self._det_hold_timer.timeout.connect(self._on_det_hold_expired)
 
         # Shutter flash animation (fade-out white flash overlay)
         self._shutter_alpha: float = 0.0
@@ -1342,7 +1444,11 @@ class VideoCanvas(QWidget):
     def _sync_reconnect_button(self) -> None:
         if not hasattr(self, "btn_reconnect"):
             return
-        should_show = self._show_reconnect_overlay and self._is_disconnected_state()
+        should_show = (
+            self._show_reconnect_overlay
+            and self._is_disconnected_state()
+            and not getattr(self, "_editing_chime_zone", False)
+        )
         if should_show:
             self._reposition_reconnect_button()
             if not self.btn_reconnect.isVisible():
@@ -1351,6 +1457,58 @@ class VideoCanvas(QWidget):
         else:
             if self.btn_reconnect.isVisible():
                 self.btn_reconnect.hide()
+
+    def set_chime_zone(self, zone: Optional[List[float]]) -> None:
+        self._chime_zone = CameraConfig.normalize_chime_zone(zone)
+        self.update()
+
+    def set_chime_zone_edit_mode(self, enabled: bool) -> None:
+        new_mode = bool(enabled)
+        if self._editing_chime_zone == new_mode and not new_mode:
+            return
+        self._editing_chime_zone = new_mode
+        self._chime_drag_start = None
+        self._chime_drag_curr = None
+        if self._editing_chime_zone:
+            self._zoom = 1.0
+            self._pan_offset = QPoint(0, 0)
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self.unsetCursor()
+        self._sync_reconnect_button()
+        self.chime_zone_edit_toggled.emit(self._editing_chime_zone)
+        self.update()
+
+    def _get_video_target_rect(self) -> QRect:
+        rect = self.rect()
+        img = self._qimage if (self._qimage is not None and not self._qimage.isNull()) else self._last_frame
+        if img is not None and not img.isNull() and img.width() > 0 and img.height() > 0:
+            img_w = img.width()
+            img_h = img.height()
+            scale = min(rect.width() / img_w, rect.height() / img_h) * (
+                1.0 if self._editing_chime_zone else self._zoom
+            )
+            draw_w = max(1, int(img_w * scale))
+            draw_h = max(1, int(img_h * scale))
+            cx = rect.center().x() + (0 if self._editing_chime_zone else self._pan_offset.x())
+            cy = rect.center().y() + (0 if self._editing_chime_zone else self._pan_offset.y())
+            return QRect(cx - draw_w // 2, cy - draw_h // 2, draw_w, draw_h)
+        # Fallback 16:9 rect when no frame has ever been received yet
+        avail = rect.adjusted(10, 10, -10, -10)
+        if avail.width() <= 0 or avail.height() <= 0:
+            return rect
+        scale = min(avail.width() / 16.0, avail.height() / 9.0)
+        draw_w = max(1, int(16.0 * scale))
+        draw_h = max(1, int(9.0 * scale))
+        return QRect(rect.center().x() - draw_w // 2, rect.center().y() - draw_h // 2, draw_w, draw_h)
+
+    def _pos_to_norm(self, pos: QPoint) -> Tuple[float, float]:
+        target = self._get_video_target_rect()
+        tw = max(1, target.width())
+        th = max(1, target.height())
+        xn = max(0.0, min(1.0, (pos.x() - target.left()) / float(tw)))
+        yn = max(0.0, min(1.0, (pos.y() - target.top()) / float(th)))
+        return (xn, yn)
 
     def notify_manual_connect_started(self) -> None:
         self._has_disconnected = False
@@ -1370,15 +1528,86 @@ class VideoCanvas(QWidget):
         self._flash_step = (self._flash_step + 1) % 20
         self.update()
 
-    def set_detections(self, boxes: list) -> None:
-        self._detections = list(boxes) if boxes else []
-        if self._detections:
+    def set_detections(self, boxes: list, force_clear: bool = False) -> None:
+        import time as _time
+
+        now_t = _time.monotonic()
+        if force_clear:
+            self._live_detections = []
+            self._pinned_detections = []
+            self._detections = []
+            self._det_hold_timer.stop()
+            if self._flash_timer.isActive():
+                self._flash_timer.stop()
+            self.update()
+            return
+
+        if boxes:
+            self._live_detections = list(boxes)
+            self._pinned_detections = list(boxes)
+            self._last_detection_ts = now_t
+            self._detections = list(boxes)
+            self._det_hold_timer.stop()
             if not self._flash_timer.isActive():
                 self._flash_step = 0
                 self._flash_timer.start()
-        else:
-            if self._flash_timer.isActive():
-                self._flash_timer.stop()
+            self.update()
+            return
+
+        # Live boxes became empty: if hovering on the camera view or within the 2.2s grace hold, keep boxes visible!
+        self._live_detections = []
+        if self._hover_pos is not None and self._pinned_detections:
+            self._detections = list(self._pinned_detections)
+            self.update()
+            return
+
+        elapsed = now_t - self._last_detection_ts
+        if self._pinned_detections and elapsed < 2.2:
+            remaining_ms = max(200, int((2.2 - elapsed) * 1000))
+            if not self._det_hold_timer.isActive():
+                self._det_hold_timer.start(remaining_ms)
+            return
+
+        self._detections = []
+        if self._flash_timer.isActive():
+            self._flash_timer.stop()
+        self.update()
+
+    def _on_det_hold_expired(self) -> None:
+        if self._live_detections:
+            return
+        if self._hover_pos is not None and self._pinned_detections:
+            # User is currently hovering over the camera view — keep boxes pinned!
+            return
+        self._detections = []
+        if self._flash_timer.isActive():
+            self._flash_timer.stop()
+        self.update()
+
+    def remove_pinned_box(self, dismissed_box: Tuple[float, float, float, float]) -> None:
+        from stream_worker import ClassicalPersonDetector
+
+        self._pinned_detections = [
+            b
+            for b in self._pinned_detections
+            if len(b) < 4
+            or ClassicalPersonDetector._box_iou(
+                dismissed_box, (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
+            )
+            < 0.30
+        ]
+        self._live_detections = [
+            b
+            for b in self._live_detections
+            if len(b) < 4
+            or ClassicalPersonDetector._box_iou(
+                dismissed_box, (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
+            )
+            < 0.30
+        ]
+        self._detections = list(self._live_detections or self._pinned_detections)
+        if not self._detections and self._flash_timer.isActive():
+            self._flash_timer.stop()
         self.update()
 
     def set_frame(self, image: QImage) -> None:
@@ -1401,7 +1630,7 @@ class VideoCanvas(QWidget):
             self._download_progress = None
         if not connected:
             self._qimage = None
-            self.set_detections([])
+            self.set_detections([], force_clear=True)
             if any(
                 w in low
                 for w in (
@@ -1458,6 +1687,28 @@ class VideoCanvas(QWidget):
     def show_error_toast(self, msg: str) -> None:
         self._toast.show_warning(msg)
 
+    def show_info_toast(self, msg: str) -> None:
+        self._toast.show_info(msg)
+
+    def detection_at_pos(self, pos: QPoint) -> Optional[tuple]:
+        for pill_rect, det_box in self._dismiss_hit_rects:
+            if pill_rect.contains(pos):
+                return det_box
+        for box_rect, det_box in self._box_hit_rects:
+            if box_rect.adjusted(-8, -8, 8, 8).contains(pos):
+                return det_box
+        return None
+
+    def leaveEvent(self, event) -> None:
+        self._hover_pos = None
+        if not self._editing_chime_zone:
+            self.unsetCursor()
+        if not self._live_detections and self._detections:
+            # Give a 1.5s grace period after cursor leaves (e.g. when opening right-click menu) before hiding
+            self._det_hold_timer.start(1500)
+        self.update()
+        super().leaveEvent(event)
+
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
         if hasattr(self, "_toast") and self._toast.isVisible():
@@ -1465,6 +1716,9 @@ class VideoCanvas(QWidget):
         self._reposition_reconnect_button()
 
     def wheelEvent(self, event: QWheelEvent) -> None:
+        if self._editing_chime_zone:
+            event.accept()
+            return
         delta = event.angleDelta().y()
         if delta > 0:
             self._zoom = min(5.0, self._zoom * 1.15)
@@ -1477,7 +1731,35 @@ class VideoCanvas(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         self.clicked.emit()
+        if self._editing_chime_zone:
+            if event.button() == Qt.MouseButton.LeftButton:
+                if self._chime_done_rect.contains(event.pos()):
+                    self.set_chime_zone_edit_mode(False)
+                    event.accept()
+                    return
+                if self._chime_reset_rect.contains(event.pos()):
+                    self._chime_zone = None
+                    self._chime_drag_start = None
+                    self._chime_drag_curr = None
+                    self.chime_zone_changed.emit(None)
+                    self.update()
+                    event.accept()
+                    return
+                self._chime_drag_start = self._pos_to_norm(event.pos())
+                self._chime_drag_curr = self._chime_drag_start
+                self.update()
+                event.accept()
+                return
+            elif event.button() == Qt.MouseButton.RightButton:
+                self.set_chime_zone_edit_mode(False)
+                event.accept()
+                return
         if event.button() == Qt.MouseButton.LeftButton:
+            for pill_rect, det_box in self._dismiss_hit_rects:
+                if pill_rect.contains(event.pos()):
+                    self.dismiss_detection_requested.emit(det_box)
+                    event.accept()
+                    return
             if self._zoom > 1.0:
                 self._drag_last = event.pos()
             else:
@@ -1485,6 +1767,43 @@ class VideoCanvas(QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        import time as _time
+
+        self._hover_pos = event.pos()
+        self._det_hold_timer.stop()
+
+        if self._editing_chime_zone:
+            if self._chime_drag_start is not None and (event.buttons() & Qt.MouseButton.LeftButton):
+                self._chime_drag_curr = self._pos_to_norm(event.pos())
+                self.setCursor(Qt.CursorShape.CrossCursor)
+                self.update()
+                event.accept()
+                return
+            if self._chime_done_rect.contains(event.pos()) or self._chime_reset_rect.contains(event.pos()):
+                self.setCursor(Qt.CursorShape.PointingHandCursor)
+            else:
+                self.setCursor(Qt.CursorShape.CrossCursor)
+            self.update()
+            event.accept()
+            return
+
+        # If a detection happened recently (within 8s) and flickered off right before the user hovered, restore it!
+        if (
+            not self._detections
+            and self._pinned_detections
+            and (_time.monotonic() - self._last_detection_ts) <= 8.0
+        ):
+            self._detections = list(self._pinned_detections)
+            if not self._flash_timer.isActive():
+                self._flash_step = 0
+                self._flash_timer.start()
+        over_pill = any(pr.contains(event.pos()) for pr, _ in self._dismiss_hit_rects)
+        if over_pill:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+        else:
+            self.unsetCursor()
+        if self._detections or self._chime_zone is not None:
+            self.update()
         if self._drag_last is not None and self._zoom > 1.0:
             diff = event.pos() - self._drag_last
             self._pan_offset += diff
@@ -1501,11 +1820,33 @@ class VideoCanvas(QWidget):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if (
+            self._editing_chime_zone
+            and event.button() == Qt.MouseButton.LeftButton
+            and self._chime_drag_start is not None
+        ):
+            end_pt = self._pos_to_norm(event.pos())
+            x1 = min(self._chime_drag_start[0], end_pt[0])
+            y1 = min(self._chime_drag_start[1], end_pt[1])
+            x2 = max(self._chime_drag_start[0], end_pt[0])
+            y2 = max(self._chime_drag_start[1], end_pt[1])
+            self._chime_drag_start = None
+            self._chime_drag_curr = None
+            if (x2 - x1) >= 0.03 and (y2 - y1) >= 0.03:
+                norm = CameraConfig.normalize_chime_zone([x1, y1, x2, y2])
+                self._chime_zone = norm
+                self.chime_zone_changed.emit(self._chime_zone)
+            self.update()
+            event.accept()
+            return
         self._drag_last = None
         self._mouse_down_pos = None
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        if self._editing_chime_zone:
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             self.double_clicked.emit()
         super().mouseDoubleClickEvent(event)
@@ -1517,6 +1858,9 @@ class VideoCanvas(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         rect = self.rect()
         painter.fillRect(rect, QColor("#050507"))
+
+        self._dismiss_hit_rects.clear()
+        self._box_hit_rects.clear()
 
         if self._qimage is not None and not self._qimage.isNull():
             img_w = self._qimage.width()
@@ -1536,12 +1880,14 @@ class VideoCanvas(QWidget):
                         if len(det) < 4:
                             continue
                         x1n, y1n, x2n, y2n = float(det[0]), float(det[1]), float(det[2]), float(det[3])
+                        det_box = (x1n, y1n, x2n, y2n)
 
                         bx = int(target.left() + x1n * target.width())
                         by = int(target.top() + y1n * target.height())
                         bw = max(16, int((x2n - x1n) * target.width()))
                         bh = max(24, int((y2n - y1n) * target.height()))
                         box_rect = QRect(bx, by, bw, bh)
+                        self._box_hit_rects.append((box_rect, det_box))
 
                         # 4 corner L-brackets around the subject (no rectangle sides, no fill, no text label)
                         arm = max(8, min(20, min(bw, bh) // 4))
@@ -1562,6 +1908,25 @@ class VideoCanvas(QWidget):
                         # Bottom-Right corner
                         painter.drawLine(x_r - arm, y_b, x_r, y_b)
                         painter.drawLine(x_r, y_b - arm, x_r, y_b)
+
+                        # Interactive '× Not a Person' quick-dismiss pill when mouse hovers over the viewport
+                        if self._hover_pos is not None:
+                            pill_w, pill_h = 96, 20
+                            px = max(rect.left() + 6, min(rect.right() - pill_w - 6, x_l))
+                            py = y_t - pill_h - 4 if (y_t - pill_h - 4) >= (rect.top() + 6) else (y_t + 4)
+                            pill_rect = QRect(px, py, pill_w, pill_h)
+                            self._dismiss_hit_rects.append((pill_rect, det_box))
+                            is_hovered = pill_rect.contains(self._hover_pos)
+                            painter.setPen(
+                                QPen(QColor("#f87171" if is_hovered else "#ef4444"), 1.1)
+                            )
+                            painter.setBrush(
+                                QColor(185, 28, 28, 240) if is_hovered else QColor(15, 15, 20, 225)
+                            )
+                            painter.drawRoundedRect(pill_rect, 4, 4)
+                            painter.setPen(QColor("#ffffff" if is_hovered else "#fca5a5"))
+                            painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+                            painter.drawText(pill_rect, Qt.AlignmentFlag.AlignCenter, "× Not a Person")
 
                     # --- Flashing Red Corner & Border Outline on Footage ---
                     import math as _math
@@ -1609,6 +1974,10 @@ class VideoCanvas(QWidget):
                     painter.setPen(QColor("#f4f4f5"))
                     painter.setFont(QFont("Cascadia Mono", 9, QFont.Weight.DemiBold))
                     painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, f"{self._zoom:.1f}x")
+        elif self._editing_chime_zone and self._last_frame is not None and not self._last_frame.isNull():
+            # When editing the chime trigger area while stream is offline, show crisp cached last frame
+            target = self._get_video_target_rect()
+            painter.drawImage(target, self._last_frame)
         else:
             # 0. Draw blurred last frame of footage if available
             blurred_img = self._get_blurred_last_frame()
@@ -1984,6 +2353,9 @@ class VideoCanvas(QWidget):
                 painter.setFont(QFont("Segoe UI", 9))
                 painter.drawText(QRect(rect.left() + 20, cy + 66, rect.width() - 40, 20), Qt.AlignmentFlag.AlignCenter, "Stream offline")
 
+        # Chime Trigger Zone overlay (interactive editor or subtle active-zone indicator)
+        self._paint_chime_zone_overlay(painter, self._get_video_target_rect())
+
         # Camera shutter flash effect
         if self._shutter_alpha > 0.01:
             painter.setPen(Qt.PenStyle.NoPen)
@@ -1991,6 +2363,233 @@ class VideoCanvas(QWidget):
             painter.drawRect(rect)
 
         painter.end()
+
+    def _paint_chime_zone_overlay(self, painter: QPainter, target: QRect) -> None:
+        self._chime_done_rect = QRect()
+        self._chime_reset_rect = QRect()
+        rect = self.rect()
+        if target.width() < 24 or target.height() < 24:
+            return
+
+        if self._editing_chime_zone:
+            # Determine active box being dragged or currently configured
+            active_box: Optional[List[float]] = None
+            if self._chime_drag_start is not None and self._chime_drag_curr is not None:
+                x1 = min(self._chime_drag_start[0], self._chime_drag_curr[0])
+                y1 = min(self._chime_drag_start[1], self._chime_drag_curr[1])
+                x2 = max(self._chime_drag_start[0], self._chime_drag_curr[0])
+                y2 = max(self._chime_drag_start[1], self._chime_drag_curr[1])
+                if (x2 - x1) >= 0.015 and (y2 - y1) >= 0.015:
+                    active_box = [x1, y1, x2, y2]
+            if active_box is None and self._chime_zone is not None:
+                active_box = list(self._chime_zone)
+
+            if active_box is not None and len(active_box) >= 4:
+                zx = int(round(target.left() + active_box[0] * target.width()))
+                zy = int(round(target.top() + active_box[1] * target.height()))
+                zw = max(10, int(round((active_box[2] - active_box[0]) * target.width())))
+                zh = max(10, int(round((active_box[3] - active_box[1]) * target.height())))
+                z_rect = QRect(zx, zy, zw, zh).intersected(target)
+
+                # Dim areas outside the Chime Trigger Area
+                dim_col = QColor(5, 5, 10, 148)
+                if z_rect.top() > target.top():
+                    painter.fillRect(
+                        QRect(target.left(), target.top(), target.width(), z_rect.top() - target.top()),
+                        dim_col,
+                    )
+                if z_rect.bottom() < target.bottom():
+                    painter.fillRect(
+                        QRect(
+                            target.left(),
+                            z_rect.bottom() + 1,
+                            target.width(),
+                            target.bottom() - z_rect.bottom(),
+                        ),
+                        dim_col,
+                    )
+                if z_rect.left() > target.left():
+                    painter.fillRect(
+                        QRect(
+                            target.left(),
+                            z_rect.top(),
+                            z_rect.left() - target.left(),
+                            z_rect.height(),
+                        ),
+                        dim_col,
+                    )
+                if z_rect.right() < target.right():
+                    painter.fillRect(
+                        QRect(
+                            z_rect.right() + 1,
+                            z_rect.top(),
+                            target.right() - z_rect.right(),
+                            z_rect.height(),
+                        ),
+                        dim_col,
+                    )
+
+                # Subtle warm amber highlight inside trigger zone
+                painter.fillRect(z_rect, QColor(245, 158, 11, 28))
+                dash_pen = QPen(QColor("#f59e0b"), 2.0, Qt.PenStyle.DashLine)
+                painter.setPen(dash_pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRect(z_rect)
+
+                # Bold corner L-handles on the zone rectangle
+                arm = max(8, min(18, min(z_rect.width(), z_rect.height()) // 4))
+                c_pen = QPen(QColor("#fbbf24"), 3.2)
+                c_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                painter.setPen(c_pen)
+                zl, zt, zr, zb = z_rect.left(), z_rect.top(), z_rect.right(), z_rect.bottom()
+                painter.drawLine(zl, zt, zl + arm, zt)
+                painter.drawLine(zl, zt, zl, zt + arm)
+                painter.drawLine(zr - arm, zt, zr, zt)
+                painter.drawLine(zr, zt, zr, zt + arm)
+                painter.drawLine(zl, zb - arm, zl, zb)
+                painter.drawLine(zl, zb, zl + arm, zb)
+                painter.drawLine(zr - arm, zb, zr, zb)
+                painter.drawLine(zr, zb - arm, zr, zb)
+
+                # Zone tag badge
+                tag_w, tag_h = min(146, max(96, z_rect.width())), 20
+                tag_x = max(target.left() + 4, min(target.right() - tag_w - 4, zl))
+                tag_y = zt - tag_h - 4 if (zt - tag_h - 4) >= (target.top() + 38) else (zt + 5)
+                tag_rect = QRect(tag_x, tag_y, tag_w, tag_h)
+                painter.setPen(QPen(QColor("#f59e0b"), 1.0))
+                painter.setBrush(QColor(24, 18, 10, 230))
+                painter.drawRoundedRect(tag_rect, 4, 4)
+                painter.setPen(QColor("#fde68a"))
+                painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+                painter.drawText(tag_rect, Qt.AlignmentFlag.AlignCenter, "CHIME TRIGGER AREA")
+            else:
+                # Whole Frame currently active in edit mode
+                vis_t = target.adjusted(2, 2, -2, -2)
+                painter.setPen(QPen(QColor(245, 158, 11, 185), 2.0, Qt.PenStyle.DashLine))
+                painter.setBrush(QColor(245, 158, 11, 14))
+                painter.drawRect(vis_t)
+
+                hint_w = min(rect.width() - 24, 340)
+                hint_h = 28
+                hint_rect = QRect(rect.center().x() - hint_w // 2, rect.center().y() - hint_h // 2, hint_w, hint_h)
+                painter.setPen(QPen(QColor(245, 158, 11, 160), 1.0))
+                painter.setBrush(QColor(14, 14, 18, 225))
+                painter.drawRoundedRect(hint_rect, 6, 6)
+                painter.setPen(QColor("#fde68a"))
+                painter.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
+                painter.drawText(
+                    hint_rect,
+                    Qt.AlignmentFlag.AlignCenter,
+                    "Whole Frame Active — Drag on footage to set Gate / Chime Area",
+                )
+
+            # Top Interactive HUD Control Bar for Chime Area Editor
+            bar_w = min(rect.width() - 12, 410)
+            bar_h = 30
+            bar_x = max(6, rect.center().x() - bar_w // 2)
+            bar_y = 8
+            bar_rect = QRect(bar_x, bar_y, bar_w, bar_h)
+            painter.setPen(QPen(QColor("#f59e0b"), 1.2))
+            painter.setBrush(QColor(14, 14, 18, 238))
+            painter.drawRoundedRect(bar_rect, 6, 6)
+
+            done_w, done_h = 54, 22
+            reset_w, reset_h = 80, 22
+            done_x = bar_rect.right() - done_w - 6
+            done_y = bar_y + (bar_h - done_h) // 2
+            reset_x = done_x - reset_w - 6
+            reset_y = done_y
+
+            self._chime_done_rect = QRect(done_x, done_y, done_w, done_h)
+            self._chime_reset_rect = QRect(reset_x, reset_y, reset_w, reset_h)
+
+            lbl_rect = QRect(bar_x + 10, bar_y, max(60, reset_x - bar_x - 14), bar_h)
+            painter.setPen(QColor("#fef3c7"))
+            painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+            status_lbl = (
+                "DRAG TO SET CHIME AREA (CUSTOM)"
+                if self._chime_zone is not None
+                else "DRAG TO SET CHIME AREA (FULL FRAME)"
+            )
+            painter.drawText(
+                lbl_rect,
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                status_lbl,
+            )
+
+            # 'Full Frame' reset pill
+            hov_reset = self._hover_pos is not None and self._chime_reset_rect.contains(self._hover_pos)
+            is_custom = self._chime_zone is not None
+            painter.setPen(
+                QPen(
+                    QColor("#fbbf24" if hov_reset else ("#52525b" if is_custom else "#27272a")),
+                    1.0,
+                )
+            )
+            painter.setBrush(
+                QColor(63, 63, 70, 240) if hov_reset else QColor(24, 24, 30, 220)
+            )
+            painter.drawRoundedRect(self._chime_reset_rect, 4, 4)
+            painter.setPen(QColor("#ffffff" if hov_reset else ("#e4e4e7" if is_custom else "#71717a")))
+            painter.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
+            painter.drawText(self._chime_reset_rect, Qt.AlignmentFlag.AlignCenter, "Full Frame")
+
+            # 'Done' primary pill
+            hov_done = self._hover_pos is not None and self._chime_done_rect.contains(self._hover_pos)
+            painter.setPen(QPen(QColor("#fde68a" if hov_done else "#f59e0b"), 1.0))
+            painter.setBrush(QColor(217, 119, 6, 245) if hov_done else QColor(180, 83, 9, 235))
+            painter.drawRoundedRect(self._chime_done_rect, 4, 4)
+            painter.setPen(QColor("#ffffff"))
+            painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+            painter.drawText(self._chime_done_rect, Qt.AlignmentFlag.AlignCenter, "Done")
+            return
+
+        # Passive indicator when a custom Chime Zone is configured and user hovers or person is detected
+        if self._chime_zone is not None and len(self._chime_zone) >= 4:
+            if not self._is_connected and (self._qimage is None or self._qimage.isNull()):
+                return
+            triggered = any(
+                len(det) >= 4
+                and CameraConfig.box_in_chime_zone(
+                    (float(det[0]), float(det[1]), float(det[2]), float(det[3])),
+                    self._chime_zone,
+                )
+                for det in self._detections
+            )
+            if self._hover_pos is None and not self._detections:
+                return
+
+            zx = int(round(target.left() + self._chime_zone[0] * target.width()))
+            zy = int(round(target.top() + self._chime_zone[1] * target.height()))
+            zw = max(10, int(round((self._chime_zone[2] - self._chime_zone[0]) * target.width())))
+            zh = max(10, int(round((self._chime_zone[3] - self._chime_zone[1]) * target.height())))
+            z_rect = QRect(zx, zy, zw, zh).intersected(target)
+            if z_rect.width() < 8 or z_rect.height() < 8:
+                return
+
+            border_col = QColor(251, 191, 36, 225) if triggered else QColor(245, 158, 11, 145)
+            if triggered:
+                painter.fillRect(z_rect, QColor(245, 158, 11, 22))
+            painter.setPen(QPen(border_col, 1.8 if triggered else 1.4, Qt.PenStyle.DashLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(z_rect)
+
+            tag_text = "CHIME AREA • TRIGGERED" if triggered else "CHIME AREA"
+            tag_w = 132 if triggered else 76
+            tag_h = 17
+            tag_x = max(target.left() + 4, min(target.right() - tag_w - 4, z_rect.left()))
+            tag_y = (
+                z_rect.top() - tag_h - 3
+                if (z_rect.top() - tag_h - 3) >= (target.top() + 4)
+                else (z_rect.top() + 3)
+            )
+            tag_rect = QRect(tag_x, tag_y, tag_w, tag_h)
+            painter.setPen(QPen(border_col, 1.0))
+            painter.setBrush(QColor(20, 16, 10, 210))
+            painter.drawRoundedRect(tag_rect, 3, 3)
+            painter.setPen(QColor("#fef3c7" if triggered else "#fcd34d"))
+            painter.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+            painter.drawText(tag_rect, Qt.AlignmentFlag.AlignCenter, tag_text)
 
 
 class CameraTileWidget(QFrame):
@@ -2018,6 +2617,7 @@ class CameraTileWidget(QFrame):
         self._is_maximized = False
         self._monitor_mode = False
         self._person_detected = False
+        self._last_chime_ts: float = 0.0
         self._last_saved_snapshot: Optional[str] = None
         self._last_thumb_save_ts: float = 0.0
         self._is_being_dragged = False
@@ -2122,10 +2722,14 @@ class CameraTileWidget(QFrame):
         # --- Video Canvas ---
         self.canvas = VideoCanvas(self)
         self.canvas.set_reconnect_overlay_enabled(True)
+        self.canvas.set_chime_zone(getattr(self.config, "chime_zone", None))
         self.canvas.clicked.connect(lambda: self.selected.emit(self.config.cam_id))
         self.canvas.double_clicked.connect(lambda: self.maximize_requested.emit(self.config.cam_id))
         self.canvas.drag_requested.connect(self._start_trello_drag)
         self.canvas.reconnect_requested.connect(self.reconnect_stream)
+        self.canvas.dismiss_detection_requested.connect(self.ignore_detection_box)
+        self.canvas.chime_zone_changed.connect(self._on_canvas_chime_zone_changed)
+        self.canvas.chime_zone_edit_toggled.connect(self._on_canvas_chime_zone_edit_toggled)
         self.canvas.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.canvas.customContextMenuRequested.connect(self._show_context_menu)
         self.canvas.set_camera_info(self.config.name, "Live Feed")
@@ -2166,6 +2770,23 @@ class CameraTileWidget(QFrame):
         self.audio_bar.setFixedSize(40, 4)
         self.audio_bar.setToolTip("Live Audio Level")
         c_layout.addWidget(self.audio_bar)
+
+        self.btn_chime = QPushButton()
+        self.btn_chime.setObjectName("ghostBtn")
+        self.btn_chime.setCheckable(True)
+        self.btn_chime.setIconSize(QSize(14, 14))
+        self.btn_chime.setFixedSize(26, 24)
+        self.btn_chime.clicked.connect(self._toggle_detection_sound)
+        c_layout.addWidget(self.btn_chime)
+
+        self.btn_chime_zone = QPushButton()
+        self.btn_chime_zone.setObjectName("ghostBtn")
+        self.btn_chime_zone.setCheckable(True)
+        self.btn_chime_zone.setIconSize(QSize(14, 14))
+        self.btn_chime_zone.setFixedSize(26, 24)
+        self.btn_chime_zone.clicked.connect(self.toggle_chime_zone_editor)
+        self._update_chime_btn()
+        c_layout.addWidget(self.btn_chime_zone)
 
         c_layout.addStretch()
 
@@ -2219,6 +2840,22 @@ class CameraTileWidget(QFrame):
     def _show_context_menu(self, pos: QPoint) -> None:
         self.selected.emit(self.config.cam_id)
         menu = QMenu(self)
+
+        hit_det = self.canvas.detection_at_pos(pos)
+        active_dets = list(self.canvas._detections or self.canvas._pinned_detections)
+        act_ignore_det = None
+        if hit_det is not None or active_dets:
+            act_ignore_det = menu.addAction('Mark Detected Object as "Not a Person" (Ignore False Trigger)')
+            menu.addSeparator()
+
+        ignored_count = len(getattr(self.config, "ignored_objects", None) or [])
+        act_clear_ignored = None
+        if ignored_count > 0:
+            act_clear_ignored = menu.addAction(
+                f'Reset Ignored "Not a Person" Objects ({ignored_count} saved)'
+            )
+            menu.addSeparator()
+
         act_sd = menu.addAction("Review SD Card Footage & Anomalies...")
         menu.addSeparator()
         act_mon = menu.addAction(
@@ -2226,6 +2863,23 @@ class CameraTileWidget(QFrame):
         )
         act_max = menu.addAction("Solo / Restore This Camera (Double-Click)")
         act_ptz = menu.addAction("PTZ & Camera Controls")
+        chime_on = bool(getattr(self.config, "detection_sound", True))
+        cd_sec = int(getattr(self.config, "detection_sound_cooldown", 10) or 10)
+        act_chime = menu.addAction(
+            f"Mute Person Detection Chime ({cd_sec}s cooldown)"
+            if chime_on
+            else f"Enable Person Detection Chime ({cd_sec}s cooldown)"
+        )
+        is_editing_zone = bool(getattr(self.canvas, "_editing_chime_zone", False))
+        has_custom_zone = CameraConfig.normalize_chime_zone(getattr(self.config, "chime_zone", None)) is not None
+        act_chime_zone = menu.addAction(
+            "Finish Editing Chime Trigger Area"
+            if is_editing_zone
+            else "Set Chime Trigger Area on Footage (Drag Box)..."
+        )
+        act_reset_chime_zone = (
+            menu.addAction("Reset Chime Trigger Area to Whole Frame") if has_custom_zone else None
+        )
         menu.addSeparator()
         act_snap = menu.addAction("Take Photo / Snapshot (Space / S)")
         act_folder = menu.addAction("Open Snapshots Folder")
@@ -2235,7 +2889,11 @@ class CameraTileWidget(QFrame):
         menu.addSeparator()
         act_del = menu.addAction("Remove Camera")
         chosen = menu.exec(self.canvas.mapToGlobal(pos))
-        if chosen == act_sd:
+        if act_ignore_det is not None and chosen == act_ignore_det:
+            self.ignore_detection_box(hit_det)
+        elif act_clear_ignored is not None and chosen == act_clear_ignored:
+            self.clear_ignored_objects()
+        elif chosen == act_sd:
             self.review_sd_requested.emit(self.config.cam_id)
         elif chosen == act_mon:
             self.monitor_mode_requested.emit()
@@ -2243,6 +2901,12 @@ class CameraTileWidget(QFrame):
             self.maximize_requested.emit(self.config.cam_id)
         elif chosen == act_ptz:
             self.controls_requested.emit(self.config.cam_id)
+        elif chosen == act_chime:
+            self._toggle_detection_sound()
+        elif chosen == act_chime_zone:
+            self.toggle_chime_zone_editor()
+        elif act_reset_chime_zone is not None and chosen == act_reset_chime_zone:
+            self.reset_chime_zone()
         elif chosen == act_snap:
             self.take_snapshot()
         elif chosen == act_folder:
@@ -2441,7 +3105,9 @@ class CameraTileWidget(QFrame):
         self.title_lbl.setText(config.name)
         self.badge_lbl.setText(self._protocol_badge())
         self.canvas.set_camera_info(config.name, "Live Feed")
+        self.canvas.set_chime_zone(getattr(config, "chime_zone", None))
         self._update_quality_btn()
+        self._update_chime_btn()
         if self.worker is not None and not stream_changed:
             self.worker.config.name = config.name
             self.worker.set_detection_options(
@@ -2571,6 +3237,20 @@ class CameraTileWidget(QFrame):
             self._last_thumb_save_ts = now_t
             self._save_cached_last_frame(image)
 
+    def _any_detection_in_chime_zone(self, boxes: list) -> bool:
+        if not boxes:
+            return False
+        zone = CameraConfig.normalize_chime_zone(getattr(self.config, "chime_zone", None))
+        if zone is None:
+            return True
+        for det in boxes:
+            if len(det) >= 4 and CameraConfig.box_in_chime_zone(
+                (float(det[0]), float(det[1]), float(det[2]), float(det[3])),
+                zone,
+            ):
+                return True
+        return False
+
     def _on_detections(self, cam_id: str, boxes: list) -> None:
         _ = cam_id
         has_person = bool(boxes)
@@ -2579,6 +3259,19 @@ class CameraTileWidget(QFrame):
             self._person_detected = has_person
             self.person_lbl.setVisible(has_person)
             self._update_border()
+        if (
+            has_person
+            and bool(getattr(self.config, "person_detection", True))
+            and bool(getattr(self.config, "detection_sound", True))
+            and self._any_detection_in_chime_zone(boxes)
+        ):
+            import time as _time
+
+            now_t = _time.monotonic()
+            cd_sec = float(getattr(self.config, "detection_sound_cooldown", 10) or 10)
+            if (now_t - self._last_chime_ts) >= cd_sec:
+                self._last_chime_ts = now_t
+                DetectionChimePlayer.play_chime()
 
     def _on_audio(self, cam_id: str, pcm_bytes: bytes, level: float) -> None:
         _ = cam_id
@@ -2622,6 +3315,131 @@ class CameraTileWidget(QFrame):
         self.btn_mute.setIcon(
             lucide_icon("volume_2", "#10b981", 14) if checked else lucide_icon("volume_x", "#71717a", 14)
         )
+
+    def _update_chime_btn(self) -> None:
+        chime_on = bool(getattr(self.config, "detection_sound", True))
+        cd_sec = int(getattr(self.config, "detection_sound_cooldown", 10) or 10)
+        zone = CameraConfig.normalize_chime_zone(getattr(self.config, "chime_zone", None))
+        zone_desc = "Custom Area" if zone is not None else "Whole Frame"
+        self.btn_chime.blockSignals(True)
+        self.btn_chime.setChecked(chime_on)
+        self.btn_chime.blockSignals(False)
+        if chime_on:
+            self.btn_chime.setIcon(lucide_icon("bell", "#f59e0b", 14))
+            self.btn_chime.setToolTip(
+                f"Person Detection Chime: ON ({cd_sec}s cooldown • {zone_desc}) — Click to Mute Chime"
+            )
+        else:
+            self.btn_chime.setIcon(lucide_icon("bell_off", "#71717a", 14))
+            self.btn_chime.setToolTip(
+                f"Person Detection Chime: OFF ({zone_desc}) — Click to Enable Chime"
+            )
+        if hasattr(self, "btn_chime_zone"):
+            editing = bool(getattr(self.canvas, "_editing_chime_zone", False))
+            self.btn_chime_zone.blockSignals(True)
+            self.btn_chime_zone.setChecked(editing or zone is not None)
+            self.btn_chime_zone.blockSignals(False)
+            if editing:
+                self.btn_chime_zone.setIcon(lucide_icon("scan", "#fbbf24", 14))
+                self.btn_chime_zone.setToolTip(
+                    "Editing Chime Trigger Area — Drag a box on the footage or click to finish"
+                )
+            elif zone is not None:
+                self.btn_chime_zone.setIcon(lucide_icon("scan", "#f59e0b", 14))
+                self.btn_chime_zone.setToolTip(
+                    "Chime Trigger Area: Custom Area Set — Click to edit area on footage"
+                )
+            else:
+                self.btn_chime_zone.setIcon(lucide_icon("scan", "#71717a", 14))
+                self.btn_chime_zone.setToolTip(
+                    "Chime Trigger Area: Whole Frame (Default) — Click to draw a custom trigger area (e.g. Gate)"
+                )
+
+    def toggle_chime_zone_editor(self) -> None:
+        self.selected.emit(self.config.cam_id)
+        new_mode = not bool(getattr(self.canvas, "_editing_chime_zone", False))
+        self.canvas.set_chime_zone_edit_mode(new_mode)
+
+    def reset_chime_zone(self) -> None:
+        self.selected.emit(self.config.cam_id)
+        self.config.chime_zone = None
+        self.canvas.set_chime_zone(None)
+        self.canvas.set_chime_zone_edit_mode(False)
+        self._update_chime_btn()
+        self.canvas.show_info_toast(f"Chime trigger area reset to Whole Frame on {self.config.name}")
+        self.config_changed.emit()
+
+    def _on_canvas_chime_zone_changed(self, zone: object) -> None:
+        norm = CameraConfig.normalize_chime_zone(zone)
+        self.config.chime_zone = norm
+        self.canvas.set_chime_zone(norm)
+        self._update_chime_btn()
+        if norm is not None:
+            self.canvas.show_info_toast(f"Saved custom Chime Trigger Area on {self.config.name}")
+        else:
+            self.canvas.show_info_toast(f"Chime Trigger Area set to Whole Frame on {self.config.name}")
+        self.config_changed.emit()
+
+    def _on_canvas_chime_zone_edit_toggled(self, editing: bool) -> None:
+        _ = editing
+        self._update_chime_btn()
+        self.config_changed.emit()
+
+    def _toggle_detection_sound(self) -> None:
+        self.selected.emit(self.config.cam_id)
+        new_state = not bool(getattr(self.config, "detection_sound", True))
+        self.config.detection_sound = new_state
+        self._update_chime_btn()
+        if new_state:
+            DetectionChimePlayer.play_chime(force=True)
+        self.config_changed.emit()
+
+    def ignore_detection_box(self, box: Optional[tuple] = None) -> bool:
+        """Mark the given detection box (or all currently active/pinned detection boxes on this tile) as 'Not a Person'."""
+        self.selected.emit(self.config.cam_id)
+        targets: List[Tuple[float, float, float, float]] = []
+        if box is not None and len(box) >= 4:
+            targets.append((float(box[0]), float(box[1]), float(box[2]), float(box[3])))
+        else:
+            for det in list(self.canvas._detections or self.canvas._pinned_detections):
+                if len(det) >= 4:
+                    targets.append((float(det[0]), float(det[1]), float(det[2]), float(det[3])))
+
+        if not targets:
+            self.canvas.show_error_toast("No recent person detection on this camera to mark")
+            return False
+
+        for tbox in targets:
+            if self.worker is not None:
+                self.worker.ignore_detection_box(tbox)
+            else:
+                if not hasattr(self.config, "ignored_objects") or self.config.ignored_objects is None:
+                    self.config.ignored_objects = []
+                self.config.ignored_objects.append(
+                    {
+                        "box": [round(tbox[0], 4), round(tbox[1], 4), round(tbox[2], 4), round(tbox[3], 4)],
+                        "fingerprint": [],
+                        "created_at": datetime.now().strftime("%H:%M"),
+                    }
+                )
+            self.canvas.remove_pinned_box(tbox)
+
+        remaining = list(self.canvas._detections)
+        self._person_detected = bool(remaining)
+        self.person_lbl.setVisible(bool(remaining))
+        self._update_border()
+        total_ig = len(getattr(self.config, "ignored_objects", None) or [])
+        self.canvas.show_info_toast(f'Marked as "Not a Person" ({total_ig} ignored on {self.config.name})')
+        self.config_changed.emit()
+        return True
+
+    def clear_ignored_objects(self) -> None:
+        self.selected.emit(self.config.cam_id)
+        self.config.ignored_objects = []
+        if self.worker is not None:
+            self.worker.clear_ignored_objects()
+        self.canvas.show_info_toast(f'Cleared ignored objects on {self.config.name}')
+        self.config_changed.emit()
 
     def _update_quality_btn(self) -> None:
         is_hd = self.config.quality == 1
@@ -5489,13 +6307,26 @@ class OmniSightMainWindow(QMainWindow):
         self.grid_layout.setSpacing(6)
         ws_hbox.addWidget(self.grid_container, 1)
 
-        # Right Collapsible PTZ & Device Inspector Drawer (Open by default)
+        # Right Collapsible PTZ & Device Inspector Drawer (Open by default, scrollable when window height is short)
         self.drawer = QFrame()
         self.drawer.setObjectName("inspectorDrawer")
-        self.drawer.setFixedWidth(275)
+        self.drawer.setFixedWidth(285)
         self.drawer.setVisible(True)
-        d_vbox = QVBoxLayout(self.drawer)
-        d_vbox.setContentsMargins(12, 12, 12, 12)
+        drawer_outer_vbox = QVBoxLayout(self.drawer)
+        drawer_outer_vbox.setContentsMargins(0, 0, 0, 0)
+        drawer_outer_vbox.setSpacing(0)
+
+        self.drawer_scroll = QScrollArea()
+        self.drawer_scroll.setObjectName("drawerScrollArea")
+        self.drawer_scroll.setWidgetResizable(True)
+        self.drawer_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.drawer_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.drawer_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        drawer_content = QWidget()
+        drawer_content.setObjectName("drawerContent")
+        d_vbox = QVBoxLayout(drawer_content)
+        d_vbox.setContentsMargins(12, 12, 10, 12)
         d_vbox.setSpacing(10)
 
         # 1. Camera Switcher Section (Auto-sizes height to fit items cleanly without scrollbar)
@@ -5708,7 +6539,7 @@ class OmniSightMainWindow(QMainWindow):
 
         det_row = QHBoxLayout()
         det_row.setSpacing(4)
-        self.btn_person_det = QPushButton("Person Detection Alert")
+        self.btn_person_det = QPushButton("Person Alert")
         self.btn_person_det.setObjectName("optBtn")
         self.btn_person_det.setCheckable(True)
         self.btn_person_det.setChecked(True)
@@ -5717,8 +6548,73 @@ class OmniSightMainWindow(QMainWindow):
             "Long-Range Person Detection — Draws PERSON / PERSON (FAR) bounding box and flashes red corner outline"
         )
         self.btn_person_det.clicked.connect(self._toggle_person_detection)
-        det_row.addWidget(self.btn_person_det)
+        det_row.addWidget(self.btn_person_det, 1)
+
+        self.btn_det_sound = QPushButton("Chime")
+        self.btn_det_sound.setObjectName("optBtn")
+        self.btn_det_sound.setCheckable(True)
+        self.btn_det_sound.setChecked(True)
+        self.btn_det_sound.setIcon(lucide_icon("bell", "#f59e0b", 13))
+        self.btn_det_sound.setToolTip(
+            "Person Detection Audio Chime — Plays a gentle two-note harmonic chime when a person is detected"
+        )
+        self.btn_det_sound.clicked.connect(self._toggle_detection_sound)
+        det_row.addWidget(self.btn_det_sound, 1)
         opt_vbox.addLayout(det_row)
+
+        cd_row = QHBoxLayout()
+        cd_row.setSpacing(4)
+        lbl_cd = QLabel("Chime Cooldown:")
+        lbl_cd.setStyleSheet("color: #71717a; font-size: 10px; font-weight: 600;")
+        cd_row.addWidget(lbl_cd)
+
+        self.btn_cd_5 = QPushButton("5s")
+        self.btn_cd_5.setObjectName("optBtn")
+        self.btn_cd_5.setCheckable(True)
+        self.btn_cd_5.setToolTip("5-second cooldown before the detection chime can play again on this camera")
+        self.btn_cd_5.clicked.connect(lambda: self._set_detection_sound_cooldown(5))
+
+        self.btn_cd_10 = QPushButton("10s")
+        self.btn_cd_10.setObjectName("optBtn")
+        self.btn_cd_10.setCheckable(True)
+        self.btn_cd_10.setChecked(True)
+        self.btn_cd_10.setToolTip("10-second cooldown before the detection chime can play again on this camera")
+        self.btn_cd_10.clicked.connect(lambda: self._set_detection_sound_cooldown(10))
+
+        self.btn_cd_20 = QPushButton("20s")
+        self.btn_cd_20.setObjectName("optBtn")
+        self.btn_cd_20.setCheckable(True)
+        self.btn_cd_20.setToolTip("20-second cooldown before the detection chime can play again on this camera")
+        self.btn_cd_20.clicked.connect(lambda: self._set_detection_sound_cooldown(20))
+
+        cd_row.addWidget(self.btn_cd_5, 1)
+        cd_row.addWidget(self.btn_cd_10, 1)
+        cd_row.addWidget(self.btn_cd_20, 1)
+        opt_vbox.addLayout(cd_row)
+
+        chime_area_row = QHBoxLayout()
+        chime_area_row.setSpacing(4)
+        self.btn_chime_zone = QPushButton("Set Chime Area")
+        self.btn_chime_zone.setObjectName("optBtn")
+        self.btn_chime_zone.setCheckable(True)
+        self.btn_chime_zone.setIcon(lucide_icon("scan", "#a1a1aa", 12))
+        self.btn_chime_zone.setToolTip(
+            "Draw a region on the camera footage (e.g. Gate) where Person Detection Chime is allowed to trigger.\n"
+            "By default, the Whole Frame triggers the chime until a custom area is set."
+        )
+        self.btn_chime_zone.clicked.connect(self._toggle_chime_zone_editor)
+        chime_area_row.addWidget(self.btn_chime_zone, 1)
+
+        self.btn_reset_chime_zone = QPushButton("Full Frame")
+        self.btn_reset_chime_zone.setObjectName("optBtn")
+        self.btn_reset_chime_zone.setIcon(lucide_icon("maximize_2", "#a1a1aa", 11))
+        self.btn_reset_chime_zone.setEnabled(False)
+        self.btn_reset_chime_zone.setToolTip(
+            "Reset Chime Trigger Area to Whole Frame (Default — chime triggers anywhere in frame)"
+        )
+        self.btn_reset_chime_zone.clicked.connect(self._reset_chime_zone)
+        chime_area_row.addWidget(self.btn_reset_chime_zone)
+        opt_vbox.addLayout(chime_area_row)
 
         sens_row = QHBoxLayout()
         sens_row.setSpacing(4)
@@ -5747,6 +6643,26 @@ class OmniSightMainWindow(QMainWindow):
         sens_row.addWidget(self.btn_sens_high)
         sens_row.addWidget(self.btn_sens_ultra)
         opt_vbox.addLayout(sens_row)
+
+        ignore_row = QHBoxLayout()
+        ignore_row.setSpacing(4)
+        self.btn_ignore_person = QPushButton("Not a Person")
+        self.btn_ignore_person.setObjectName("optBtn")
+        self.btn_ignore_person.setIcon(lucide_icon("x", "#f87171", 12))
+        self.btn_ignore_person.setToolTip(
+            "Dismiss the currently detected object on this camera as 'Not a Person' so it won't false-trigger again"
+        )
+        self.btn_ignore_person.clicked.connect(self._ignore_active_detection)
+        ignore_row.addWidget(self.btn_ignore_person, 1)
+
+        self.btn_reset_ignored = QPushButton("Reset (0)")
+        self.btn_reset_ignored.setObjectName("optBtn")
+        self.btn_reset_ignored.setIcon(lucide_icon("refresh", "#a1a1aa", 11))
+        self.btn_reset_ignored.setEnabled(False)
+        self.btn_reset_ignored.setToolTip("Clear all saved 'Not a Person' ignored false-positive objects on this camera")
+        self.btn_reset_ignored.clicked.connect(self._clear_ignored_detections)
+        ignore_row.addWidget(self.btn_reset_ignored)
+        opt_vbox.addLayout(ignore_row)
 
         gpu_row = QHBoxLayout()
         gpu_row.setSpacing(4)
@@ -5796,6 +6712,8 @@ class OmniSightMainWindow(QMainWindow):
         d_vbox.addWidget(aud_sec)
 
         d_vbox.addStretch(1)
+        self.drawer_scroll.setWidget(drawer_content)
+        drawer_outer_vbox.addWidget(self.drawer_scroll)
         ws_hbox.addWidget(self.drawer)
 
         self.workspace_stack = QStackedWidget()
@@ -6178,16 +7096,20 @@ class OmniSightMainWindow(QMainWindow):
         if self.selected_cam_id:
             cfg = self._get_config(self.selected_cam_id)
             if cfg:
+                self._sync_optics_buttons(cfg)
                 stream_profile = "HD Stream" if cfg.quality == 1 else "SD Stream"
                 sens_lbl = getattr(cfg, "detection_sensitivity", "ultra").upper()
                 gpu_lbl = "GPU" if bool(getattr(cfg, "gpu_acceleration", True)) else "CPU"
                 self.lbl_selected_meta.setText(f"{cfg.protocol.upper()}  |  {stream_profile}  |  {sens_lbl} ({gpu_lbl})")
-                self.status_bar.showMessage(f"Switched {cfg.name} to {stream_profile}.", 3000)
 
     def _sync_optics_buttons(self, cfg: CameraConfig) -> None:
         img_mode = (cfg.image_mode or "auto").lower()
         light_mode = (cfg.light_mode or "auto").lower()
         sens = (getattr(cfg, "detection_sensitivity", "ultra") or "ultra").lower()
+        chime_on = bool(getattr(cfg, "detection_sound", True))
+        cd_sec = int(getattr(cfg, "detection_sound_cooldown", 10) or 10)
+        if cd_sec not in (5, 10, 20):
+            cd_sec = 10
         gpu_on = bool(getattr(cfg, "gpu_acceleration", True))
         self.btn_img_color.setChecked(img_mode == "color")
         self.btn_img_bw.setChecked(img_mode == "bw")
@@ -6197,9 +7119,33 @@ class OmniSightMainWindow(QMainWindow):
         self.btn_l_auto.setChecked(light_mode not in ("on", "off"))
         self.btn_flip.setChecked(bool(cfg.flipped))
         self.btn_person_det.setChecked(bool(getattr(cfg, "person_detection", True)))
+        self.btn_det_sound.setChecked(chime_on)
+        self.btn_det_sound.setIcon(lucide_icon("bell" if chime_on else "bell_off", "#f59e0b" if chime_on else "#71717a", 13))
+        self.btn_cd_5.setChecked(cd_sec == 5)
+        self.btn_cd_10.setChecked(cd_sec == 10)
+        self.btn_cd_20.setChecked(cd_sec == 20)
+        zone = CameraConfig.normalize_chime_zone(getattr(cfg, "chime_zone", None))
+        tile_ref = self.tiles.get(cfg.cam_id)
+        editing_zone = bool(tile_ref and getattr(tile_ref.canvas, "_editing_chime_zone", False))
+        self.btn_chime_zone.blockSignals(True)
+        self.btn_chime_zone.setChecked(editing_zone or zone is not None)
+        self.btn_chime_zone.blockSignals(False)
+        if editing_zone:
+            self.btn_chime_zone.setText("Done (Area)")
+            self.btn_chime_zone.setIcon(lucide_icon("check", "#10b981", 12))
+        elif zone is not None:
+            self.btn_chime_zone.setText("Chime Area: Custom")
+            self.btn_chime_zone.setIcon(lucide_icon("scan", "#f59e0b", 12))
+        else:
+            self.btn_chime_zone.setText("Set Chime Area")
+            self.btn_chime_zone.setIcon(lucide_icon("scan", "#a1a1aa", 12))
+        self.btn_reset_chime_zone.setEnabled(zone is not None)
         self.btn_sens_std.setChecked(sens == "standard")
         self.btn_sens_high.setChecked(sens == "high")
         self.btn_sens_ultra.setChecked(sens not in ("standard", "high"))
+        ignored_count = len(getattr(cfg, "ignored_objects", None) or [])
+        self.btn_reset_ignored.setText(f"Reset ({ignored_count})")
+        self.btn_reset_ignored.setEnabled(ignored_count > 0)
         self.btn_gpu_accel.setChecked(gpu_on)
         self.btn_gpu_accel.setIcon(lucide_icon("zap", "#10b981" if gpu_on else "#71717a", 13))
         self._sync_all_gpu_btn()
@@ -6535,11 +7481,102 @@ class OmniSightMainWindow(QMainWindow):
                 gpu_acceleration=bool(getattr(tile.config, "gpu_acceleration", True)),
             )
         if not tile.config.person_detection:
+            tile.canvas.set_detections([], force_clear=True)
             tile._on_detections(tile.config.cam_id, [])
         self._sync_optics_buttons(tile.config)
         self._save_cameras_list()
         state_str = "ENABLED" if tile.config.person_detection else "DISABLED"
         self.status_bar.showMessage(f"Person Detection Alert {state_str} on {tile.config.name}", 3000)
+
+    def _toggle_detection_sound(self) -> None:
+        tile = self._active_tile()
+        if not tile:
+            return
+        new_state = not bool(getattr(tile.config, "detection_sound", True))
+        tile.config.detection_sound = new_state
+        tile._update_chime_btn()
+        self._sync_optics_buttons(tile.config)
+        self._save_cameras_list()
+        if new_state:
+            DetectionChimePlayer.play_chime(force=True)
+        cd_sec = int(getattr(tile.config, "detection_sound_cooldown", 10) or 10)
+        state_str = f"ENABLED ({cd_sec}s cooldown)" if new_state else "MUTED"
+        self.status_bar.showMessage(f"Person Detection Chime {state_str} on {tile.config.name}", 3000)
+
+    def _set_detection_sound_cooldown(self, cooldown_sec: int) -> None:
+        cd = int(cooldown_sec) if int(cooldown_sec) in (5, 10, 20) else 10
+        tile = self._active_tile()
+        if not tile:
+            return
+        tile.config.detection_sound_cooldown = cd
+        tile.config.detection_sound = True
+        tile._update_chime_btn()
+        self._sync_optics_buttons(tile.config)
+        self._save_cameras_list()
+        DetectionChimePlayer.play_chime(force=True)
+        self.status_bar.showMessage(
+            f"Person Detection Chime Cooldown set to {cd}s on {tile.config.name}",
+            3000,
+        )
+
+    def _toggle_chime_zone_editor(self) -> None:
+        tile = self._active_tile()
+        if not tile:
+            self.status_bar.showMessage("Select a camera first to set its Chime Trigger Area", 3000)
+            return
+        for cid, other in self.tiles.items():
+            if cid != tile.config.cam_id and getattr(other.canvas, "_editing_chime_zone", False):
+                other.canvas.set_chime_zone_edit_mode(False)
+        tile.toggle_chime_zone_editor()
+        editing = bool(getattr(tile.canvas, "_editing_chime_zone", False))
+        self._sync_optics_buttons(tile.config)
+        if editing:
+            self.status_bar.showMessage(
+                f"Click and drag a box on '{tile.config.name}' footage to set the Chime Trigger Area (e.g. Gate). Click Done or press Esc when finished.",
+                6000,
+            )
+        else:
+            zone = CameraConfig.normalize_chime_zone(getattr(tile.config, "chime_zone", None))
+            desc = "Custom Area saved" if zone is not None else "Whole Frame (Default)"
+            self.status_bar.showMessage(f"Chime Trigger Area on {tile.config.name}: {desc}", 4000)
+
+    def _reset_chime_zone(self) -> None:
+        tile = self._active_tile()
+        if not tile:
+            return
+        tile.reset_chime_zone()
+        self._sync_optics_buttons(tile.config)
+        self.status_bar.showMessage(
+            f"✓ Reset Chime Trigger Area to Whole Frame on {tile.config.name}.",
+            4000,
+        )
+
+    def _ignore_active_detection(self) -> None:
+        tile = self._active_tile()
+        if not tile:
+            self.status_bar.showMessage("Select a camera first to mark an object as 'Not a Person'", 3000)
+            return
+        if tile.ignore_detection_box(None):
+            cnt = len(getattr(tile.config, "ignored_objects", None) or [])
+            self.status_bar.showMessage(
+                f"✓ Marked current detection as 'Not a Person' on {tile.config.name} ({cnt} ignored).",
+                4500,
+            )
+        else:
+            self.status_bar.showMessage(
+                f"No active person detection on {tile.config.name} right now (or hover red bracket & click '× Not a Person').",
+                4500,
+            )
+
+    def _clear_ignored_detections(self) -> None:
+        tile = self._active_tile()
+        if not tile:
+            return
+        tile.clear_ignored_objects()
+        self.status_bar.showMessage(
+            f"✓ Cleared all saved 'Not a Person' ignored objects on {tile.config.name}.",
+            4000,
+        )
 
     def _set_detection_sensitivity(self, sensitivity: str) -> None:
         sens = (sensitivity or "ultra").lower()
@@ -6624,6 +7661,7 @@ class OmniSightMainWindow(QMainWindow):
     def _on_volume_changed(self, value: int) -> None:
         self.lbl_vol_pct.setText(f"{value}%")
         vol = value / 100.0
+        DetectionChimePlayer.set_volume(vol)
         for tile in self.tiles.values():
             tile.audio_out.set_volume(vol)
 
@@ -6687,7 +7725,16 @@ class OmniSightMainWindow(QMainWindow):
         if event.key() == Qt.Key.Key_F11:
             self.toggle_monitor_mode()
             return
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            for tile in self.tiles.values():
+                if getattr(tile.canvas, "_editing_chime_zone", False):
+                    tile.canvas.set_chime_zone_edit_mode(False)
+                    return
         if event.key() == Qt.Key.Key_Escape:
+            for tile in self.tiles.values():
+                if getattr(tile.canvas, "_editing_chime_zone", False):
+                    tile.canvas.set_chime_zone_edit_mode(False)
+                    return
             if self.monitor_mode or self.isFullScreen():
                 self.set_monitor_mode(False)
                 return

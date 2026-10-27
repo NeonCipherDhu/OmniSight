@@ -159,11 +159,77 @@ class CameraConfig:
     flipped: bool = False
     person_detection: bool = True
     detection_sensitivity: str = "ultra"  # "standard" | "high" | "ultra"
+    detection_sound: bool = True
+    detection_sound_cooldown: int = 10  # 5 | 10 | 20 seconds
+    chime_zone: Optional[List[float]] = None  # None = whole frame (default), or [x1, y1, x2, y2] in 0.0..1.0
     gpu_acceleration: bool = True
     ptz_presets: List[Dict[str, Any]] = field(default_factory=list)
+    ignored_objects: List[Dict[str, Any]] = field(default_factory=list)
+
+    @staticmethod
+    def normalize_chime_zone(zone: Any) -> Optional[List[float]]:
+        """Validate and normalize a chime trigger region [x1, y1, x2, y2] in [0.0..1.0], or None for whole frame."""
+        if not zone or not isinstance(zone, (list, tuple)) or len(zone) < 4:
+            return None
+        try:
+            x1 = max(0.0, min(1.0, float(zone[0])))
+            y1 = max(0.0, min(1.0, float(zone[1])))
+            x2 = max(0.0, min(1.0, float(zone[2])))
+            y2 = max(0.0, min(1.0, float(zone[3])))
+            if x1 > x2:
+                x1, x2 = x2, x1
+            if y1 > y2:
+                y1, y2 = y2, y1
+            if (x2 - x1) < 0.03 or (y2 - y1) < 0.03:
+                return None
+            if x1 <= 0.01 and y1 <= 0.01 and x2 >= 0.99 and y2 >= 0.99:
+                return None
+            return [round(x1, 4), round(y1, 4), round(x2, 4), round(y2, 4)]
+        except Exception:
+            return None
+
+    @staticmethod
+    def box_in_chime_zone(
+        box: Tuple[float, float, float, float],
+        chime_zone: Optional[List[float]],
+    ) -> bool:
+        """
+        Return True if a detected person bounding box (x1, y1, x2, y2) is inside/overlapping
+        the configured chime trigger zone. If chime_zone is None, the whole frame triggers.
+        """
+        norm_zone = CameraConfig.normalize_chime_zone(chime_zone)
+        if norm_zone is None:
+            return True
+        if not box or len(box) < 4:
+            return False
+        zx1, zy1, zx2, zy2 = norm_zone[0], norm_zone[1], norm_zone[2], norm_zone[3]
+        bx1, by1, bx2, by2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
+        bw = max(1e-6, bx2 - bx1)
+        bh = max(1e-6, by2 - by1)
+        bcx = (bx1 + bx2) * 0.5
+        bcy = (by1 + by2) * 0.5
+        foot_y = by1 + bh * 0.78
+
+        # 1. Person center or lower-body/feet point lies inside the chime trigger zone
+        if zx1 <= bcx <= zx2 and (zy1 <= bcy <= zy2 or zy1 <= foot_y <= zy2):
+            return True
+
+        # 2. Meaningful bounding-box intersection with the chime trigger zone
+        ix1 = max(bx1, zx1)
+        iy1 = max(by1, zy1)
+        ix2 = min(bx2, zx2)
+        iy2 = min(by2, zy2)
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        if inter <= 0.0:
+            return False
+        person_area = bw * bh
+        zone_area = max(1e-6, (zx2 - zx1) * (zy2 - zy1))
+        return (inter / person_area) >= 0.20 or (inter / zone_area) >= 0.20
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        d["chime_zone"] = self.normalize_chime_zone(self.chime_zone)
+        return d
 
     @classmethod
     def from_dict(cls, data: dict) -> "CameraConfig":
@@ -171,6 +237,14 @@ class CameraConfig:
         filtered = {k: v for k, v in data.items() if k in valid_keys}
         if str(filtered.get("protocol", "")).lower() == "v380":
             filtered["protocol"] = "lan8800"
+        if "detection_sound_cooldown" in filtered:
+            try:
+                cd = int(filtered["detection_sound_cooldown"])
+                filtered["detection_sound_cooldown"] = cd if cd in (5, 10, 20) else 10
+            except Exception:
+                filtered["detection_sound_cooldown"] = 10
+        if "chime_zone" in filtered:
+            filtered["chime_zone"] = cls.normalize_chime_zone(filtered["chime_zone"])
         return cls(**filtered)
 
 
@@ -239,6 +313,116 @@ class LiveAudioOutput(QObject):
                 pass
             self._sink = None
             self._io_device = None
+
+
+class DetectionChimePlayer:
+    """
+    Synthesizes and plays a gentle, non-jarring two-note harmonic chime
+    (warm E5 -> A5 acoustic ping) asynchronously on a background thread.
+    """
+
+    _lock = threading.Lock()
+    _last_global_play_ts: float = 0.0
+    _wav_cache: Dict[int, bytes] = {}
+    _volume: float = 0.85
+
+    @classmethod
+    def set_volume(cls, volume: float) -> None:
+        cls._volume = max(0.0, min(1.0, float(volume)))
+
+    @classmethod
+    def _build_chime_wav(cls, vol_pct: int) -> bytes:
+        cached = cls._wav_cache.get(vol_pct)
+        if cached is not None:
+            return cached
+
+        import struct
+
+        sample_rate = 44100
+        duration = 0.36
+        n_samples = int(sample_rate * duration)
+        t = np.linspace(0.0, duration, n_samples, endpoint=False, dtype=np.float32)
+
+        # Note 1: Warm E5 (659.25 Hz) + soft 2nd harmonic, smooth 8ms cosine fade-in & exponential bell decay
+        f1 = 659.25
+        env1 = np.exp(-15.0 * t)
+        attack1 = np.clip(t / 0.008, 0.0, 1.0)
+        attack1 = 0.5 * (1.0 - np.cos(np.pi * attack1))
+        note1 = (
+            np.sin(2.0 * np.pi * f1 * t)
+            + 0.16 * np.sin(2.0 * np.pi * (f1 * 2.0) * t)
+        ) * env1 * attack1
+
+        # Note 2: Pleasant A5 (880.0 Hz) + soft harmonics starting at 95ms for a gentle upward two-tone chime
+        f2 = 880.0
+        t2_offset = 0.095
+        t2 = np.maximum(0.0, t - t2_offset)
+        active2 = (t >= t2_offset).astype(np.float32)
+        env2 = np.exp(-11.5 * t2) * active2
+        attack2 = np.clip(t2 / 0.009, 0.0, 1.0)
+        attack2 = 0.5 * (1.0 - np.cos(np.pi * attack2))
+        note2 = (
+            np.sin(2.0 * np.pi * f2 * t2)
+            + 0.14 * np.sin(2.0 * np.pi * (f2 * 2.0) * t2)
+            + 0.04 * np.sin(2.0 * np.pi * (f2 * 3.0) * t2)
+        ) * env2 * attack2
+
+        # Smooth tail fade-out over final 25ms to eliminate any click/pop
+        tail_fade = np.clip((duration - t) / 0.025, 0.0, 1.0)
+        wave = (0.52 * note1 + 0.62 * note2) * tail_fade
+
+        peak = float(np.max(np.abs(wave))) or 1.0
+        gain = 0.26 * (float(vol_pct) / 100.0)
+        pcm_f32 = (wave / peak) * gain
+        pcm_i16 = np.clip(pcm_f32 * 32767.0, -32767, 32767).astype(np.int16)
+        pcm_bytes = pcm_i16.tobytes()
+
+        data_size = len(pcm_bytes)
+        header = struct.pack(
+            "<4sI4s4sIHHIIHH4sI",
+            b"RIFF",
+            36 + data_size,
+            b"WAVE",
+            b"fmt ",
+            16,
+            1,  # PCM
+            1,  # Mono
+            sample_rate,
+            sample_rate * 2,
+            2,
+            16,
+            b"data",
+            data_size,
+        )
+        wav_bytes = header + pcm_bytes
+        cls._wav_cache[vol_pct] = wav_bytes
+        return wav_bytes
+
+    @classmethod
+    def play_chime(cls, force: bool = False) -> None:
+        now = time.monotonic()
+        with cls._lock:
+            if not force and (now - cls._last_global_play_ts) < 0.38:
+                return
+            cls._last_global_play_ts = now
+            vol_pct = max(5, min(100, int(round(cls._volume * 100.0))))
+            if cls._volume <= 0.01 and not force:
+                return
+
+        wav_bytes = cls._build_chime_wav(vol_pct)
+
+        def _worker() -> None:
+            try:
+                import winsound
+
+                winsound.PlaySound(
+                    wav_bytes,
+                    winsound.SND_MEMORY | winsound.SND_NODEFAULT,
+                )
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
 
 
 class _YoloOnnxEngine:
@@ -392,9 +576,20 @@ class ClassicalPersonDetector:
     4. Multi-Frame Temporal AI Tracker with smooth bounding box interpolation
     """
 
-    def __init__(self, sensitivity: str = "ultra", use_gpu: bool = True) -> None:
+    def __init__(
+        self,
+        sensitivity: str = "ultra",
+        use_gpu: bool = True,
+        ignored_objects: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
         self.sensitivity: str = (sensitivity or "ultra").lower()
         self.use_gpu: bool = bool(use_gpu)
+        self._ignored_objects: List[Dict[str, Any]] = (
+            [dict(item) for item in ignored_objects if isinstance(item, dict) and "box" in item]
+            if ignored_objects
+            else []
+        )
+        self._last_bgr: Optional[np.ndarray] = None
         caps = get_gpu_capabilities()
         self._gpu_available: bool = bool(caps.get("directml", False) or caps.get("opencl", False))
         self._opencl_available: bool = bool(caps.get("opencl", False))
@@ -414,6 +609,156 @@ class ClassicalPersonDetector:
         self._prev_motion: Optional[np.ndarray] = None
         self._flicker_map: Optional[np.ndarray] = None
         self._tracks: List[dict] = []
+
+    @staticmethod
+    def compute_object_fingerprint(
+        bgr: Optional[np.ndarray], box: Tuple[float, float, float, float]
+    ) -> List[float]:
+        """Compute a compact 64-float zero-mean unit-variance 8x8 appearance fingerprint for a normalized box."""
+        if bgr is None or bgr.size == 0:
+            return []
+        h, w = bgr.shape[:2]
+        if h < 8 or w < 8:
+            return []
+        x1n, y1n, x2n, y2n = float(box[0]), float(box[1]), float(box[2]), float(box[3])
+        x1 = max(0, min(w - 2, int(round(x1n * w))))
+        y1 = max(0, min(h - 2, int(round(y1n * h))))
+        x2 = max(x1 + 2, min(w, int(round(x2n * w))))
+        y2 = max(y1 + 2, min(h, int(round(y2n * h))))
+        crop = bgr[y1:y2, x1:x2]
+        if crop.size == 0:
+            return []
+        try:
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            patch = cv2.resize(gray, (8, 8), interpolation=cv2.INTER_AREA).astype(np.float32)
+            mean = float(np.mean(patch))
+            std = float(np.std(patch))
+            if std < 1.5:
+                return [0.0] * 64
+            norm = (patch - mean) / std
+            return [round(float(v), 4) for v in norm.flatten()]
+        except Exception:
+            return []
+
+    @staticmethod
+    def _box_iou(
+        a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]
+    ) -> float:
+        ix1 = max(float(a[0]), float(b[0]))
+        iy1 = max(float(a[1]), float(b[1]))
+        ix2 = min(float(a[2]), float(b[2]))
+        iy2 = min(float(a[3]), float(b[3]))
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        if inter <= 0.0:
+            return 0.0
+        area_a = max(1e-6, (float(a[2]) - float(a[0])) * (float(a[3]) - float(a[1])))
+        area_b = max(1e-6, (float(b[2]) - float(b[0])) * (float(b[3]) - float(b[1])))
+        return inter / max(1e-6, area_a + area_b - inter)
+
+    def set_ignored_objects(self, ignored_objects: Optional[List[Dict[str, Any]]]) -> None:
+        self._ignored_objects = (
+            [dict(item) for item in ignored_objects if isinstance(item, dict) and "box" in item]
+            if ignored_objects
+            else []
+        )
+
+    def add_ignored_object(
+        self,
+        box: Tuple[float, float, float, float],
+        bgr: Optional[np.ndarray] = None,
+    ) -> Dict[str, Any]:
+        """Register a false-positive object box + visual fingerprint and immediately purge active tracks."""
+        frame = bgr if bgr is not None else self._last_bgr
+        clean_box = [
+            round(max(0.0, min(1.0, float(box[0]))), 4),
+            round(max(0.0, min(1.0, float(box[1]))), 4),
+            round(max(0.0, min(1.0, float(box[2]))), 4),
+            round(max(0.0, min(1.0, float(box[3]))), 4),
+        ]
+        fp = self.compute_object_fingerprint(frame, (clean_box[0], clean_box[1], clean_box[2], clean_box[3]))
+        entry: Dict[str, Any] = {
+            "box": clean_box,
+            "fingerprint": fp,
+            "created_at": datetime.now().strftime("%H:%M"),
+        }
+        replaced = False
+        for idx, existing in enumerate(self._ignored_objects):
+            eb = existing.get("box", [0, 0, 0, 0])
+            if len(eb) >= 4 and self._box_iou(tuple(clean_box), (eb[0], eb[1], eb[2], eb[3])) >= 0.55:
+                self._ignored_objects[idx] = entry
+                replaced = True
+                break
+        if not replaced:
+            self._ignored_objects.append(entry)
+
+        # Immediately remove matching active tracks & boxes so red brackets disappear right away
+        b_tup = (clean_box[0], clean_box[1], clean_box[2], clean_box[3])
+        self._tracks = [
+            tr
+            for tr in self._tracks
+            if self._box_iou(b_tup, tuple(tr.get("box", (0, 0, 0, 0)))) < 0.30
+        ]
+        self._active_boxes = [
+            ab
+            for ab in self._active_boxes
+            if self._box_iou(b_tup, (ab[0], ab[1], ab[2], ab[3])) < 0.30
+        ]
+        return entry
+
+    def _matches_ignored_object(
+        self,
+        bgr: Optional[np.ndarray],
+        bx1: float,
+        by1: float,
+        bx2: float,
+        by2: float,
+        is_translating: bool = False,
+    ) -> bool:
+        """
+        Return True if the candidate detection matches a user-dismissed 'Not a Person' static object.
+        Never suppresses an object that is actively walking/translating across the scene.
+        """
+        if not self._ignored_objects or is_translating:
+            return False
+        cand_box = (bx1, by1, bx2, by2)
+        bcx, bcy = (bx1 + bx2) * 0.5, (by1 + by2) * 0.5
+        bw, bh = max(1e-4, bx2 - bx1), max(1e-4, by2 - by1)
+        cand_fp: Optional[List[float]] = None
+
+        for ig in self._ignored_objects:
+            ib = ig.get("box")
+            if not ib or len(ib) < 4:
+                continue
+            ix1, iy1, ix2, iy2 = float(ib[0]), float(ib[1]), float(ib[2]), float(ib[3])
+            icx, icy = (ix1 + ix2) * 0.5, (iy1 + iy2) * 0.5
+            ibw, ibh = max(1e-4, ix2 - ix1), max(1e-4, iy2 - iy1)
+
+            iou = self._box_iou(cand_box, (ix1, iy1, ix2, iy2))
+            center_dist = math.hypot(bcx - icx, bcy - icy)
+            geom_close = (
+                iou >= 0.35
+                or (
+                    center_dist <= max(0.055, ibh * 0.40)
+                    and 0.58 <= (bh / ibh) <= 1.65
+                    and 0.58 <= (bw / ibw) <= 1.65
+                )
+            )
+            if not geom_close:
+                continue
+
+            ref_fp = ig.get("fingerprint")
+            if not ref_fp or len(ref_fp) != 64 or bgr is None:
+                return True
+
+            if cand_fp is None:
+                cand_fp = self.compute_object_fingerprint(bgr, cand_box)
+            if not cand_fp or len(cand_fp) != 64:
+                return True
+
+            sim = float(np.dot(np.asarray(cand_fp, dtype=np.float32), np.asarray(ref_fp, dtype=np.float32))) / 64.0
+            if sim >= 0.36 or (iou >= 0.52 and sim >= 0.18):
+                return True
+        return False
 
     @property
     def min_interval(self) -> float:
@@ -476,6 +821,7 @@ class ClassicalPersonDetector:
         h_orig, w_orig = bgr.shape[:2]
         if w_orig <= 0 or h_orig <= 0:
             return []
+        self._last_bgr = bgr
 
         sens = self.sensitivity
         use_gpu_flag = self.use_gpu
@@ -694,7 +1040,7 @@ class ClassicalPersonDetector:
                         ai_candidates.append((fx1, fy1, fx2, fy2, zconf))
 
         merged = self._merge_overlapping_scored(ai_candidates)
-        confirmed_boxes = self._update_tracks(merged, now)
+        confirmed_boxes = self._update_tracks(merged, now, bgr)
 
         if confirmed_boxes:
             self._last_hit_time = now
@@ -711,12 +1057,14 @@ class ClassicalPersonDetector:
         self,
         scored_boxes: List[Tuple[float, float, float, float, float]],
         now: float,
+        bgr: Optional[np.ndarray] = None,
     ) -> List[Tuple[float, float, float, float]]:
         """
         Multi-frame AI tracker:
         - High-confidence detections (conf >= 0.52) lock on immediately
         - Medium/Far-Zoom detections confirm in 2 consecutive hits
         - Suppresses permanently static false objects that never exhibit displacement
+        - Suppresses user-marked 'Not a Person' false objects unless a real person is actively walking through
         """
         matched_track_indices = set()
         for bx1, by1, bx2, by2, conf in scored_boxes:
@@ -753,6 +1101,11 @@ class ClassicalPersonDetector:
                 net_disp = math.hypot(bcx - tr["anchor_cx"], bcy - tr["anchor_cy"])
                 if net_disp >= max(0.005, bh * 0.08):
                     tr["has_translated"] = True
+                is_walking = net_disp >= max(0.04, bh * 0.35)
+
+                if self._matches_ignored_object(bgr, bx1, by1, bx2, by2, is_translating=is_walking):
+                    tr["confirmed"] = False
+                    continue
 
                 # Confirm track: 1 hit if high AI confidence, or 2 hits for far/medium AI confidence
                 if tr["hits"] >= 2 or tr["conf"] >= 0.52:
@@ -763,6 +1116,8 @@ class ClassicalPersonDetector:
                 if tr["hits"] > 35 and not tr["has_translated"] and tr["conf"] < 0.68:
                     tr["confirmed"] = False
             else:
+                if self._matches_ignored_object(bgr, bx1, by1, bx2, by2, is_translating=False):
+                    continue
                 is_immediate = conf >= 0.52
                 self._tracks.append(
                     {
@@ -910,6 +1265,7 @@ class CameraStreamWorker(QThread):
         self._person_detector = ClassicalPersonDetector(
             sensitivity=getattr(config, "detection_sensitivity", "ultra"),
             use_gpu=bool(getattr(config, "gpu_acceleration", True)),
+            ignored_objects=getattr(config, "ignored_objects", None),
         )
         self._latest_detections: List[Tuple[float, float, float, float, str]] = []
         self._hwaccel_failed: bool = False
@@ -993,6 +1349,19 @@ class CameraStreamWorker(QThread):
         if not self.config.person_detection and self._latest_detections:
             self._latest_detections = []
             self.detections_ready.emit(self.config.cam_id, [])
+
+    def ignore_detection_box(self, box: Tuple[float, float, float, float]) -> Dict[str, Any]:
+        """Mark a detected bounding box as 'Not a Person', update config.ignored_objects, and clear active alert."""
+        entry = self._person_detector.add_ignored_object(box)
+        self.config.ignored_objects = list(self._person_detector._ignored_objects)
+        self._latest_detections = list(self._person_detector._active_boxes)
+        self.detections_ready.emit(self.config.cam_id, list(self._latest_detections))
+        return entry
+
+    def clear_ignored_objects(self) -> None:
+        """Reset all saved 'Not a Person' ignored false-positive objects on this camera."""
+        self.config.ignored_objects = []
+        self._person_detector.set_ignored_objects([])
 
     # --- Camera Control Actions ---
     def ptz_move(self, direction: str) -> None:

@@ -16,7 +16,11 @@
     "flipped": false,
     "person_detection": true,
     "detection_sensitivity": "ultra",
+    "detection_sound": true,
+    "detection_sound_cooldown": 10,
+    "chime_zone": null,
     "gpu_acceleration": true,
-    "ptz_presets": []
+    "ptz_presets": [],
+    "ignored_objects": []
   }
 ]

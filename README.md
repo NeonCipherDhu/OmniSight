@@ -14,7 +14,11 @@
   - Automatic firmware `v31/v32+` media frame AES-ECB decryption
   - Smart **H.264** & **H.265 (HEVC)** Annex-B NAL unit extraction piped into a zero-latency FFmpeg decoder (with Direct3D 11 `d3d11va` hardware acceleration)
   - **Live Audio** (`AAC-LC`, `G.711 A-Law`, and `IMA-ADPCM` decoding to 16-bit PCM with per-tile mute/unmute & master audio gain)
-- **YOLOv8 AI Person Detection (DirectML GPU Accelerated)** — Built-in `yolov8n.onnx` person detector with 3.2× far-field optical zoom (SAHI) for distant walkers, wind/foliage flicker suppression, and Standard / High / Ultra sensitivity modes.
+- **YOLOv8 AI Person Detection (DirectML GPU Accelerated)** — Built-in `yolov8n.onnx` person detector with 3.2× far-field optical zoom (SAHI) for distant walkers, wind/foliage flicker suppression, and Standard / High / Ultra sensitivity modes:
+  - **Acoustic Detection Chime & Cooldown** — Optional two-note harmonic chime (`E5 → A5`) on person detection with per-camera mute/unmute toggle and configurable `5s`, `10s`, or `20s` alert cooldown.
+  - **Custom Chime Trigger Zone** — Interactive on-canvas drag-and-resize zone editor so audio alerts only trigger when a person enters a designated doorway, gate, or driveway region.
+  - **One-Click False-Positive Suppression (`✕ Not a Person`)** — Hover over any detected bounding box on the live canvas (or use the right-click menu) to dismiss static false positives using spatial + appearance fingerprinting without blinding the zone to real people walking through.
+- **Live Tile Status & Reconnect Experience** — Real-time Wi-Fi connection badge, active AI shield indicator, and smooth Gaussian-blurred last-frame overlay during stream reconnection.
 - **On-Camera microSD Card Footage Review & Backup** — Browse, filter (`All` / `Motion` / `Anomaly`), scrub on an interactive 24-hour zoomable timeline, stream directly from the camera's microSD card (`cmd 361`/`362`/`363`), and export or bulk-backup clips to local `.mp4` files with up to `16×` fast-forward playback.
 - **PTZ, Hardware Presets, Floodlight & Night Vision Controls** — Directional Pan/Tilt gimbal control (mouse press-and-hold or keyboard arrow keys), up to 6 persistent hardware PTZ preset slots (`PTZX`), LED Floodlight (`On` / `Off` / `Auto`), Night Vision (`Color` / `IR B&W` / `Auto`), and `180° Image Flip`.
 - **Multi-Camera Grid Layouts** — Switch between **Auto**, **1×1**, **2×2**, and **3×3** views, drag-and-drop tiles to reorder, double-click any camera feed to solo/maximize, scroll the mouse wheel for **1.0×–5.0× digital zoom**, or press `F11` for **Fullscreen Monitor Mode**.
@@ -114,8 +118,12 @@ Camera settings are automatically saved to `cameras.json` in the application fol
     "flipped": false,
     "person_detection": true,
     "detection_sensitivity": "ultra",
+    "detection_sound": true,
+    "detection_sound_cooldown": 10,
+    "chime_zone": null,
     "gpu_acceleration": true,
-    "ptz_presets": []
+    "ptz_presets": [],
+    "ignored_objects": []
   }
 ]
 ```
