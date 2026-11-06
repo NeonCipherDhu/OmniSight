@@ -15,6 +15,8 @@ import json
 import logging
 import os
 import sys
+import threading
+import traceback
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -8692,7 +8694,19 @@ class OmniSightMainWindow(QMainWindow):
         super().closeEvent(event)
 
 
+def _install_qt_exception_guard() -> None:
+    def _excepthook(exc_type, exc_value, exc_tb) -> None:
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        err_txt = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        logger.error("Unhandled UI exception:\n%s", err_txt)
+
+    sys.excepthook = _excepthook
+
+
 def main() -> None:
+    _install_qt_exception_guard()
     app = QApplication(sys.argv)
     app.setApplicationName("OmniSight")
     win = OmniSightMainWindow()
