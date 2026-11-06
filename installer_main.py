@@ -35,7 +35,7 @@ from PyQt6.QtWidgets import (
 
 APP_NAME = "OmniSight"
 APP_EXE = "OmniSight.exe"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 APP_PUBLISHER = "OmniSight Open Source NVR"
 UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\OmniSight"
 
@@ -52,19 +52,25 @@ def _default_install_dir() -> Path:
 def _create_shortcut(target_exe: Path, shortcut_path: Path, working_dir: Path, description: str) -> None:
     shortcut_path.parent.mkdir(parents=True, exist_ok=True)
     ps_script = (
-        f"$ws = New-Object -ComObject WScript.Shell; "
-        f"$s = $ws.CreateShortcut('{str(shortcut_path).replace(chr(39), chr(39)*2)}'); "
-        f"$s.TargetPath = '{str(target_exe).replace(chr(39), chr(39)*2)}'; "
-        f"$s.WorkingDirectory = '{str(working_dir).replace(chr(39), chr(39)*2)}'; "
-        f"$s.IconLocation = '{str(target_exe).replace(chr(39), chr(39)*2)},0'; "
-        f"$s.Description = '{description}'; "
-        f"$s.Save()"
+        "$ws = New-Object -ComObject WScript.Shell; "
+        "$s = $ws.CreateShortcut($env:OMNISIGHT_SC_PATH); "
+        "$s.TargetPath = $env:OMNISIGHT_SC_TARGET; "
+        "$s.WorkingDirectory = $env:OMNISIGHT_SC_WORKDIR; "
+        "$s.IconLocation = $env:OMNISIGHT_SC_TARGET + ',0'; "
+        "$s.Description = $env:OMNISIGHT_SC_DESC; "
+        "$s.Save()"
     )
+    env = os.environ.copy()
+    env["OMNISIGHT_SC_PATH"] = str(shortcut_path)
+    env["OMNISIGHT_SC_TARGET"] = str(target_exe)
+    env["OMNISIGHT_SC_WORKDIR"] = str(working_dir)
+    env["OMNISIGHT_SC_DESC"] = str(description)
     creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
         capture_output=True,
         creationflags=creationflags,
+        env=env,
     )
 
 
@@ -127,10 +133,14 @@ class InstallWorker(QObject):
 
             self.install_dir.mkdir(parents=True, exist_ok=True)
 
+            preserved_user_files = {"cameras.json", "camera_names.json"}
             with zipfile.ZipFile(payload_zip, "r") as zf:
                 members = zf.infolist()
                 total = max(1, len(members))
                 for idx, member in enumerate(members, 1):
+                    rel_name = Path(member.filename).name.lower()
+                    if rel_name in preserved_user_files and (self.install_dir / member.filename).exists():
+                        continue
                     zf.extract(member, self.install_dir)
                     if idx % 15 == 0 or idx == total:
                         pct = 10 + int((idx / total) * 75)
@@ -179,7 +189,8 @@ class InstallerWindow(QWidget):
         super().__init__()
         self.setObjectName("installerRoot")
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — Setup")
-        self.setFixedSize(540, 420)
+        self.setMinimumSize(460, 380)
+        self.resize(540, 420)
         ico = _bundle_dir() / "omnisight.ico"
         if ico.is_file():
             self.setWindowIcon(QIcon(str(ico)))

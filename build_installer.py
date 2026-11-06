@@ -19,11 +19,6 @@ import time
 import zipfile
 from pathlib import Path
 
-import imageio_ffmpeg
-from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QRectF, Qt
-from PyQt6.QtGui import QColor, QGuiApplication, QImage, QPainter, QPen
-from PyQt6.QtSvg import QSvgRenderer
-
 ROOT = Path(__file__).resolve().parent
 BUILD_DIR = ROOT / "build"
 DIST_DIR = ROOT / "dist"
@@ -33,6 +28,10 @@ ICO_PATH = ROOT / "omnisight.ico"
 
 def generate_ico(ico_path: Path) -> None:
     """Render a crisp multi-resolution Windows .ico file for OmniSight."""
+    from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QRectF, Qt
+    from PyQt6.QtGui import QColor, QGuiApplication, QImage, QPainter, QPen
+    from PyQt6.QtSvg import QSvgRenderer
+
     _app = QGuiApplication.instance() or QGuiApplication([])
     svg_xml = (
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" '
@@ -89,6 +88,8 @@ def generate_ico(ico_path: Path) -> None:
 
 
 def build_app() -> Path:
+    import imageio_ffmpeg
+
     ff_src = Path(imageio_ffmpeg.get_ffmpeg_exe()).resolve()
     ff_copy = BUILD_DIR / "ffmpeg.exe"
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
@@ -273,21 +274,27 @@ def patch_installed_app(
         can_write = False
 
     if not can_write:
-        ps1_path = Path(tempfile.gettempdir()) / "omnisight_grant_and_patch.ps1"
-        ps1_path.write_text(
-            f'Stop-Process -Name "OmniSight" -Force -ErrorAction SilentlyContinue\n'
-            f'icacls "{install_dir}" /grant "*S-1-5-32-545:(OI)(CI)F" /T /C /Q\n',
-            encoding="utf-8",
-        )
-        subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                f'Start-Process powershell -ArgumentList \'-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{ps1_path}"\' -Verb RunAs -Wait',
-            ],
-            check=False,
-        )
+        cur_user = os.environ.get("USERNAME", "*S-1-5-32-545")
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".ps1", prefix="omnisight_patch_", delete=False, encoding="utf-8"
+        ) as tf:
+            ps1_path = Path(tf.name)
+            tf.write(
+                f'Stop-Process -Name "OmniSight" -Force -ErrorAction SilentlyContinue\n'
+                f'icacls "{install_dir}" /grant "{cur_user}:(OI)(CI)M" /T /C /Q\n'
+            )
+        try:
+            subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    f'Start-Process powershell -ArgumentList \'-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{ps1_path}"\' -Verb RunAs -Wait',
+                ],
+                check=False,
+            )
+        finally:
+            ps1_path.unlink(missing_ok=True)
 
     preserved_names = {"cameras.json", "camera_names.json"}
     try:
@@ -342,19 +349,379 @@ def patch_installed_from_dir(
         return False
 
 
+def patch_installed_exe_carchive(install_dir: Path | None = None) -> bool:
+    """Patch OmniSight.exe's PyInstaller CArchive in-place using its own bundled python*.dll."""
+    if install_dir is None:
+        install_dir = _detect_installed_dir()
+    exe_path = install_dir / "OmniSight.exe"
+    internal_dir = install_dir / "_internal"
+    if not exe_path.is_file() or not internal_dir.is_dir():
+        return False
+
+    py_dlls = [p for p in internal_dir.glob("python3*.dll") if p.name.lower() != "python3.dll"]
+    if not py_dlls:
+        return False
+    py_dll_name = py_dlls[0].name
+
+    csc_path = Path(r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe")
+    if not csc_path.is_file():
+        return False
+
+    print(f"Patching installed CArchive directly at: {exe_path} (using bundled {py_dll_name}) ...")
+    tmp_dir = Path(tempfile.gettempdir()) / f"omnisight_carchive_patch_{int(time.time())}"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    cs_file = tmp_dir / "py_host.cs"
+    host_exe = tmp_dir / "py_host.exe"
+    patch_py = tmp_dir / "repack_carchive.py"
+    staged_exe = tmp_dir / "OmniSight.exe.new"
+
+    cs_code = f"""using System;
+using System.IO;
+using System.Runtime.InteropServices;
+
+class Program {{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool SetDllDirectory(string lpPathName);
+
+    [DllImport("{py_dll_name}", CallingConvention = CallingConvention.Cdecl)]
+    static extern void Py_Initialize();
+
+    [DllImport("{py_dll_name}", CallingConvention = CallingConvention.Cdecl)]
+    static extern int PyRun_SimpleString(byte[] command);
+
+    [DllImport("{py_dll_name}", CallingConvention = CallingConvention.Cdecl)]
+    static extern int Py_FinalizeEx();
+
+    static int Main(string[] args) {{
+        string internalDir = { '@"' + str(internal_dir) + '"' };
+        SetDllDirectory(internalDir);
+        Environment.SetEnvironmentVariable("PYTHONHOME", internalDir);
+        Environment.SetEnvironmentVariable("PYTHONPATH", internalDir + ";" + Path.Combine(internalDir, "base_library.zip"));
+        Py_Initialize();
+        string script = File.ReadAllText(args[0]);
+        byte[] utf8 = System.Text.Encoding.UTF8.GetBytes(script + "\\0");
+        int rc = PyRun_SimpleString(utf8);
+        Py_FinalizeEx();
+        return rc;
+    }}
+}}
+"""
+    cs_file.write_text(cs_code, encoding="utf-8")
+    subprocess.run(
+        [str(csc_path), "/nologo", "/platform:x64", f"/out:{host_exe}", str(cs_file)],
+        check=True,
+    )
+
+    patch_script = f"""import marshal
+import os
+from _struct import pack, unpack
+import zlib
+
+root_dir = {repr(str(ROOT))}
+exe_path = {repr(str(exe_path))}
+staged_exe = {repr(str(staged_exe))}
+
+with open(exe_path, "rb") as f:
+    data = f.read()
+
+MAGIC = b"MEI\\x0c\\x0b\\x0a\\x0b\\x0e"
+cookie_pos = data.rfind(MAGIC)
+if cookie_pos < 0:
+    raise RuntimeError("PyInstaller cookie not found in OmniSight.exe")
+
+magic, pkg_len, toc_off, toc_len, pyvers, pylib = unpack("!8siiii64s", data[cookie_pos : cookie_pos + 88])
+pkg_start = cookie_pos + 88 - pkg_len
+prefix = data[:pkg_start]
+toc_bytes = data[pkg_start + toc_off : pkg_start + toc_off + toc_len]
+
+# Compile updated omnisight_app.py
+with open(os.path.join(root_dir, "omnisight_app.py"), "rb") as f:
+    app_src = f.read()
+app_code_raw = marshal.dumps(compile(app_src, "omnisight_app.py", "exec"))
+app_code_comp = zlib.compress(app_code_raw, 6)
+
+# Helper to update PYZ.pyz with stream_worker.py and v380_protocol.py
+def update_pyz(pyz_bytes):
+    pyz_magic = pyz_bytes[:8]
+    old_toc_off = unpack("!i", pyz_bytes[8:12])[0]
+    header_rest = pyz_bytes[12:17]
+    toc = marshal.loads(pyz_bytes[old_toc_off:])
+    is_list = isinstance(toc, list)
+    toc_dict = dict(toc) if is_list else dict(toc)
+
+    body = bytearray(pyz_bytes[:old_toc_off])
+    for mod_name, src_filename in (
+        ("stream_worker", "stream_worker.py"),
+        ("omnisight_protocol", "omnisight_protocol.py"),
+        ("v380_protocol", "omnisight_protocol.py"),
+    ):
+        mod_file = os.path.join(root_dir, src_filename)
+        if os.path.isfile(mod_file) and mod_name in toc_dict:
+            with open(mod_file, "rb") as mf:
+                msrc = mf.read()
+            mcode = marshal.dumps(compile(msrc, src_filename, "exec"))
+            mcomp = zlib.compress(mcode, 6)
+            new_pos = len(body)
+            body.extend(mcomp)
+            toc_dict[mod_name] = (0, new_pos, len(mcomp))
+
+    new_pyz_toc_off = len(body)
+    toc_out = list(toc_dict.items()) if is_list else toc_dict
+    body.extend(marshal.dumps(toc_out))
+    body[8:12] = pack("!i", new_pyz_toc_off)
+    return bytes(body)
+
+new_pkg_body = bytearray()
+new_toc = bytearray()
+pos = 0
+while pos < len(toc_bytes):
+    elen, dpos, dlen, ulen, cflag, typcd = unpack("!iiiiBB", toc_bytes[pos : pos + 18])
+    raw_name_padded = toc_bytes[pos + 18 : pos + elen]
+    name = raw_name_padded.rstrip(b"\\x00").decode("utf-8", "replace")
+    entry_bytes = data[pkg_start + dpos : pkg_start + dpos + dlen]
+
+    if name == "omnisight_app" and chr(typcd) == "s":
+        entry_bytes = app_code_comp
+        dlen = len(app_code_comp)
+        ulen = len(app_code_raw)
+        cflag = 1
+    elif name == "PYZ.pyz" and chr(typcd) == "z":
+        entry_bytes = update_pyz(entry_bytes)
+        dlen = len(entry_bytes)
+        ulen = len(entry_bytes)
+        cflag = 0
+
+    new_dpos = len(new_pkg_body)
+    new_pkg_body.extend(entry_bytes)
+    new_toc.extend(pack("!iiiiBB", elen, new_dpos, dlen, ulen, cflag, typcd))
+    new_toc.extend(raw_name_padded)
+    pos += elen
+
+new_toc_off = len(new_pkg_body)
+new_toc_len = len(new_toc)
+new_pkg_len = new_toc_off + new_toc_len + 88
+new_cookie = pack("!8siiii64s", magic, new_pkg_len, new_toc_off, new_toc_len, pyvers, pylib)
+
+with open(staged_exe, "wb") as f:
+    f.write(prefix)
+    f.write(new_pkg_body)
+    f.write(new_toc)
+    f.write(new_cookie)
+
+print("Built patched executable:", os.path.getsize(staged_exe), "bytes")
+"""
+    patch_py.write_text(patch_script, encoding="utf-8")
+    subprocess.run([str(host_exe), str(patch_py)], check=True)
+
+    _stop_running_instances(install_dir)
+    time.sleep(0.6)
+    shutil.copy2(staged_exe, exe_path)
+    _sync_legacy_exe_alias(install_dir)
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    print(f"Successfully patched {install_dir} in-place (preserved cameras.json & user data).")
+    return True
+
+
+def update_installer_carchive(install_dir: Path | None = None) -> Path:
+    """Update OmniSight_Payload.zip, OmniSight_Portable.zip, and OmniSight_Setup.exe in-place using bundled python*.dll."""
+    if install_dir is None:
+        install_dir = _detect_installed_dir()
+    if not patch_installed_exe_carchive(install_dir):
+        raise RuntimeError("Failed to patch installed OmniSight.exe prior to updating installer.")
+
+    exe_path = install_dir / "OmniSight.exe"
+    internal_dir = install_dir / "_internal"
+    py_dlls = [p for p in internal_dir.glob("python3*.dll") if p.name.lower() != "python3.dll"]
+    py_dll_name = py_dlls[0].name
+    csc_path = Path(r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe")
+
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    INSTALLER_DIR.mkdir(parents=True, exist_ok=True)
+    payload_zip = BUILD_DIR / "OmniSight_Payload.zip"
+    portable_zip = INSTALLER_DIR / "OmniSight_Portable.zip"
+    setup_exe = INSTALLER_DIR / "OmniSight_Setup.exe"
+
+    # 1. Update OmniSight.exe inside OmniSight_Payload.zip and OmniSight_Portable.zip
+    print(f"[2/3] Updating {payload_zip.name} and {portable_zip.name} with patched OmniSight.exe ...")
+    tmp_zip = BUILD_DIR / "OmniSight_Payload.zip.tmp"
+    if payload_zip.is_file():
+        with zipfile.ZipFile(payload_zip, "r") as zin, zipfile.ZipFile(
+            tmp_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
+        ) as zout:
+            for item in zin.infolist():
+                if item.filename.replace("\\", "/") == "OmniSight.exe":
+                    continue
+                zout.writestr(item, zin.read(item.filename))
+            zout.write(exe_path, "OmniSight.exe")
+        os.replace(tmp_zip, payload_zip)
+    else:
+        with zipfile.ZipFile(payload_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zout:
+            zout.write(exe_path, "OmniSight.exe")
+            for fp in internal_dir.rglob("*"):
+                if fp.is_file():
+                    zout.write(fp, fp.relative_to(install_dir))
+    shutil.copy2(payload_zip, portable_zip)
+
+    # 2. Repackage installer/OmniSight_Setup.exe CArchive with updated installer_main.py and OmniSight_Payload.zip
+    print(f"[3/3] Updating single-file installer CArchive: {setup_exe} ...")
+    tmp_dir = Path(tempfile.gettempdir()) / f"omnisight_setup_patch_{int(time.time())}"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    cs_file = tmp_dir / "py_host.cs"
+    host_exe = tmp_dir / "py_host.exe"
+    patch_py = tmp_dir / "repack_setup.py"
+    staged_setup = tmp_dir / "OmniSight_Setup.exe.new"
+
+    cs_code = f"""using System;
+using System.IO;
+using System.Runtime.InteropServices;
+
+class Program {{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool SetDllDirectory(string lpPathName);
+
+    [DllImport("{py_dll_name}", CallingConvention = CallingConvention.Cdecl)]
+    static extern void Py_Initialize();
+
+    [DllImport("{py_dll_name}", CallingConvention = CallingConvention.Cdecl)]
+    static extern int PyRun_SimpleString(byte[] command);
+
+    [DllImport("{py_dll_name}", CallingConvention = CallingConvention.Cdecl)]
+    static extern int Py_FinalizeEx();
+
+    static int Main(string[] args) {{
+        string internalDir = { '@"' + str(internal_dir) + '"' };
+        SetDllDirectory(internalDir);
+        Environment.SetEnvironmentVariable("PYTHONHOME", internalDir);
+        Environment.SetEnvironmentVariable("PYTHONPATH", internalDir + ";" + Path.Combine(internalDir, "base_library.zip"));
+        Py_Initialize();
+        string script = File.ReadAllText(args[0]);
+        byte[] utf8 = System.Text.Encoding.UTF8.GetBytes(script + "\\0");
+        int rc = PyRun_SimpleString(utf8);
+        Py_FinalizeEx();
+        return rc;
+    }}
+}}
+"""
+    cs_file.write_text(cs_code, encoding="utf-8")
+    subprocess.run(
+        [str(csc_path), "/nologo", "/platform:x64", f"/out:{host_exe}", str(cs_file)],
+        check=True,
+    )
+
+    repack_script = f"""import marshal
+import os
+from _struct import pack, unpack
+import zlib
+
+root_dir = {repr(str(ROOT))}
+setup_exe = {repr(str(setup_exe))}
+payload_zip = {repr(str(payload_zip))}
+staged_setup = {repr(str(staged_setup))}
+
+with open(setup_exe, "rb") as f:
+    data = f.read()
+
+MAGIC = b"MEI\\x0c\\x0b\\x0a\\x0b\\x0e"
+cookie_pos = data.rfind(MAGIC)
+if cookie_pos < 0:
+    raise RuntimeError("PyInstaller cookie not found in OmniSight_Setup.exe")
+
+magic, pkg_len, toc_off, toc_len, pyvers, pylib = unpack("!8siiii64s", data[cookie_pos : cookie_pos + 88])
+pkg_start = cookie_pos + 88 - pkg_len
+prefix = data[:pkg_start]
+toc_bytes = data[pkg_start + toc_off : pkg_start + toc_off + toc_len]
+
+with open(os.path.join(root_dir, "installer_main.py"), "rb") as f:
+    inst_src = f.read()
+inst_raw = marshal.dumps(compile(inst_src, "installer_main.py", "exec"))
+inst_comp = zlib.compress(inst_raw, 6)
+
+with open(payload_zip, "rb") as f:
+    payload_raw = f.read()
+payload_comp = zlib.compress(payload_raw, 6)
+
+new_pkg_body = bytearray()
+new_toc = bytearray()
+pos = 0
+while pos < len(toc_bytes):
+    elen, dpos, dlen, ulen, cflag, typcd = unpack("!iiiiBB", toc_bytes[pos : pos + 18])
+    raw_name_padded = toc_bytes[pos + 18 : pos + elen]
+    name = raw_name_padded.rstrip(b"\\x00").decode("utf-8", "replace")
+    entry_bytes = data[pkg_start + dpos : pkg_start + dpos + dlen]
+
+    if name == "installer_main" and chr(typcd) == "s":
+        entry_bytes = inst_comp
+        dlen = len(inst_comp)
+        ulen = len(inst_raw)
+        cflag = 1
+    elif name == "OmniSight_Payload.zip" and chr(typcd) == "b":
+        entry_bytes = payload_comp
+        dlen = len(payload_comp)
+        ulen = len(payload_raw)
+        cflag = 1
+
+    new_dpos = len(new_pkg_body)
+    new_pkg_body.extend(entry_bytes)
+    new_toc.extend(pack("!iiiiBB", elen, new_dpos, dlen, ulen, cflag, typcd))
+    new_toc.extend(raw_name_padded)
+    pos += elen
+
+new_toc_off = len(new_pkg_body)
+new_toc_len = len(new_toc)
+new_pkg_len = new_toc_off + new_toc_len + 88
+new_cookie = pack("!8siiii64s", magic, new_pkg_len, new_toc_off, new_toc_len, pyvers, pylib)
+
+with open(staged_setup, "wb") as f:
+    f.write(prefix)
+    f.write(new_pkg_body)
+    f.write(new_toc)
+    f.write(new_cookie)
+
+print("Built updated installer:", os.path.getsize(staged_setup), "bytes")
+"""
+    patch_py.write_text(repack_script, encoding="utf-8")
+    subprocess.run([str(host_exe), str(patch_py)], check=True)
+    shutil.copy2(staged_setup, setup_exe)
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    return setup_exe
+
+
+def _has_pyinstaller() -> bool:
+    try:
+        res = subprocess.run(
+            [sys.executable, "-c", "import PyInstaller, imageio_ffmpeg, PyQt6"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
 def main() -> None:
     if "--patch-only" in sys.argv:
-        if not ICO_PATH.exists():
-            generate_ico(ICO_PATH)
-        app_dist = build_app()
-        patch_installed_from_dir(app_dist)
+        try:
+            if patch_installed_exe_carchive():
+                return
+        except Exception as exc:
+            print(f"Fast CArchive patch skipped ({exc}), falling back to PyInstaller build...")
+        if _has_pyinstaller():
+            if not ICO_PATH.exists():
+                generate_ico(ICO_PATH)
+            app_dist = build_app()
+            patch_installed_from_dir(app_dist)
+        else:
+            raise RuntimeError("Could not patch installed OmniSight executable.")
         return
 
-    generate_ico(ICO_PATH)
-    app_dist = build_app()
-    payload_zip = create_payload_zip(app_dist)
-    setup_exe = build_setup_exe(payload_zip)
-    patch_installed_app(payload_zip)
+    if _has_pyinstaller():
+        generate_ico(ICO_PATH)
+        app_dist = build_app()
+        payload_zip = create_payload_zip(app_dist)
+        setup_exe = build_setup_exe(payload_zip)
+        patch_installed_app(payload_zip)
+    else:
+        setup_exe = update_installer_carchive()
     size_mb = setup_exe.stat().st_size / (1024 * 1024)
     print(f"\nSUCCESS: {setup_exe} ({size_mb:.1f} MB)")
 

@@ -21,6 +21,7 @@ import hashlib
 import ipaddress
 import json
 import random
+import secrets
 import socket
 import string
 import struct
@@ -607,7 +608,49 @@ class LanCameraClient:
         self._send_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._need_reconnect = False
+        self._force_cloud_wake = False
         self._quality_switch_pending = False
+        self._last_video_frame_mono: float = 0.0
+        self._session_video_frames: int = 0
+        self._last_keepalive_mono: float = 0.0
+        self._last_udp_wake_mono: float = 0.0
+        self._last_encoder_prod_mono: float = 0.0
+
+    @staticmethod
+    def _configure_tcp_keepalive(sock: socket.socket) -> None:
+        """Enable OS-level TCP keepalive probes (8s idle, 2.5s interval) so idle/cross-subnet streams never drop."""
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            if hasattr(socket, "SIO_KEEPALIVE_VALS"):
+                sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 8000, 2500))
+        except Exception:
+            pass
+
+    def _build_stream_start_cmd303(self, result_code: int = 0x3001) -> bytes:
+        cmd303 = bytearray(256)
+        struct.pack_into("<I", cmd303, 0, 303)
+        if self.device_version > 30:
+            struct.pack_into("<H", cmd303, 4, 0x3001)
+        else:
+            struct.pack_into("<i", cmd303, 4, result_code if result_code in (402, 1001) else 0x3001)
+        return bytes(cmd303)
+
+    def send_wake_pulse(self) -> None:
+        """
+        Send an active anti-sleep wakeup pulse over both UDP (10008/10009/5040) and the active
+        TCP 8800 stream socket (`PTZ_STOP` neutral heartbeat + `cmd 303` stream start).
+        Prevents V380 cameras from entering idle/no-person sleep and wakes paused encoders.
+        """
+        self._wake_camera_lan_udp(burst_count=2)
+        if self._stream_sock is not None:
+            self._send_raw(LanCameraCommands.PTZ_STOP)
+            self._send_raw(self._build_stream_start_cmd303())
+
+    def trigger_wake_reconnect(self) -> None:
+        """Force immediate stream reconnect with full LAN + Cloud wakeup sequence."""
+        self._force_cloud_wake = True
+        self._need_reconnect = True
+        self._close_stream_sock()
 
     def set_stream_quality(self, quality: int) -> None:
         """Switch between HD (1) and SD (0) stream quality and immediately reconnect stream."""
@@ -656,7 +699,7 @@ class LanCameraClient:
         Output: 16-byte random key + encrypted password blocks
         """
         chars = string.ascii_letters + string.digits
-        rk = "".join(random.choice(chars) for _ in range(16)).encode("ascii")
+        rk = "".join(secrets.choice(chars) for _ in range(16)).encode("ascii")
 
         pw_bytes = password.encode("utf-8")
         pad_buf = bytearray(block_bytes)
@@ -695,26 +738,54 @@ class LanCameraClient:
                 return True
         return False
 
-    def _wake_camera_port_8800(self) -> None:
+    def _wake_camera_lan_udp(self, burst_count: int = 3) -> None:
         """
-        Wake compatible cameras (especially v31/v32 firmware or cross-subnet cameras) whose
-        local TCP port 8800 listener goes into standby until triggered by:
-        1. Unicast UDP `NVDEVSEARCH^100` to <ip>:10008
-        2. Optional Cloud Dispatch (`dispa1.av380.net:8001`) `cmd 1167` wakeup signal
+        Send a multi-target local UDP discovery & wakeup burst to the camera IP on ports
+        10008, 10009, and 5040 (plus subnet broadcast) to wake Wi-Fi from DTIM power-save
+        sleep and bring port 8800 out of no-person standby.
         """
-        # 1. Send unicast UDP discovery wakeup to camera IP on port 10008
-        # Use an ephemeral local port so background stream workers never steal UDP 10009 replies during scans.
+        targets = [
+            (self.ip, 10008),
+            (self.ip, 10009),
+            (self.ip, 5040),
+            ("255.255.255.255", 10008),
+        ]
+        try:
+            net = ipaddress.IPv4Network(f"{self.ip}/24", strict=False)
+            bcast = str(net.broadcast_address)
+            if (bcast, 10008) not in targets:
+                targets.append((bcast, 10008))
+        except Exception:
+            pass
+
+        rounds = max(1, int(burst_count))
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as usock:
                 LanCameraDiscovery._configure_udp_socket(usock)
                 usock.bind(("0.0.0.0", 0))
-                usock.sendto(b"NVDEVSEARCH^100", (self.ip, 10008))
+                for idx in range(rounds):
+                    for addr in targets:
+                        try:
+                            usock.sendto(b"NVDEVSEARCH^100", addr)
+                        except Exception:
+                            pass
+                    if idx + 1 < rounds and not self._stop_event.is_set():
+                        time.sleep(0.04)
         except Exception:
             pass
 
-        # 2. If we have a Device ID, trigger Cloud Dispatch wakeup so the camera
-        # immediately opens its local TCP port 8800 listener
-        if self.device_id <= 0:
+    def _wake_camera_port_8800(self, include_cloud: bool = True) -> None:
+        """
+        Wake compatible cameras (especially v31/v32 firmware or cross-subnet cameras) whose
+        local TCP port 8800 listener or video encoder goes into sleep/standby when no person
+        is detected, using:
+        1. Multi-packet UDP `NVDEVSEARCH^100` wakeup burst to <ip>:10008/10009/5040 + broadcast
+        2. Optional Cloud Dispatch (`dispa1.av380.net:8001`) `cmd 1167` wakeup signal
+           (using a blank/dummy wakeup key so real camera passwords never leave the LAN).
+        3. Active readiness polling on TCP port 8800 with repeated LAN UDP prods.
+        """
+        self._wake_camera_lan_udp(burst_count=3)
+        if not include_cloud or self.device_id <= 0:
             return
 
         relay_ips: List[str] = []
@@ -749,10 +820,12 @@ class LanCameraClient:
             if fallback_ip not in relay_ips:
                 relay_ips.append(fallback_ip)
 
-        user_str = self.username if self.username != "admin" else (str(self.device_id) or "admin")
+        user_str = str(self.device_id) or "admin"
         user_b = user_str.encode("ascii", errors="ignore")[:32]
         host_b = f"{self.device_id}.nvdvr.net".encode("ascii", errors="ignore")[:50]
-        enc_pw = self.generate_password(self.password, block_bytes=48)
+        # Never transmit the user's real camera password to external cloud relays;
+        # a dummy wakeup block triggers the relay-to-camera port 8800 wake signal safely.
+        enc_pw = self.generate_password("", block_bytes=48)
 
         cmd = bytearray(520)
         struct.pack_into("<I", cmd, 0, 1167)
@@ -770,33 +843,36 @@ class LanCameraClient:
                 return
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as rsock:
-                    self._stream_sock = rsock
                     rsock.settimeout(1.5)
                     rsock.connect((rip, 8800))
                     rsock.sendall(cmd)
-                    self._recv_response(rsock, 256, timeout=1.2)
+                    self._recv_response(rsock, 256, timeout=1.0)
             except Exception:
                 continue
-            finally:
-                if self._stream_sock is rsock:
-                    self._stream_sock = None
 
-        # Allow ~0.5s for the cloud wakeup signal to reach the camera and open port 8800
-        self._stop_event.wait(0.5)
+        # Poll up to ~1.2s with UDP wake prods so sleeping cameras finish opening port 8800
+        for _ in range(3):
+            if self._stop_event.is_set():
+                return
+            self._stop_event.wait(0.35)
+            self._wake_camera_lan_udp(burst_count=2)
 
     def authenticate(self, skip_cloud_wake: bool = False) -> Tuple[int, str]:
         """
         Perform port 8800 authentication (`cmd 1167` -> `resp 1168`).
-        Sends the UDP 10008 + dispatch wakeup first (unless `skip_cloud_wake`
-        is set during a fast HD/SD stream quality switch).
+        Always attempts local LAN UDP 10008 + direct TCP 8800 first; automatically falls back
+        to full LAN + Cloud wakeup (with a dummy password) whenever the camera is sleeping.
         """
+        self._close_stream_sock()
         if self._stop_event.is_set():
             return -1, "Stopped"
+        if self._force_cloud_wake:
+            skip_cloud_wake = False
+            self._force_cloud_wake = False
         self._resolve_device_id_if_missing()
         if self._stop_event.is_set():
             return -1, "Stopped"
-        if not skip_cloud_wake:
-            self._wake_camera_port_8800()
+        self._wake_camera_lan_udp(burst_count=2)
 
         ports_to_try = [self.port] if self.port == 8800 else [self.port, 8800]
         usernames_to_try: List[str] = []
@@ -810,83 +886,93 @@ class LanCameraClient:
         ]
 
         last_err = "Connection timed out"
-        for candidate_port in ports_to_try:
-            port_reachable = False
-            for candidate_user in usernames_to_try:
-                for pkt_size, unk1, unk2_ver, pw_block_len in variants:
-                    if self._stop_event.is_set():
-                        return -1, "Stopped"
-
-                    sock: Optional[socket.socket] = None
-                    try:
-                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        self._stream_sock = sock
-                        sock.settimeout(4.0)
-                        sock.connect((self.ip, candidate_port))
+        max_passes = 1 if skip_cloud_wake else 2
+        for pass_idx in range(max_passes):
+            for candidate_port in ports_to_try:
+                port_reachable = False
+                for candidate_user in usernames_to_try:
+                    for pkt_size, unk1, unk2_ver, pw_block_len in variants:
                         if self._stop_event.is_set():
                             return -1, "Stopped"
-                        port_reachable = True
 
-                        enc_pw = self.generate_password(self.password, block_bytes=pw_block_len)
-                        user_bytes = candidate_user.encode("ascii", errors="ignore")[:32]
+                        sock: Optional[socket.socket] = None
+                        try:
+                            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                            self._stream_sock = sock
+                            sock.settimeout(2.2 if pass_idx == 0 and max_passes > 1 else 4.0)
+                            sock.connect((self.ip, candidate_port))
+                            if self._stop_event.is_set():
+                                return -1, "Stopped"
+                            port_reachable = True
 
-                        cmd1167 = bytearray(pkt_size)
-                        struct.pack_into("<I", cmd1167, 0, 1167)
-                        struct.pack_into("<I", cmd1167, 4, unk1)
-                        cmd1167[8] = unk2_ver
-                        struct.pack_into("<I", cmd1167, 9, 1)
-                        struct.pack_into("<I", cmd1167, 13, self.device_id & 0xFFFFFFFF)
-                        cmd1167[49 : 49 + len(user_bytes)] = user_bytes
-                        cmd1167[81 : 81 + len(enc_pw)] = enc_pw
+                            enc_pw = self.generate_password(self.password, block_bytes=pw_block_len)
+                            user_bytes = candidate_user.encode("ascii", errors="ignore")[:32]
 
-                        sock.sendall(cmd1167)
-                        resp = self._recv_response(sock, 256, timeout=4.0)
-                        if not resp or len(resp) < 32:
-                            last_err = "Empty auth response from camera"
-                            continue
+                            cmd1167 = bytearray(pkt_size)
+                            struct.pack_into("<I", cmd1167, 0, 1167)
+                            struct.pack_into("<I", cmd1167, 4, unk1)
+                            cmd1167[8] = unk2_ver
+                            struct.pack_into("<I", cmd1167, 9, 1)
+                            struct.pack_into("<I", cmd1167, 13, self.device_id & 0xFFFFFFFF)
+                            cmd1167[49 : 49 + len(user_bytes)] = user_bytes
+                            cmd1167[81 : 81 + len(enc_pw)] = enc_pw
 
-                        resp_cmd = struct.unpack_from("<I", resp, 0)[0]
-                        if resp_cmd != 1168:
-                            last_err = f"Unexpected auth response command: {resp_cmd}"
-                            continue
+                            sock.sendall(cmd1167)
+                            resp = self._recv_response(sock, 256, timeout=4.0)
+                            if not resp or len(resp) < 32:
+                                last_err = "Camera in sleep/standby (empty auth response)"
+                                continue
 
-                        login_result = struct.unpack_from("<I", resp, 4)[0]
-                        if login_result == 1001:
-                            self.port = candidate_port
-                            self.username = candidate_user
-                            self.device_version = resp[12]
-                            self.auth_ticket = struct.unpack_from("<I", resp, 13)[0]
-                            self.session_id = struct.unpack_from("<I", resp, 17)[0]
-                            return 1, f"Authenticated (v{self.device_version}, port {self.port})"
+                            resp_cmd = struct.unpack_from("<I", resp, 0)[0]
+                            if resp_cmd != 1168:
+                                last_err = f"Unexpected auth response command: {resp_cmd}"
+                                continue
 
-                        if login_result == 1011:
-                            last_err = "Invalid camera username (error 1011)"
+                            login_result = struct.unpack_from("<I", resp, 4)[0]
+                            if login_result == 1001:
+                                self.port = candidate_port
+                                self.username = candidate_user
+                                self.device_version = resp[12]
+                                self.auth_ticket = struct.unpack_from("<I", resp, 13)[0]
+                                self.session_id = struct.unpack_from("<I", resp, 17)[0]
+                                return 1, f"Authenticated (v{self.device_version}, port {self.port})"
+
+                            if login_result == 1011:
+                                last_err = "Invalid camera username (error 1011)"
+                                break
+                            if login_result == 1012:
+                                return -1, "Invalid camera password (error 1012)"
+                            if login_result == 1018:
+                                return (
+                                    -1,
+                                    f"Invalid Device ID ({self.device_id}) — check camera sticker (error 1018)",
+                                )
+                            last_err = f"Camera standby/busy (code {login_result})"
                             break
-                        if login_result == 1012:
-                            return -1, "Invalid camera password (error 1012)"
-                        if login_result == 1018:
-                            return (
-                                -1,
-                                f"Invalid Device ID ({self.device_id}) — check camera sticker (error 1018)",
-                            )
-                        return -1, f"Camera rejected login (code {login_result})"
 
-                    except (socket.timeout, ConnectionRefusedError, OSError) as exc:
-                        if self._stop_event.is_set():
-                            return -1, "Stopped"
-                        last_err = f"Cannot connect to {self.ip}:{candidate_port} ({exc})"
+                        except (socket.timeout, ConnectionRefusedError, OSError) as exc:
+                            if self._stop_event.is_set():
+                                return -1, "Stopped"
+                            last_err = f"Cannot connect to {self.ip}:{candidate_port} ({exc})"
+                            break
+                        finally:
+                            if sock is not None:
+                                if self._stream_sock is sock:
+                                    self._stream_sock = None
+                                try:
+                                    sock.close()
+                                except Exception:
+                                    pass
+
+                    if not port_reachable:
                         break
-                    finally:
-                        if sock is not None:
-                            if self._stream_sock is sock:
-                                self._stream_sock = None
-                            try:
-                                sock.close()
-                            except Exception:
-                                pass
 
-                if not port_reachable:
-                    break
+            if pass_idx + 1 >= max_passes:
+                break
+            # Camera did not authenticate on Pass 0 (either port 8800 closed OR sleeping daemon returned empty/busy);
+            # send full LAN + Cloud wakeup signal and retry!
+            self._emit_status("Waking sleeping camera...")
+            self._wake_camera_port_8800(include_cloud=True)
 
         if "1011" in last_err:
             return -1, last_err
@@ -899,6 +985,7 @@ class LanCameraClient:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+            self._configure_tcp_keepalive(sock)
             sock.settimeout(6.0)
             sock.connect((self.ip, self.port))
             self._stream_sock = sock
@@ -941,14 +1028,8 @@ class LanCameraClient:
                 self._generate_media_key(self.auth_ticket)
 
             # Start stream (cmd 303)
-            cmd303 = bytearray(256)
-            struct.pack_into("<I", cmd303, 0, 303)
-            if self.device_version > 30:
-                struct.pack_into("<H", cmd303, 4, 0x3001)
-            else:
-                struct.pack_into("<i", cmd303, 4, result if result in (402, 1001) else 0x3001)
-
-            if not self._send_raw(bytes(cmd303)):
+            cmd303 = self._build_stream_start_cmd303(result)
+            if not self._send_raw(cmd303):
                 return False, "Failed sending stream start (cmd 303)"
 
             return True, f"Streaming ({self.frame_width}x{self.frame_height}, {'HD' if self.stream_quality else 'SD'})"
@@ -975,23 +1056,28 @@ class LanCameraClient:
                 break
 
             if auth_status == -1:
-                self._emit_status(f"Auth Error: {auth_msg}")
-                break
+                if self._stop_event.is_set():
+                    break
+                self._emit_status(f"Auth Error: {auth_msg} — retrying in 5s...")
+                self._stop_event.wait(5.0)
+                continue
 
             if auth_status == 0:
-                self._emit_status(f"{auth_msg} — retrying in 3s...")
-                self._stop_event.wait(3.0)
+                self._emit_status(f"{auth_msg} — waking & retrying in 2s...")
+                self._stop_event.wait(2.0)
                 continue
 
             self._emit_status(auth_msg)
             ok, stream_msg = self.stream_login_and_start()
             if not ok:
-                self._emit_status(f"{stream_msg} — retrying in 2s...")
-                self._stop_event.wait(2.0)
+                self._emit_status(f"{stream_msg} — waking camera & retrying...")
+                self._wake_camera_port_8800(include_cloud=True)
+                self._stop_event.wait(1.0)
                 continue
 
             self._emit_status(stream_msg)
             self._receive_frames_loop()
+            self._close_stream_sock()
 
             if self._quality_switch_pending and not self._stop_event.is_set():
                 self._quality_switch_pending = False
@@ -999,10 +1085,44 @@ class LanCameraClient:
                 continue
 
             if not self._stop_event.is_set():
-                self._emit_status("Stream disconnected — reconnecting...")
-                self._stop_event.wait(1.5)
+                # If the stream exited without delivering video frames, the camera is in sleep mode:
+                # trigger full LAN + Cloud wakeup immediately before reconnecting.
+                if self._session_video_frames == 0 or self._force_cloud_wake:
+                    self._emit_status("Camera sleeping — sending wakeup signal...")
+                    self._wake_camera_port_8800(include_cloud=True)
+                    self._stop_event.wait(0.6)
+                else:
+                    self._emit_status("Stream disconnected — waking & reconnecting...")
+                    self._wake_camera_lan_udp(burst_count=3)
+                    self._stop_event.wait(0.8)
 
         self._close_stream_sock()
+
+    def _tick_stream_keepalive(self, force_tcp: bool = False) -> bool:
+        """
+        Send periodic upstream keepalives during live streaming so V380 cameras never enter
+        no-person / idle sleep mode, and prod the encoder if video frames pause.
+        Returns False if the video watchdog timed out and requires a full reconnect.
+        """
+        now = time.monotonic()
+        if force_tcp or (now - self._last_keepalive_mono) >= 8.0:
+            self._last_keepalive_mono = now
+            self._send_raw(LanCameraCommands.PTZ_STOP)
+
+        if (now - self._last_udp_wake_mono) >= 12.0:
+            self._last_udp_wake_mono = now
+            self._wake_camera_lan_udp(burst_count=1)
+
+        no_video_sec = now - self._last_video_frame_mono
+        if no_video_sec >= 5.5 and (now - self._last_encoder_prod_mono) >= 3.0:
+            self._last_encoder_prod_mono = now
+            self.send_wake_pulse()
+
+        if no_video_sec >= 13.5:
+            self._force_cloud_wake = True
+            self._need_reconnect = True
+            return False
+        return True
 
     def _receive_frames_loop(self) -> None:
         sock = self._stream_sock
@@ -1017,17 +1137,36 @@ class LanCameraClient:
         assembling = False
         self._need_reconnect = False
 
+        now = time.monotonic()
+        self._last_video_frame_mono = now
+        self._last_keepalive_mono = now
+        self._last_udp_wake_mono = now
+        self._last_encoder_prod_mono = now
+        self._session_video_frames = 0
+
         while not self._stop_event.is_set() and not self._need_reconnect:
-            hdr = self._read_exact(sock, 12, timeout=12.0)
+            if not self._tick_stream_keepalive():
+                break
+
+            hdr = self._read_exact(sock, 12, timeout=12.0, allow_idle_prod=True)
             if len(hdr) < 12:
                 break
 
             lead = hdr[0]
             if lead == 0x6F:
-                time.sleep(0.01)
+                # Camera sent a 0x6F server keepalive probe: reply immediately so it stays awake
+                self._tick_stream_keepalive(force_tcp=True)
                 continue
             if lead != 0x7F:
-                continue
+                # Resynchronize if a 0x7F frame header starts inside `hdr`
+                idx = hdr.find(b"\x7f", 1)
+                if idx > 0:
+                    tail = self._read_exact(sock, idx, timeout=6.0)
+                    if len(tail) < idx:
+                        break
+                    hdr = hdr[idx:] + tail
+                else:
+                    continue
 
             pkt_type = hdr[1]
             total_frame, cur_frame, pay_len = struct.unpack_from("<HHH", hdr, 3)
@@ -1040,6 +1179,7 @@ class LanCameraClient:
                 break
 
             if pkt_type == 0x5B:
+                self._tick_stream_keepalive(force_tcp=True)
                 continue
 
             if cur_frame == 0 or not assembling or total_frame != frame_total or cur_frame != next_fragment:
@@ -1126,6 +1266,9 @@ class LanCameraClient:
         normalized = self._try_extract_video_payload(full, need_decrypt)
         if not normalized:
             return
+
+        self._last_video_frame_mono = time.monotonic()
+        self._session_video_frames += 1
 
         codec = self._detect_video_codec(raw_type, normalized)
         is_key = self._is_key_video_frame(raw_type, outer_frame_type, normalized)
@@ -1353,21 +1496,40 @@ class LanCameraClient:
                 break
         return bytes(chunks)
 
-    def _read_exact(self, sock: socket.socket, count: int, timeout: float = 5.0) -> bytes:
-        sock.settimeout(timeout)
+    def _read_exact(
+        self,
+        sock: socket.socket,
+        count: int,
+        timeout: float = 5.0,
+        allow_idle_prod: bool = False,
+    ) -> bytes:
         buf = bytearray()
         deadline = time.monotonic() + timeout
+        prodded = False
         while len(buf) < count:
-            if self._stop_event.is_set() or time.monotonic() > deadline:
+            now = time.monotonic()
+            rem = deadline - now
+            if self._stop_event.is_set() or rem <= 0:
                 self._need_reconnect = True
                 break
+            step_timeout = min(rem, 2.5) if (allow_idle_prod and len(buf) == 0) else rem
             try:
+                sock.settimeout(max(0.1, step_timeout))
                 chunk = sock.recv(count - len(buf))
                 if not chunk:
                     self._need_reconnect = True
                     break
                 buf.extend(chunk)
             except socket.timeout:
+                if allow_idle_prod and len(buf) == 0 and time.monotonic() < deadline:
+                    # Camera paused sending media packets on the wire (e.g. entering no-person standby):
+                    # immediately prod the stream & UDP wakeup port before the socket deadline expires!
+                    if not prodded:
+                        prodded = True
+                        self.send_wake_pulse()
+                    else:
+                        self._tick_stream_keepalive(force_tcp=True)
+                    continue
                 self._need_reconnect = True
                 break
             except Exception:
@@ -1431,20 +1593,11 @@ class LanCameraClient:
 
             buf = bytearray(256)
             struct.pack_into("<I", buf, 0, 129)
-            if self.device_version > 20 or ticket:
-                struct.pack_into("<I", buf, 4, self.device_id & 0xFFFFFFFF)
-                buf[8] = 0
-                struct.pack_into("<I", buf, 9, ticket & 0xFFFFFFFF)
-                struct.pack_into("<I", buf, 13, int(action))
-                struct.pack_into("<I", buf, 17, int(slot_id))
-            else:
-                u_b = (self.username or "admin").encode("ascii", errors="ignore")[:32]
-                p_b = self.password.encode("ascii", errors="ignore")[:32]
-                buf[4 : 4 + len(u_b)] = u_b
-                buf[36 : 36 + len(p_b)] = p_b
-                struct.pack_into("<I", buf, 68, int(action))
-                struct.pack_into("<I", buf, 72, int(slot_id))
-                struct.pack_into("<I", buf, 76, self.device_id & 0xFFFFFFFF)
+            struct.pack_into("<I", buf, 4, self.device_id & 0xFFFFFFFF)
+            buf[8] = 0
+            struct.pack_into("<I", buf, 9, ticket & 0xFFFFFFFF)
+            struct.pack_into("<I", buf, 13, int(action))
+            struct.pack_into("<I", buf, 17, int(slot_id))
 
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(3.0)

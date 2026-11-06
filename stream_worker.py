@@ -10,6 +10,10 @@ Supports three connection modes per camera:
 
 from __future__ import annotations
 
+import base64
+import ctypes
+import ctypes.wintypes
+import logging
 import math
 import os
 import queue
@@ -22,6 +26,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger("OmniSight")
 
 import cv2
 import numpy as np
@@ -141,6 +147,79 @@ def get_gpu_capabilities() -> Dict[str, Any]:
     return _GPU_CAPS_CACHE
 
 
+_DPAPI_PREFIX = "dpapi:"
+
+
+class _DATA_BLOB(ctypes.Structure):
+    _fields_ = [
+        ("cbData", ctypes.wintypes.DWORD),
+        ("pbData", ctypes.POINTER(ctypes.c_char)),
+    ]
+
+
+def _dpapi_encrypt(plaintext: str) -> str:
+    """Encrypt a secret string using Windows Current-User DPAPI (`CryptProtectData`)."""
+    if not plaintext or plaintext.startswith(_DPAPI_PREFIX) or os.name != "nt":
+        return plaintext
+    try:
+        raw = plaintext.encode("utf-8")
+        buf = ctypes.create_string_buffer(raw, len(raw))
+        blob_in = _DATA_BLOB(len(raw), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+        blob_out = _DATA_BLOB()
+        crypt32 = ctypes.windll.crypt32
+        kernel32 = ctypes.windll.kernel32
+        # CRYPTPROTECT_UI_FORBIDDEN = 0x01
+        if crypt32.CryptProtectData(
+            ctypes.byref(blob_in),
+            None,
+            None,
+            None,
+            None,
+            0x01,
+            ctypes.byref(blob_out),
+        ):
+            try:
+                enc_bytes = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+                return _DPAPI_PREFIX + base64.b64encode(enc_bytes).decode("ascii")
+            finally:
+                kernel32.LocalFree(blob_out.pbData)
+    except Exception:
+        pass
+    return plaintext
+
+
+def _dpapi_decrypt(value: str) -> str:
+    """Decrypt a `dpapi:`-prefixed secret string using Windows DPAPI (`CryptUnprotectData`)."""
+    if not value or not isinstance(value, str) or not value.startswith(_DPAPI_PREFIX):
+        return value or ""
+    if os.name != "nt":
+        return value
+    try:
+        enc_bytes = base64.b64decode(value[len(_DPAPI_PREFIX) :].encode("ascii"))
+        buf = ctypes.create_string_buffer(enc_bytes, len(enc_bytes))
+        blob_in = _DATA_BLOB(len(enc_bytes), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+        blob_out = _DATA_BLOB()
+        crypt32 = ctypes.windll.crypt32
+        kernel32 = ctypes.windll.kernel32
+        if crypt32.CryptUnprotectData(
+            ctypes.byref(blob_in),
+            None,
+            None,
+            None,
+            None,
+            0x01,
+            ctypes.byref(blob_out),
+        ):
+            try:
+                dec_bytes = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+                return dec_bytes.decode("utf-8")
+            finally:
+                kernel32.LocalFree(blob_out.pbData)
+    except Exception:
+        pass
+    return ""
+
+
 @dataclass
 class CameraConfig:
     cam_id: str
@@ -229,6 +308,10 @@ class CameraConfig:
     def to_dict(self) -> dict:
         d = asdict(self)
         d["chime_zone"] = self.normalize_chime_zone(self.chime_zone)
+        if d.get("password"):
+            d["password"] = _dpapi_encrypt(str(d["password"]))
+        if d.get("rtsp_url"):
+            d["rtsp_url"] = _dpapi_encrypt(str(d["rtsp_url"]))
         return d
 
     @classmethod
@@ -237,6 +320,10 @@ class CameraConfig:
         filtered = {k: v for k, v in data.items() if k in valid_keys}
         if str(filtered.get("protocol", "")).lower() == "v380":
             filtered["protocol"] = "lan8800"
+        if "password" in filtered and isinstance(filtered["password"], str):
+            filtered["password"] = _dpapi_decrypt(filtered["password"])
+        if "rtsp_url" in filtered and isinstance(filtered["rtsp_url"], str):
+            filtered["rtsp_url"] = _dpapi_decrypt(filtered["rtsp_url"])
         if "detection_sound_cooldown" in filtered:
             try:
                 cd = int(filtered["detection_sound_cooldown"])
@@ -1283,6 +1370,8 @@ class CameraStreamWorker(QThread):
         self._rec_lock = threading.Lock()
         self._video_writer: Optional[cv2.VideoWriter] = None
         self._recording_path: str = ""
+        self._rec_start_mono: float = 0.0
+        self._rec_frames_written: int = 0
         self._latest_qimage: Optional[QImage] = None
         self._latest_jpeg_bytes: Optional[bytes] = None
         self._recording_active = False
@@ -1310,6 +1399,15 @@ class CameraStreamWorker(QThread):
         self._last_stat_time = time.monotonic()
         self._current_fps = 0.0
         self._current_kbps = 0.0
+        self._lan_streaming_connected = False
+        self._last_decoded_frame_mono = time.monotonic()
+        self._last_wake_prod_mono = 0.0
+
+    def wake_camera(self) -> None:
+        """Send an immediate LAN + stream wakeup burst to wake a sleeping V380 camera."""
+        client = self._lan_client
+        if client is not None:
+            threading.Thread(target=client.send_wake_pulse, daemon=True).start()
 
     def stop_stream(self) -> None:
         self._stop_flag.set()
@@ -1667,7 +1765,7 @@ class CameraStreamWorker(QThread):
 
     def _detection_worker_loop(self) -> None:
         """
-        Asynchronous AI detection & recording loop.
+        Asynchronous AI detection, recording, and anti-sleep stream watchdog loop.
         Always processes the latest available frame (dropping stale intermediate frames)
         so live video rendering runs at full native camera FPS with zero lag.
         """
@@ -1676,6 +1774,19 @@ class CameraStreamWorker(QThread):
             self._det_event.clear()
             if self._stop_flag.is_set():
                 break
+
+            if self._lan_streaming_connected and self._lan_client is not None:
+                now_wd = time.monotonic()
+                idle_dec = now_wd - self._last_decoded_frame_mono
+                if idle_dec >= 4.5 and (now_wd - self._last_wake_prod_mono) >= 3.0:
+                    self._last_wake_prod_mono = now_wd
+                    self._lan_client.send_wake_pulse()
+                if idle_dec >= 14.0:
+                    self._last_decoded_frame_mono = now_wd
+                    self._seen_keyframe = False
+                    with self._ffmpeg_lock:
+                        self._stop_ffmpeg_video_unlocked()
+                    self._lan_client.trigger_wake_reconnect()
 
             jpeg_data = self._pending_det_jpeg
             bgr = self._pending_det_bgr
@@ -1706,16 +1817,21 @@ class CameraStreamWorker(QThread):
                 continue
 
             try:
+                now_det = time.monotonic()
                 if self.config.person_detection:
-                    boxes = self._person_detector.process_bgr(
-                        bgr,
-                        enabled=True,
-                        sensitivity=getattr(self.config, "detection_sensitivity", "ultra"),
-                        use_gpu=bool(getattr(self.config, "gpu_acceleration", True)),
-                    )
-                    if boxes != self._latest_detections:
-                        self._latest_detections = boxes
-                        self.detections_ready.emit(self.config.cam_id, boxes)
+                    if (
+                        not self._recording_active
+                        or (now_det - self._person_detector._last_run_time) >= self._person_detector.min_interval
+                    ):
+                        boxes = self._person_detector.process_bgr(
+                            bgr,
+                            enabled=True,
+                            sensitivity=getattr(self.config, "detection_sensitivity", "ultra"),
+                            use_gpu=bool(getattr(self.config, "gpu_acceleration", True)),
+                        )
+                        if boxes != self._latest_detections:
+                            self._latest_detections = boxes
+                            self.detections_ready.emit(self.config.cam_id, boxes)
                 elif self._latest_detections:
                     self._latest_detections = []
                     self.detections_ready.emit(self.config.cam_id, [])
@@ -1730,12 +1846,17 @@ class CameraStreamWorker(QThread):
     def _run_lan_loop(self) -> None:
         def on_status(msg: str) -> None:
             connected = msg.startswith("Streaming")
+            self._lan_streaming_connected = connected
             if connected:
-                self._last_stat_time = time.monotonic()
+                now_t = time.monotonic()
+                self._last_stat_time = now_t
+                self._last_decoded_frame_mono = now_t
                 self._frames_window = 0
                 self._bytes_window = 0
             else:
                 self._seen_keyframe = False
+                with self._ffmpeg_lock:
+                    self._stop_ffmpeg_video_unlocked()
             self.status_changed.emit(self.config.cam_id, msg, connected)
 
         def on_frame(frame: CameraFrame) -> None:
@@ -1898,6 +2019,7 @@ class CameraStreamWorker(QThread):
         if qimg.isNull():
             return
 
+        self._last_decoded_frame_mono = time.monotonic()
         self._latest_qimage = qimg
         self._latest_jpeg_bytes = jpeg_data
         self._frames_window += 1
@@ -2015,7 +2137,9 @@ class CameraStreamWorker(QThread):
 
         while not self._stop_flag.is_set():
             self.status_changed.emit(self.config.cam_id, "Connecting RTSP Stream...", False)
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer"
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+                "rtsp_transport;tcp|fflags;nobuffer|stimeout;5000000"
+            )
             cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
             if not cap.isOpened():
                 self.status_changed.emit(self.config.cam_id, "RTSP Connection Failed — Retrying...", False)
@@ -2246,11 +2370,20 @@ class CameraStreamWorker(QThread):
             if not self._recording_active or not self._recording_path:
                 return
             h, w = bgr.shape[:2]
+            now = time.monotonic()
             if self._video_writer is None:
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                 self._video_writer = cv2.VideoWriter(self._recording_path, fourcc, 20.0, (w, h))
+                self._rec_start_mono = now
+                self._rec_frames_written = 0
             try:
-                self._video_writer.write(bgr)
+                target_frames = max(1, int(round((now - self._rec_start_mono) * 20.0)) + 1)
+                if target_frames <= self._rec_frames_written and self._rec_frames_written > 0:
+                    return
+                reps = max(1, min(8, target_frames - self._rec_frames_written))
+                for _ in range(reps):
+                    self._video_writer.write(bgr)
+                    self._rec_frames_written += 1
             except Exception:
                 pass
 
@@ -2545,6 +2678,12 @@ class SDCardPlaybackWorker(QThread):
         if proc is not None:
             try:
                 proc.kill()
+            except Exception:
+                pass
+        aproc = self._ffmpeg_audio_proc
+        if aproc is not None:
+            try:
+                aproc.kill()
             except Exception:
                 pass
 
@@ -2846,7 +2985,9 @@ class SDCardPlaybackWorker(QThread):
 
             if frame.is_audio:
                 if abs(speed - 1.0) < 0.05:
-                    if frame.audio_codec == "alaw":
+                    if frame.audio_codec == "aac":
+                        self._feed_aac_to_ffmpeg(frame.payload)
+                    elif frame.audio_codec == "alaw":
                         pcm = decode_alaw_to_pcm16(frame.payload)
                         if pcm:
                             lvl = CameraStreamWorker._compute_pcm_level(pcm)
@@ -3017,9 +3158,98 @@ class SDCardPlaybackWorker(QThread):
             except Exception:
                 break
 
+    def _feed_aac_to_ffmpeg(self, aac_bytes: bytes) -> None:
+        if self._stop_flag.is_set():
+            return
+        with self._ffmpeg_lock:
+            if self._ffmpeg_audio_proc is None or self._ffmpeg_audio_proc.poll() is not None:
+                self._stop_ffmpeg_audio_unlocked()
+                creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                try:
+                    self._ffmpeg_audio_proc = subprocess.Popen(
+                        [
+                            get_ffmpeg_executable(),
+                            "-hide_banner",
+                            "-loglevel",
+                            "error",
+                            "-probesize",
+                            "512",
+                            "-analyzeduration",
+                            "0",
+                            "-fflags",
+                            "nobuffer",
+                            "-f",
+                            "aac",
+                            "-i",
+                            "pipe:0",
+                            "-f",
+                            "s16le",
+                            "-ar",
+                            "8000",
+                            "-ac",
+                            "1",
+                            "pipe:1",
+                        ],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        bufsize=0,
+                        creationflags=creationflags,
+                    )
+                    threading.Thread(
+                        target=self._ffmpeg_pcm_reader_loop,
+                        args=(self._ffmpeg_audio_proc,),
+                        daemon=True,
+                    ).start()
+                except Exception:
+                    return
+
+            aproc = self._ffmpeg_audio_proc
+        if aproc is not None and aproc.stdin is not None:
+            try:
+                aproc.stdin.write(aac_bytes)
+                aproc.stdin.flush()
+            except Exception:
+                with self._ffmpeg_lock:
+                    self._stop_ffmpeg_audio_unlocked()
+
+    def _ffmpeg_pcm_reader_loop(self, proc: subprocess.Popen) -> None:
+        stdout = proc.stdout
+        if stdout is None:
+            return
+        while not self._stop_flag.is_set() and proc.poll() is None:
+            try:
+                pcm = stdout.read(800)
+                if not pcm or self._stop_flag.is_set():
+                    break
+                lvl = CameraStreamWorker._compute_pcm_level(pcm)
+                self.audio_ready.emit(pcm, lvl)
+            except Exception:
+                break
+
     def _stop_ffmpeg(self) -> None:
         with self._ffmpeg_lock:
             self._stop_ffmpeg_video_unlocked()
+            self._stop_ffmpeg_audio_unlocked()
+
+    def _stop_ffmpeg_audio_unlocked(self) -> None:
+        proc = self._ffmpeg_audio_proc
+        self._ffmpeg_audio_proc = None
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                if proc.stdin:
+                    proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                if proc.stdout:
+                    proc.stdout.close()
+            except Exception:
+                pass
 
     def _stop_ffmpeg_video_unlocked(self) -> None:
         proc = self._ffmpeg_proc
