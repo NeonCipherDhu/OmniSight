@@ -2,26 +2,25 @@
 
 > **Disclaimer:** This project is an independent, unofficial open-source client. It is not affiliated with, endorsed by, sponsored by, or connected to Macro-Video Technologies Co., Ltd. or the official V380 / V380 Pro brands. All product and company names are trademarks of their respective holders; their use here is strictly for identification and compatibility purposes.
 
-**OmniSight** is an independent, open-source Windows desktop NVR / VMS client. It is an **unofficial client compatible with V380 cameras**, built with Python, PyQt6, OpenCV, FFmpeg, and ONNX Runtime for local network (`TCP Port 8800` / `UDP Port 10008`) streaming, PTZ control, microSD playback, and AI person detection.
+**OmniSight** is an independent, open-source Windows desktop NVR / VMS client. It is an **unofficial client compatible with V380 cameras**, built for local Wi-Fi/LAN live streaming, PTZ camera control, microSD card playback, and AI person detection.
 
 ---
 
 ## ✨ Features
 
-- **Local LAN Protocol (`TCP Port 8800`)** — Unofficial client compatible with V380 cameras over your local Wi-Fi/LAN without requiring RTSP to be unlocked:
-  - Dual-stage AES-128-ECB password authentication (`cmd 1167` -> `resp 1168`, supporting both modern `v31/v32` and classic `v2` camera firmware)
-  - Stream login & control (`cmd 301` -> `resp 401` -> `cmd 303`) with instant **HD / SD** stream switching
-  - Automatic firmware `v31/v32+` media frame AES-ECB decryption
-  - Smart **H.264** & **H.265 (HEVC)** Annex-B NAL unit extraction piped into a zero-latency FFmpeg decoder (with Direct3D 11 `d3d11va` hardware acceleration)
-  - **Live Audio** (`AAC-LC`, `G.711 A-Law`, and `IMA-ADPCM` decoding to 16-bit PCM with per-tile mute/unmute & master audio gain)
-- **YOLOv8 AI Person Detection (DirectML GPU Accelerated)** — Built-in `yolov8n.onnx` person detector with 3.2× far-field optical zoom (SAHI) for distant walkers, wind/foliage flicker suppression, and Standard / High / Ultra sensitivity modes:
-  - **Acoustic Detection Chime & Cooldown** — Optional two-note harmonic chime (`E5 → A5`) on person detection with per-camera mute/unmute toggle and configurable `5s`, `10s`, or `20s` alert cooldown.
-  - **Custom Chime Trigger Zone** — Interactive on-canvas drag-and-resize zone editor so audio alerts only trigger when a person enters a designated doorway, gate, or driveway region.
-  - **One-Click False-Positive Suppression (`✕ Not a Person`)** — Hover over any detected bounding box on the live canvas (or use the right-click menu) to dismiss static false positives using spatial + appearance fingerprinting without blinding the zone to real people walking through.
+- **Local Wi-Fi / LAN Streaming** — Connect directly to compatible V380 cameras over your local network without needing to unlock RTSP:
+  - Compatible with both newer and classic camera firmware versions
+  - Instant **HD / SD** video quality switching
+  - Smooth **H.264** & **H.265 (HEVC)** video decoding with Direct3D 11 hardware acceleration
+  - **Live Audio** with per-camera mute/unmute and master volume boost
+- **YOLOv8 AI Person Detection (GPU Accelerated)** — Built-in AI person detector with far-field zoom for distant walkers, foliage/wind false-alarm filtering, and Standard / High / Ultra sensitivity modes:
+  - **Acoustic Detection Chime & Cooldown** — Optional two-note chime on person detection with per-camera mute/unmute toggle and configurable `5s`, `10s`, or `20s` alert cooldown.
+  - **Custom Chime Trigger Zone** — Interactive on-screen drag-and-resize zone editor so audio alerts only trigger when a person enters a specific doorway, gate, or driveway area.
+  - **One-Click False-Positive Suppression (`✕ Not a Person`)** — Hover over any detected box on the live video (or use the right-click menu) to ignore stationary objects without blinding the area to real people walking through.
 - **Live Tile Status & Automatic Camera Wakeup** — Real-time Wi-Fi connection badge, active AI shield indicator, smooth blurred last-frame overlay during reconnection, and automatic wakeup for cameras that enter sleep or standby mode.
-- **Built-In Security Protection** — Saved camera passwords are encrypted on your PC, network connections and wakeup signals are validated for safety, and the setup installer includes built-in file verification checks.
+- **Built-In Security Protection** — Saved camera passwords and stream credentials are automatically encrypted on your PC, network connections are validated for safety, and the setup installer includes built-in file verification checks.
 - **On-Camera microSD Card Footage Review & Backup** — Browse, filter (`All` / `Anomalies` / `Normal`), scrub on an interactive 24-hour zoomable timeline, stream directly from the camera's microSD card with full audio playback, and export or bulk-backup clips to local `.mp4` files with up to `16×` fast-forward playback.
-- **PTZ, Hardware Presets, Floodlight & Night Vision Controls** — Directional Pan/Tilt gimbal control (on-video edge buttons, inspector D-pad, or keyboard arrow keys), up to 6 persistent hardware PTZ preset slots (`PTZX`), LED Floodlight (`On` / `Off` / `Auto`), Night Vision (`Color` / `IR B&W` / `Auto`), and `180° Image Flip`.
+- **PTZ, Hardware Presets, Floodlight & Night Vision Controls** — Directional Pan/Tilt gimbal control (on-video edge buttons, side panel D-pad, or keyboard arrow keys), up to 6 saved camera angle presets, LED Floodlight (`On` / `Off` / `Auto`), Night Vision (`Color` / `IR B&W` / `Auto`), and `180° Image Flip`.
 - **Multi-Camera Grid Layouts** — Switch between **Auto**, **1×1**, **2×2**, and **3×3** views, drag-and-drop tiles to reorder, double-click any camera feed to solo/maximize, scroll the mouse wheel for **1.0×–5.0× digital zoom**, or press `F11` for **Fullscreen Monitor Mode**.
 
 ---
@@ -37,14 +36,14 @@ You do **not** need Python or FFmpeg installed on your PC if you use the prebuil
    - *Note: If Windows SmartScreen displays "Windows protected your PC", click **More info** → **Run anyway**.*
 3. Choose your installation folder (defaults to `%LOCALAPPDATA%\Programs\OmniSight`), select whether to create **Desktop** and **Start Menu** shortcuts, and click **Install Now**.
 4. Click **Finish** to launch **OmniSight**.
-   - *Upgrading:* Installing a newer version over an existing folder automatically preserves your saved `cameras.json`, `camera_names.json`, and `captures/` recordings/snapshots.
+   - *Upgrading:* Installing a newer version over an existing folder automatically keeps your saved cameras, custom names, and recorded videos/snapshots.
 
 ### Option 2: Portable Version (`OmniSight_Portable.zip` — No Installation Required)
 
 1. Go to the [**Latest Release**](https://github.com/NeonCipherDhu/OmniSight/releases/latest) page and download **`OmniSight_Portable.zip`**.
 2. Extract the ZIP archive into any folder on your PC or external drive (for example, `C:\Tools\OmniSight` or `D:\OmniSight`).
 3. Double-click **`OmniSight.exe`** inside the extracted folder to launch the app.
-   - All camera configurations (`cameras.json`) and media captures (`captures/snapshots`, `captures/recordings`, `captures/presets`) are stored directly inside that portable folder.
+   - All saved camera settings (with encrypted passwords) and media captures (`snapshots`, `recordings`, `presets`) are stored directly inside that portable folder.
 
 ### Option 3: Run from Source (Developers / Python 3.10+)
 
@@ -74,18 +73,16 @@ Make sure your Windows PC and your camera are connected to the **same local netw
 ### Method 1: Automatic LAN Discovery (Recommended)
 
 1. Click **Discover** in the top header bar (or click **Add Camera** -> **Discover** next to the IP Address field).
-2. OmniSight will scan your local network using:
-   - UDP broadcast & unicast (`NVDEVSEARCH^100` on UDP ports `10008`/`10009`)
-   - Multi-threaded TCP Port `8800` subnet probe
+2. OmniSight will automatically scan your local Wi-Fi/LAN for compatible cameras.
 3. Select your camera from the discovered list and click **Select Camera**.
 4. The **IP Address**, **TCP Port (`8800`)**, and **Device ID** will be filled in automatically.
-5. Enter your **Camera Password** and click **Save**.
+5. Enter your **Camera Password** and click **Save** (your password is automatically encrypted when saved).
 
 ---
 
 ### Method 2: Manually Adding a Camera
 
-If your router blocks UDP discovery broadcasts or your camera is on a different subnet/VLAN, you can add it manually:
+If your router blocks local discovery broadcasts or your camera is on a different subnet/VLAN, you can add it manually:
 
 1. Click **Add Camera** (`+`) in the top header bar.
 2. Fill in the camera configuration fields:
@@ -97,7 +94,7 @@ If your router blocks UDP discovery broadcasts or your camera is on a different 
    - **Username**: `admin` (default — OmniSight also automatically tries your numeric Device ID if needed).
    - **Password**: Your camera's device password.
    - **Stream Profile**: `HD (Main Stream)` or `SD (Sub Stream)`.
-3. Click **Save** — the tile will immediately authenticate and start streaming live video and audio.
+3. Click **Save** — your settings are saved with encrypted credentials and the camera tile will immediately start streaming live video and audio.
 
 ---
 
@@ -113,41 +110,6 @@ If you are adding a camera manually and do not know its **Device ID**, **IP Addr
 | **Username** | Leave as **`admin`** (the factory default). During login, OmniSight automatically tests your entered username, your numeric Device ID, and `admin`. |
 | **TCP Port** | Leave as **`8800`** for LAN port 8800 connections. |
 | **RTSP URL**<br>*(RTSP Mode only)* | Only needed if you select `RTSP / ONVIF Stream (TCP 554)` instead of the LAN 8800 protocol.<br>Format: `rtsp://admin:YOUR_PASSWORD@192.168.1.100:554/live/ch00_1` (`ch00_1` = HD, `ch00_0` = SD). |
-
----
-
-## 📁 Configuration File (`cameras.json`)
-
-Camera settings are automatically saved to `cameras.json` in the application folder when you add or edit cameras in the UI. You can also create `cameras.json` manually by copying [`cameras.example.json`](cameras.example.json):
-
-```json
-[
-  {
-    "cam_id": "cam_example01",
-    "name": "Camera 01",
-    "protocol": "lan8800",
-    "ip": "192.168.1.100",
-    "port": 8800,
-    "device_id": "12345678",
-    "username": "admin",
-    "password": "YOUR_CAMERA_PASSWORD",
-    "quality": 1,
-    "rtsp_url": "",
-    "audio_enabled": true,
-    "light_mode": "auto",
-    "image_mode": "auto",
-    "flipped": false,
-    "person_detection": true,
-    "detection_sensitivity": "ultra",
-    "detection_sound": true,
-    "detection_sound_cooldown": 10,
-    "chime_zone": null,
-    "gpu_acceleration": true,
-    "ptz_presets": [],
-    "ignored_objects": []
-  }
-]
-```
 
 ---
 
