@@ -616,6 +616,8 @@ class LanCameraClient:
         self._last_udp_wake_mono: float = 0.0
         self._last_encoder_prod_mono: float = 0.0
 
+    _RELAY_IP_CACHE: Dict[int, List[str]] = {}
+
     @staticmethod
     def _configure_tcp_keepalive(sock: socket.socket) -> None:
         """Enable OS-level TCP keepalive probes (8s idle, 2.5s interval) so idle/cross-subnet streams never drop."""
@@ -638,13 +640,12 @@ class LanCameraClient:
     def send_wake_pulse(self) -> None:
         """
         Send an active anti-sleep wakeup pulse over both UDP (10008/10009/5040) and the active
-        TCP 8800 stream socket (`PTZ_STOP` neutral heartbeat + `cmd 303` stream start).
-        Prevents V380 cameras from entering idle/no-person sleep and wakes paused encoders.
+        TCP 8800 stream socket (`PTZ_STOP` framed neutral heartbeat).
+        Prevents V380 cameras from entering idle/no-person sleep without corrupting the framed stream.
         """
         self._wake_camera_lan_udp(burst_count=2)
         if self._stream_sock is not None:
             self._send_raw(LanCameraCommands.PTZ_STOP)
-            self._send_raw(self._build_stream_start_cmd303())
 
     def trigger_wake_reconnect(self) -> None:
         """Force immediate stream reconnect with full LAN + Cloud wakeup sequence."""
@@ -780,93 +781,145 @@ class LanCameraClient:
         local TCP port 8800 listener or video encoder goes into sleep/standby when no person
         is detected, using:
         1. Multi-packet UDP `NVDEVSEARCH^100` wakeup burst to <ip>:10008/10009/5040 + broadcast
-        2. Optional Cloud Dispatch (`dispa1.av380.net:8001`) `cmd 1167` wakeup signal
-           (using a blank/dummy wakeup key so real camera passwords never leave the LAN).
-        3. Active readiness polling on TCP port 8800 with repeated LAN UDP prods.
+        2. Authenticated Cloud Dispatch (`dispa1.av380.net:8001`) `cmd 1167` wakeup signal
+           so the cloud relay pushes the wakeup handshake to the sleeping camera.
         """
         self._wake_camera_lan_udp(burst_count=3)
         if not include_cloud or self.device_id <= 0:
             return
 
         relay_ips: List[str] = []
-        try:
-            ts = int(time.time())
-            base = f"dev_id={self.device_id}&platform=10001&timestamp={ts}hsdata2022"
-            sign = hashlib.sha1(base.encode("utf-8")).hexdigest().lower()
-            body = json.dumps(
-                {
-                    "dev_id": self.device_id,
-                    "platform": 10001,
-                    "timestamp": ts,
-                    "sign": sign,
-                }
-            ).encode("utf-8")
-            req = urllib.request.Request(
-                "http://dispa1.av380.net:8001/api/v1/get_stream_server",
-                data=body,
-                headers={"Content-Type": "application/json"},
-            )
-            with urllib.request.urlopen(req, timeout=1.8) as resp:
-                data = json.loads(resp.read().decode("utf-8", errors="ignore"))
-                if data.get("code") == 2000:
-                    for item in data.get("data", []):
-                        rip = item.get("ip")
-                        if rip and rip not in relay_ips:
-                            relay_ips.append(rip)
-        except Exception:
-            pass
+        for _ in range(2):
+            if self._stop_event.is_set() or relay_ips:
+                break
+            try:
+                ts = int(time.time())
+                base = f"dev_id={self.device_id}&platform=10001&timestamp={ts}hsdata2022"
+                sign = hashlib.sha1(base.encode("utf-8")).hexdigest().lower()
+                body = json.dumps(
+                    {
+                        "dev_id": self.device_id,
+                        "platform": 10001,
+                        "timestamp": ts,
+                        "sign": sign,
+                    }
+                ).encode("utf-8")
+                req = urllib.request.Request(
+                    "http://dispa1.av380.net:8001/api/v1/get_stream_server",
+                    data=body,
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=2.2) as resp:
+                    data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                    if data.get("code") == 2000:
+                        for item in data.get("data", []):
+                            rip = str(item.get("ip") or "").strip()
+                            if rip and rip not in relay_ips:
+                                try:
+                                    if ipaddress.IPv4Address(rip).is_global:
+                                        relay_ips.append(rip)
+                                except Exception:
+                                    pass
+            except Exception:
+                pass
 
-        for fallback_ip in ("103.138.75.221", "129.226.139.226", "101.33.35.22"):
+        if relay_ips:
+            self._RELAY_IP_CACHE[self.device_id] = list(relay_ips)
+        else:
+            for cached_ip in self._RELAY_IP_CACHE.get(self.device_id, []):
+                if cached_ip not in relay_ips:
+                    relay_ips.append(cached_ip)
+            for other_ips in self._RELAY_IP_CACHE.values():
+                for cached_ip in other_ips:
+                    if cached_ip not in relay_ips:
+                        relay_ips.append(cached_ip)
+
+        for fallback_ip in (
+            "103.138.75.134",
+            "103.138.75.212",
+            "103.138.75.221",
+            "43.154.60.102",
+            "43.128.44.102",
+            "43.154.16.42",
+            "129.226.135.99",
+            "129.226.139.226",
+            "101.33.35.22",
+        ):
             if fallback_ip not in relay_ips:
                 relay_ips.append(fallback_ip)
 
-        user_str = str(self.device_id) or "admin"
-        user_b = user_str.encode("ascii", errors="ignore")[:32]
+        candidate_users: List[str] = []
+        primary_user = self.username if self.username != "admin" else (str(self.device_id) or "admin")
+        for u in (primary_user, str(self.device_id) if self.device_id else "", "admin"):
+            if u and u not in candidate_users:
+                candidate_users.append(u)
+
         host_b = f"{self.device_id}.nvdvr.net".encode("ascii", errors="ignore")[:50]
-        # Never transmit the user's real camera password to external cloud relays;
-        # a dummy wakeup block triggers the relay-to-camera port 8800 wake signal safely.
-        enc_pw = self.generate_password("", block_bytes=48)
+        enc_pw = self.generate_password(self.password, block_bytes=48)
 
-        cmd = bytearray(520)
-        struct.pack_into("<I", cmd, 0, 1167)
-        struct.pack_into("<I", cmd, 4, 1022)
-        cmd[8] = 31
-        struct.pack_into("<I", cmd, 9, 1)
-        struct.pack_into("<I", cmd, 13, self.device_id & 0xFFFFFFFF)
-        cmd[17 : 17 + len(host_b)] = host_b
-        struct.pack_into("<I", cmd, 67, 8800)
-        cmd[71 : 71 + len(user_b)] = user_b
-        cmd[103 : 103 + len(enc_pw)] = enc_pw
+        def _build_relay_cmd(u_str: str) -> bytearray:
+            user_b = u_str.encode("ascii", errors="ignore")[:32]
+            c = bytearray(520)
+            struct.pack_into("<I", c, 0, 1167)
+            struct.pack_into("<I", c, 4, 1022)
+            c[8] = 31
+            struct.pack_into("<I", c, 9, 1)
+            struct.pack_into("<I", c, 13, self.device_id & 0xFFFFFFFF)
+            c[17 : 17 + len(host_b)] = host_b
+            struct.pack_into("<I", c, 67, 8800)
+            c[71 : 71 + len(user_b)] = user_b
+            c[103 : 103 + len(enc_pw)] = enc_pw
+            return c
 
-        for rip in relay_ips[:3]:
+        cmd_primary = _build_relay_cmd(candidate_users[0])
+
+        for rip in relay_ips[:4]:
             if self._stop_event.is_set():
                 return
+            rsock: Optional[socket.socket] = None
             try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as rsock:
-                    rsock.settimeout(1.5)
-                    rsock.connect((rip, 8800))
-                    rsock.sendall(cmd)
-                    self._recv_response(rsock, 256, timeout=1.0)
+                rsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._stream_sock = rsock
+                rsock.settimeout(1.8)
+                rsock.connect((rip, 8800))
+                rsock.sendall(cmd_primary)
+                resp = self._recv_response(rsock, 256, timeout=1.5)
+                if resp and len(resp) >= 8:
+                    rcmd, rres = struct.unpack_from("<II", resp, 0)
+                    if rcmd == 1168 and rres in (1002, 1011) and len(candidate_users) > 1:
+                        rsock.close()
+                        rsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        self._stream_sock = rsock
+                        rsock.settimeout(1.8)
+                        rsock.connect((rip, 8800))
+                        rsock.sendall(_build_relay_cmd(candidate_users[1]))
+                        self._recv_response(rsock, 256, timeout=1.5)
             except Exception:
                 continue
+            finally:
+                if rsock is not None:
+                    if self._stream_sock is rsock:
+                        self._stream_sock = None
+                    try:
+                        rsock.close()
+                    except Exception:
+                        pass
 
-        # Poll up to ~1.2s with UDP wake prods so sleeping cameras finish opening port 8800
-        for _ in range(3):
-            if self._stop_event.is_set():
-                return
-            self._stop_event.wait(0.35)
-            self._wake_camera_lan_udp(burst_count=2)
+        self._wake_camera_lan_udp(burst_count=2)
+        self._stop_event.wait(0.4)
 
     def authenticate(self, skip_cloud_wake: bool = False) -> Tuple[int, str]:
         """
         Perform port 8800 authentication (`cmd 1167` -> `resp 1168`).
-        Always attempts local LAN UDP 10008 + direct TCP 8800 first; automatically falls back
-        to full LAN + Cloud wakeup (with a dummy password) whenever the camera is sleeping.
+        Attempts fast LAN UDP + TCP 8800 first when `self._force_cloud_wake` is False;
+        automatically triggers authenticated Cloud Dispatch wakeup and polls TCP port 8800
+        readiness (up to ~5.5s) whenever the camera is in sleep/standby mode.
         """
         self._close_stream_sock()
         if self._stop_event.is_set():
             return -1, "Stopped"
-        if self._force_cloud_wake:
+        force_cloud = self._force_cloud_wake
+        if force_cloud:
             skip_cloud_wake = False
             self._force_cloud_wake = False
         self._resolve_device_id_if_missing()
@@ -886,86 +939,119 @@ class LanCameraClient:
         ]
 
         last_err = "Connection timed out"
-        max_passes = 1 if skip_cloud_wake else 2
+        cloud_woken = False
+        if force_cloud and not skip_cloud_wake:
+            self._emit_status("Waking sleeping camera...")
+            self._wake_camera_port_8800(include_cloud=True)
+            cloud_woken = True
+
+        max_passes = 1 if (skip_cloud_wake or cloud_woken) else 2
         for pass_idx in range(max_passes):
-            for candidate_port in ports_to_try:
-                port_reachable = False
-                for candidate_user in usernames_to_try:
-                    for pkt_size, unk1, unk2_ver, pw_block_len in variants:
-                        if self._stop_event.is_set():
-                            return -1, "Stopped"
+            # When the cloud relay wakeup was just sent, the sleeping camera on Wi-Fi
+            # typically takes 1.5s - 5.5s to wake its radio, resolve ARP, and open TCP port 8800.
+            # Poll connect up to 8 times so we immediately authenticate the moment port 8800 opens.
+            connect_attempts = 8 if cloud_woken else 1
+            last_attempt_fast_fail = False
+            for conn_try in range(connect_attempts):
+                if self._stop_event.is_set():
+                    return -1, "Stopped"
+                if conn_try > 0:
+                    self._wake_camera_lan_udp(burst_count=2)
+                    wait_sec = 0.85 if last_attempt_fast_fail else 0.35
+                    self._stop_event.wait(wait_sec)
+                    if self._stop_event.is_set():
+                        return -1, "Stopped"
 
-                        sock: Optional[socket.socket] = None
-                        try:
-                            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                            self._stream_sock = sock
-                            sock.settimeout(2.2 if pass_idx == 0 and max_passes > 1 else 4.0)
-                            sock.connect((self.ip, candidate_port))
+                t_conn_start = time.monotonic()
+                any_port_reachable = False
+                for candidate_port in ports_to_try:
+                    port_reachable = False
+                    for candidate_user in usernames_to_try:
+                        for pkt_size, unk1, unk2_ver, pw_block_len in variants:
                             if self._stop_event.is_set():
                                 return -1, "Stopped"
-                            port_reachable = True
 
-                            enc_pw = self.generate_password(self.password, block_bytes=pw_block_len)
-                            user_bytes = candidate_user.encode("ascii", errors="ignore")[:32]
+                            sock: Optional[socket.socket] = None
+                            try:
+                                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                                self._stream_sock = sock
+                                if not cloud_woken and max_passes > 1 and pass_idx == 0:
+                                    sock.settimeout(1.2)
+                                elif cloud_woken and conn_try + 1 < connect_attempts:
+                                    sock.settimeout(1.5)
+                                else:
+                                    sock.settimeout(3.0)
+                                sock.connect((self.ip, candidate_port))
+                                if self._stop_event.is_set():
+                                    return -1, "Stopped"
+                                port_reachable = True
+                                any_port_reachable = True
 
-                            cmd1167 = bytearray(pkt_size)
-                            struct.pack_into("<I", cmd1167, 0, 1167)
-                            struct.pack_into("<I", cmd1167, 4, unk1)
-                            cmd1167[8] = unk2_ver
-                            struct.pack_into("<I", cmd1167, 9, 1)
-                            struct.pack_into("<I", cmd1167, 13, self.device_id & 0xFFFFFFFF)
-                            cmd1167[49 : 49 + len(user_bytes)] = user_bytes
-                            cmd1167[81 : 81 + len(enc_pw)] = enc_pw
+                                enc_pw = self.generate_password(self.password, block_bytes=pw_block_len)
+                                user_bytes = candidate_user.encode("ascii", errors="ignore")[:32]
 
-                            sock.sendall(cmd1167)
-                            resp = self._recv_response(sock, 256, timeout=4.0)
-                            if not resp or len(resp) < 32:
-                                last_err = "Camera in sleep/standby (empty auth response)"
-                                continue
+                                cmd1167 = bytearray(pkt_size)
+                                struct.pack_into("<I", cmd1167, 0, 1167)
+                                struct.pack_into("<I", cmd1167, 4, unk1)
+                                cmd1167[8] = unk2_ver
+                                struct.pack_into("<I", cmd1167, 9, 1)
+                                struct.pack_into("<I", cmd1167, 13, self.device_id & 0xFFFFFFFF)
+                                cmd1167[49 : 49 + len(user_bytes)] = user_bytes
+                                cmd1167[81 : 81 + len(enc_pw)] = enc_pw
 
-                            resp_cmd = struct.unpack_from("<I", resp, 0)[0]
-                            if resp_cmd != 1168:
-                                last_err = f"Unexpected auth response command: {resp_cmd}"
-                                continue
+                                sock.sendall(cmd1167)
+                                resp = self._recv_response(sock, 256, timeout=4.0)
+                                if not resp or len(resp) < 32:
+                                    last_err = "Camera in sleep/standby (empty auth response)"
+                                    continue
 
-                            login_result = struct.unpack_from("<I", resp, 4)[0]
-                            if login_result == 1001:
-                                self.port = candidate_port
-                                self.username = candidate_user
-                                self.device_version = resp[12]
-                                self.auth_ticket = struct.unpack_from("<I", resp, 13)[0]
-                                self.session_id = struct.unpack_from("<I", resp, 17)[0]
-                                return 1, f"Authenticated (v{self.device_version}, port {self.port})"
+                                resp_cmd = struct.unpack_from("<I", resp, 0)[0]
+                                if resp_cmd != 1168:
+                                    last_err = f"Unexpected auth response command: {resp_cmd}"
+                                    continue
 
-                            if login_result == 1011:
-                                last_err = "Invalid camera username (error 1011)"
+                                login_result = struct.unpack_from("<I", resp, 4)[0]
+                                if login_result == 1001:
+                                    self.port = candidate_port
+                                    self.username = candidate_user
+                                    self.device_version = resp[12]
+                                    self.auth_ticket = struct.unpack_from("<I", resp, 13)[0]
+                                    self.session_id = struct.unpack_from("<I", resp, 17)[0]
+                                    return 1, f"Authenticated (v{self.device_version}, port {self.port})"
+
+                                if login_result == 1011:
+                                    last_err = "Invalid camera username (error 1011)"
+                                    break
+                                if login_result == 1012:
+                                    return -1, "Invalid camera password (error 1012)"
+                                if login_result == 1018:
+                                    return (
+                                        -1,
+                                        f"Invalid Device ID ({self.device_id}) — check camera sticker (error 1018)",
+                                    )
+                                last_err = f"Camera standby/busy (code {login_result})"
                                 break
-                            if login_result == 1012:
-                                return -1, "Invalid camera password (error 1012)"
-                            if login_result == 1018:
-                                return (
-                                    -1,
-                                    f"Invalid Device ID ({self.device_id}) — check camera sticker (error 1018)",
-                                )
-                            last_err = f"Camera standby/busy (code {login_result})"
+
+                            except (socket.timeout, ConnectionRefusedError, OSError) as exc:
+                                if self._stop_event.is_set():
+                                    return -1, "Stopped"
+                                last_err = f"Cannot connect to {self.ip}:{candidate_port} ({exc})"
+                                break
+                            finally:
+                                if sock is not None:
+                                    if self._stream_sock is sock:
+                                        self._stream_sock = None
+                                    try:
+                                        sock.close()
+                                    except Exception:
+                                        pass
+
+                        if not port_reachable:
                             break
 
-                        except (socket.timeout, ConnectionRefusedError, OSError) as exc:
-                            if self._stop_event.is_set():
-                                return -1, "Stopped"
-                            last_err = f"Cannot connect to {self.ip}:{candidate_port} ({exc})"
-                            break
-                        finally:
-                            if sock is not None:
-                                if self._stream_sock is sock:
-                                    self._stream_sock = None
-                                try:
-                                    sock.close()
-                                except Exception:
-                                    pass
-
-                    if not port_reachable:
-                        break
+                last_attempt_fast_fail = (time.monotonic() - t_conn_start) < 0.6
+                if any_port_reachable and "1011" in last_err:
+                    break
 
             if pass_idx + 1 >= max_passes:
                 break
@@ -973,6 +1059,7 @@ class LanCameraClient:
             # send full LAN + Cloud wakeup signal and retry!
             self._emit_status("Waking sleeping camera...")
             self._wake_camera_port_8800(include_cloud=True)
+            cloud_woken = True
 
         if "1011" in last_err:
             return -1, last_err
@@ -980,63 +1067,77 @@ class LanCameraClient:
 
     def stream_login_and_start(self) -> Tuple[bool, str]:
         """Connect stream socket, send `cmd 301`, parse `resp 401`, and send `cmd 303`."""
-        self._close_stream_sock()
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
-            self._configure_tcp_keepalive(sock)
-            sock.settimeout(6.0)
-            sock.connect((self.ip, self.port))
-            self._stream_sock = sock
-
-            cmd301 = bytearray(256)
-            struct.pack_into("<I", cmd301, 0, 301)
-            struct.pack_into("<I", cmd301, 4, self.device_id & 0xFFFFFFFF)
-            struct.pack_into("<I", cmd301, 8, 0)
-            struct.pack_into("<H", cmd301, 12, 20)  # Target FPS
-            struct.pack_into("<I", cmd301, 14, self.auth_ticket & 0xFFFFFFFF)
-            struct.pack_into("<I", cmd301, 22, 4097 if self.enable_audio else 4096)
-            struct.pack_into("<I", cmd301, 26, self.stream_quality)
-
-            if not self._send_raw(bytes(cmd301)):
-                return False, "Failed sending stream login (cmd 301)"
-
-            resp401 = self._recv_response(sock, 412, timeout=10.0)
-            if not resp401 or len(resp401) < 16:
-                return False, "Stream login response too short"
-
-            resp_cmd = struct.unpack_from("<I", resp401, 0)[0]
-            if resp_cmd != 401:
-                return False, f"Expected stream login 401, got {resp_cmd}"
-
-            result = struct.unpack_from("<i", resp401, 4)[0]
-            if result in (-11, -12):
-                return False, f"Camera stream rejected (code {result})"
-
-            version = struct.unpack_from("<H", resp401, 8)[0]
-            width = struct.unpack_from("<I", resp401, 10)[0]
-            height = struct.unpack_from("<I", resp401, 14)[0]
-
-            self.communication_version = version
-            if 160 <= width <= 4096:
-                self.frame_width = int(width)
-            if 120 <= height <= 4096:
-                self.frame_height = int(height)
-
-            if self.device_version > 30:
-                self._generate_media_key(self.auth_ticket)
-
-            # Start stream (cmd 303)
-            cmd303 = self._build_stream_start_cmd303(result)
-            if not self._send_raw(cmd303):
-                return False, "Failed sending stream start (cmd 303)"
-
-            return True, f"Streaming ({self.frame_width}x{self.frame_height}, {'HD' if self.stream_quality else 'SD'})"
-
-        except Exception as exc:
+        last_err = "Stream handshake failed"
+        for attempt in range(2):
             self._close_stream_sock()
-            return False, f"Stream handshake failed: {exc}"
+            if self._stop_event.is_set():
+                return False, "Stopped"
+            if attempt > 0:
+                self._wake_camera_lan_udp(burst_count=1)
+                self._stop_event.wait(0.25)
+                if self._stop_event.is_set():
+                    return False, "Stopped"
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+                self._configure_tcp_keepalive(sock)
+                sock.settimeout(6.0)
+                sock.connect((self.ip, self.port))
+                self._stream_sock = sock
+
+                cmd301 = bytearray(256)
+                struct.pack_into("<I", cmd301, 0, 301)
+                struct.pack_into("<I", cmd301, 4, self.device_id & 0xFFFFFFFF)
+                struct.pack_into("<I", cmd301, 8, 0)
+                struct.pack_into("<H", cmd301, 12, 20)  # Target FPS
+                struct.pack_into("<I", cmd301, 14, self.auth_ticket & 0xFFFFFFFF)
+                struct.pack_into("<I", cmd301, 22, 4097 if self.enable_audio else 4096)
+                struct.pack_into("<I", cmd301, 26, self.stream_quality)
+
+                if not self._send_raw(bytes(cmd301)):
+                    last_err = "Failed sending stream login (cmd 301)"
+                    continue
+
+                resp401 = self._recv_response(sock, 412, timeout=10.0)
+                if not resp401 or len(resp401) < 16:
+                    last_err = "Stream login response too short"
+                    continue
+
+                resp_cmd = struct.unpack_from("<I", resp401, 0)[0]
+                if resp_cmd != 401:
+                    last_err = f"Expected stream login 401, got {resp_cmd}"
+                    continue
+
+                result = struct.unpack_from("<i", resp401, 4)[0]
+                if result in (-11, -12):
+                    return False, f"Camera stream rejected (code {result})"
+
+                version = struct.unpack_from("<H", resp401, 8)[0]
+                width = struct.unpack_from("<I", resp401, 10)[0]
+                height = struct.unpack_from("<I", resp401, 14)[0]
+
+                self.communication_version = version
+                if 160 <= width <= 4096:
+                    self.frame_width = int(width)
+                if 120 <= height <= 4096:
+                    self.frame_height = int(height)
+
+                if self.device_version > 30:
+                    self._generate_media_key(self.auth_ticket)
+
+                # Start stream (cmd 303)
+                cmd303 = self._build_stream_start_cmd303(result)
+                if not self._send_raw(cmd303):
+                    last_err = "Failed sending stream start (cmd 303)"
+                    continue
+
+                return True, f"Streaming ({self.frame_width}x{self.frame_height}, {'HD' if self.stream_quality else 'SD'})"
+
+            except Exception as exc:
+                self._close_stream_sock()
+                last_err = f"Stream handshake failed: {exc}"
+        return False, last_err
 
     def run_forever(self) -> None:
         """Main loop: authenticate, start stream, receive & demux media packets until stopped."""
@@ -1063,16 +1164,17 @@ class LanCameraClient:
                 continue
 
             if auth_status == 0:
-                self._emit_status(f"{auth_msg} — waking & retrying in 2s...")
-                self._stop_event.wait(2.0)
+                self._force_cloud_wake = True
+                self._emit_status(f"{auth_msg} — waking & retrying in 1.5s...")
+                self._stop_event.wait(1.5)
                 continue
 
             self._emit_status(auth_msg)
             ok, stream_msg = self.stream_login_and_start()
             if not ok:
+                self._force_cloud_wake = True
                 self._emit_status(f"{stream_msg} — waking camera & retrying...")
-                self._wake_camera_port_8800(include_cloud=True)
-                self._stop_event.wait(1.0)
+                self._stop_event.wait(0.8)
                 continue
 
             self._emit_status(stream_msg)
@@ -1086,11 +1188,11 @@ class LanCameraClient:
 
             if not self._stop_event.is_set():
                 # If the stream exited without delivering video frames, the camera is in sleep mode:
-                # trigger full LAN + Cloud wakeup immediately before reconnecting.
+                # trigger full LAN + Cloud wakeup on the next authenticate() pass.
                 if self._session_video_frames == 0 or self._force_cloud_wake:
+                    self._force_cloud_wake = True
                     self._emit_status("Camera sleeping — sending wakeup signal...")
-                    self._wake_camera_port_8800(include_cloud=True)
-                    self._stop_event.wait(0.6)
+                    self._stop_event.wait(0.5)
                 else:
                     self._emit_status("Stream disconnected — waking & reconnecting...")
                     self._wake_camera_lan_udp(burst_count=3)
@@ -1114,11 +1216,11 @@ class LanCameraClient:
             self._wake_camera_lan_udp(burst_count=1)
 
         no_video_sec = now - self._last_video_frame_mono
-        if no_video_sec >= 5.5 and (now - self._last_encoder_prod_mono) >= 3.0:
+        if no_video_sec >= 6.5 and (now - self._last_encoder_prod_mono) >= 3.5:
             self._last_encoder_prod_mono = now
             self.send_wake_pulse()
 
-        if no_video_sec >= 13.5:
+        if no_video_sec >= 18.0:
             self._force_cloud_wake = True
             self._need_reconnect = True
             return False
@@ -1512,7 +1614,7 @@ class LanCameraClient:
             if self._stop_event.is_set() or rem <= 0:
                 self._need_reconnect = True
                 break
-            step_timeout = min(rem, 2.5) if (allow_idle_prod and len(buf) == 0) else rem
+            step_timeout = min(rem, 4.0) if (allow_idle_prod and len(buf) == 0) else rem
             try:
                 sock.settimeout(max(0.1, step_timeout))
                 chunk = sock.recv(count - len(buf))
@@ -1683,12 +1785,13 @@ class LanCameraClient:
         using the Segment Search protocol (`cmd 361` -> `resp 461`, `cmd 362` -> `resp 462`).
         """
         msg = "Connection failed"
-        for attempt in range(3):
+        for attempt in range(2):
             if self._stop_event.is_set():
                 return False, "Cancelled", []
-            if attempt == 1:
+            if attempt > 0:
+                self._force_cloud_wake = True
                 self._stop_event.wait(0.25)
-            res, msg = self.authenticate(skip_cloud_wake=(attempt < 2))
+            res, msg = self.authenticate(skip_cloud_wake=False)
             if res == 1:
                 break
         else:
@@ -1807,12 +1910,13 @@ class LanCameraClient:
             return self._stop_event.is_set() or (stop_event is not None and stop_event.is_set())
 
         msg = "Connection failed"
-        for attempt in range(3):
+        for attempt in range(2):
             if is_stopped():
                 return False, "Cancelled"
-            if attempt == 1:
+            if attempt > 0:
+                self._force_cloud_wake = True
                 self._stop_event.wait(0.25)
-            res, msg = self.authenticate(skip_cloud_wake=(attempt < 2))
+            res, msg = self.authenticate(skip_cloud_wake=False)
             if res == 1:
                 break
         else:

@@ -1402,12 +1402,16 @@ class CameraStreamWorker(QThread):
         self._lan_streaming_connected = False
         self._last_decoded_frame_mono = time.monotonic()
         self._last_wake_prod_mono = 0.0
+        self._force_cloud_wake = False
 
     def wake_camera(self) -> None:
         """Send an immediate LAN + stream wakeup burst to wake a sleeping V380 camera."""
         client = self._lan_client
         if client is not None:
-            threading.Thread(target=client.send_wake_pulse, daemon=True).start()
+            if self._lan_streaming_connected:
+                threading.Thread(target=client.send_wake_pulse, daemon=True).start()
+            else:
+                threading.Thread(target=client.trigger_wake_reconnect, daemon=True).start()
 
     def stop_stream(self) -> None:
         self._stop_flag.set()
@@ -1778,10 +1782,10 @@ class CameraStreamWorker(QThread):
             if self._lan_streaming_connected and self._lan_client is not None:
                 now_wd = time.monotonic()
                 idle_dec = now_wd - self._last_decoded_frame_mono
-                if idle_dec >= 4.5 and (now_wd - self._last_wake_prod_mono) >= 3.0:
+                if idle_dec >= 6.5 and (now_wd - self._last_wake_prod_mono) >= 3.5:
                     self._last_wake_prod_mono = now_wd
                     self._lan_client.send_wake_pulse()
-                if idle_dec >= 14.0:
+                if idle_dec >= 18.0:
                     self._last_decoded_frame_mono = now_wd
                     self._seen_keyframe = False
                     with self._ffmpeg_lock:
@@ -1905,6 +1909,9 @@ class CameraStreamWorker(QThread):
             on_frame=on_frame,
             on_status=on_status,
         )
+        if self._force_cloud_wake:
+            self._lan_client._force_cloud_wake = True
+            self._force_cloud_wake = False
         self._lan_client.run_forever()
 
     def _ensure_ffmpeg_started(self, codec: VideoCodec) -> None:

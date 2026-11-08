@@ -120,7 +120,7 @@ from omnisight_protocol import (
 )
 
 BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 APP_DIR = (
     Path(sys.executable).resolve().parent
     if getattr(sys, "frozen", False)
@@ -3418,23 +3418,17 @@ class CameraTileWidget(QFrame):
         self.selected.emit(self.config.cam_id)
         if self.is_streaming():
             self.stop_stream()
-        if (self.config.protocol or "lan8800").lower() not in ("demo", "rtsp") and self.config.ip:
-            def _wake_bg(ip: str = self.config.ip, port: int = self.config.port, dev_id: str = self.config.device_id) -> None:
-                try:
-                    c = LanCameraClient(ip=ip, port=port, device_id=dev_id)
-                    c._wake_camera_port_8800(include_cloud=True)
-                except Exception:
-                    pass
-            threading.Thread(target=_wake_bg, daemon=True).start()
-        self.start_stream()
+        self.start_stream(force_wake=True)
 
-    def start_stream(self) -> None:
+    def start_stream(self, force_wake: bool = False) -> None:
         if self.is_streaming():
             return
         self.canvas.notify_manual_connect_started()
         self.canvas.set_status("Connecting to camera stream...", False)
         self.status_dot.set_state("connecting")
         self.worker = CameraStreamWorker(self.config, self)
+        if force_wake:
+            self.worker._force_cloud_wake = True
         self.worker.frame_ready.connect(self._on_frame)
         self.worker.detections_ready.connect(self._on_detections)
         self.worker.audio_ready.connect(self._on_audio)

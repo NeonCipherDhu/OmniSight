@@ -18,28 +18,49 @@
   - **Acoustic Detection Chime & Cooldown** — Optional two-note harmonic chime (`E5 → A5`) on person detection with per-camera mute/unmute toggle and configurable `5s`, `10s`, or `20s` alert cooldown.
   - **Custom Chime Trigger Zone** — Interactive on-canvas drag-and-resize zone editor so audio alerts only trigger when a person enters a designated doorway, gate, or driveway region.
   - **One-Click False-Positive Suppression (`✕ Not a Person`)** — Hover over any detected bounding box on the live canvas (or use the right-click menu) to dismiss static false positives using spatial + appearance fingerprinting without blinding the zone to real people walking through.
-- **Live Tile Status & Reconnect Experience** — Real-time Wi-Fi connection badge, active AI shield indicator, and smooth Gaussian-blurred last-frame overlay during stream reconnection.
-- **On-Camera microSD Card Footage Review & Backup** — Browse, filter (`All` / `Motion` / `Anomaly`), scrub on an interactive 24-hour zoomable timeline, stream directly from the camera's microSD card (`cmd 361`/`362`/`363`), and export or bulk-backup clips to local `.mp4` files with up to `16×` fast-forward playback.
-- **PTZ, Hardware Presets, Floodlight & Night Vision Controls** — Directional Pan/Tilt gimbal control (mouse press-and-hold or keyboard arrow keys), up to 6 persistent hardware PTZ preset slots (`PTZX`), LED Floodlight (`On` / `Off` / `Auto`), Night Vision (`Color` / `IR B&W` / `Auto`), and `180° Image Flip`.
+- **Live Tile Status, Anti-Sleep & Wakeup Engine** — Real-time Wi-Fi connection badge, active AI shield indicator, Gaussian-blurred last-frame overlay during reconnection, and automatic **LAN UDP + Cloud Dispatch (`dispa1.av380.net`) wakeup** to reliably wake sleeping or cross-subnet cameras whose local `TCP 8800` port enters standby.
+- **Security Hardening** — Camera passwords and RTSP credentials are encrypted at rest in `cameras.json` using **Windows Current-User DPAPI (`CryptProtectData`)**, session keys use cryptographically secure random generation (`secrets`), cloud wakeup packets use dual-stage AES-128-ECB encryption with strict global IPv4 relay validation, and the setup installer enforces Zip-Slip path traversal protection.
+- **On-Camera microSD Card Footage Review & Backup** — Browse, filter (`All` / `Anomalies` / `Normal`), scrub on an interactive 24-hour zoomable timeline, stream directly from the camera's microSD card (`cmd 361`/`362`/`363`) with full `AAC-LC` / `G.711 A-Law` / `ADPCM` audio decoding, and export or bulk-backup clips to local `.mp4` files with up to `16×` fast-forward playback.
+- **PTZ, Hardware Presets, Floodlight & Night Vision Controls** — Directional Pan/Tilt gimbal control (on-video edge buttons, inspector D-pad, or keyboard arrow keys), up to 6 persistent hardware PTZ preset slots (`PTZX`), LED Floodlight (`On` / `Off` / `Auto`), Night Vision (`Color` / `IR B&W` / `Auto`), and `180° Image Flip`.
 - **Multi-Camera Grid Layouts** — Switch between **Auto**, **1×1**, **2×2**, and **3×3** views, drag-and-drop tiles to reorder, double-click any camera feed to solo/maximize, scroll the mouse wheel for **1.0×–5.0× digital zoom**, or press `F11` for **Fullscreen Monitor Mode**.
 
 ---
 
-## 🚀 Quick Start
+## 📦 Installation & Quick Start
 
-### 1. Install Dependencies
+You do **not** need Python or FFmpeg installed on your PC if you use the prebuilt Windows Setup Installer or Portable ZIP from [**GitHub Releases**](https://github.com/NeonCipherDhu/OmniSight/releases/latest).
+
+### Option 1: Windows Setup Installer (`OmniSight_Setup.exe` — Recommended)
+
+1. Go to the [**Latest Release**](https://github.com/NeonCipherDhu/OmniSight/releases/latest) page and download **`OmniSight_Setup.exe`**.
+2. Run **`OmniSight_Setup.exe`**.
+   - *Note: If Windows SmartScreen displays "Windows protected your PC", click **More info** → **Run anyway**.*
+3. Choose your installation folder (defaults to `%LOCALAPPDATA%\Programs\OmniSight`), select whether to create **Desktop** and **Start Menu** shortcuts, and click **Install Now**.
+4. Click **Finish** to launch **OmniSight**.
+   - *Upgrading:* Installing a newer version over an existing folder automatically preserves your saved `cameras.json`, `camera_names.json`, and `captures/` recordings/snapshots.
+
+### Option 2: Portable Version (`OmniSight_Portable.zip` — No Installation Required)
+
+1. Go to the [**Latest Release**](https://github.com/NeonCipherDhu/OmniSight/releases/latest) page and download **`OmniSight_Portable.zip`**.
+2. Extract the ZIP archive into any folder on your PC or external drive (for example, `C:\Tools\OmniSight` or `D:\OmniSight`).
+3. Double-click **`OmniSight.exe`** inside the extracted folder to launch the app.
+   - All camera configurations (`cameras.json` encrypted with Windows DPAPI) and media captures (`captures/snapshots`, `captures/recordings`, `captures/presets`) are stored directly inside that portable folder.
+
+### Option 3: Run from Source (Developers / Python 3.10+)
+
+#### 1. Install Dependencies
 ```powershell
 pip install -r requirements.txt
 ```
 
-### 2. Launch OmniSight
+#### 2. Launch OmniSight
 Double-click **[`run_omnisight.bat`](run_omnisight.bat)** in Windows Explorer, or run from PowerShell / Command Prompt:
 
 ```powershell
 python omnisight_app.py
 ```
 
-*(Optional)* To build the standalone Windows `.exe` and Setup Installer (`installer/OmniSight_Setup.exe`):
+*(Optional)* To build the standalone Windows `.exe`, Portable ZIP (`installer/OmniSight_Portable.zip`), and Setup Installer (`installer/OmniSight_Setup.exe`):
 ```powershell
 python build_installer.py
 ```

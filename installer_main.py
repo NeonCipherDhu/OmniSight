@@ -35,7 +35,7 @@ from PyQt6.QtWidgets import (
 
 APP_NAME = "OmniSight"
 APP_EXE = "OmniSight.exe"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 APP_PUBLISHER = "OmniSight Open Source NVR"
 UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\OmniSight"
 
@@ -132,14 +132,18 @@ class InstallWorker(QObject):
             )
 
             self.install_dir.mkdir(parents=True, exist_ok=True)
+            resolved_root = self.install_dir.resolve()
 
             preserved_user_files = {"cameras.json", "camera_names.json"}
             with zipfile.ZipFile(payload_zip, "r") as zf:
                 members = zf.infolist()
                 total = max(1, len(members))
                 for idx, member in enumerate(members, 1):
+                    target_member_path = (self.install_dir / member.filename).resolve()
+                    if not target_member_path.is_relative_to(resolved_root):
+                        raise RuntimeError(f"Unsafe archive entry blocked: {member.filename}")
                     rel_name = Path(member.filename).name.lower()
-                    if rel_name in preserved_user_files and (self.install_dir / member.filename).exists():
+                    if rel_name in preserved_user_files and target_member_path.exists():
                         continue
                     zf.extract(member, self.install_dir)
                     if idx % 15 == 0 or idx == total:
