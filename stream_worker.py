@@ -240,15 +240,22 @@ class CameraConfig:
     detection_sensitivity: str = "ultra"  # "standard" | "high" | "ultra"
     detection_sound: bool = True
     detection_sound_cooldown: int = 10  # 5 | 10 | 20 seconds
-    chime_zone: Optional[List[float]] = None  # None = whole frame (default), or [x1, y1, x2, y2] in 0.0..1.0
+    chime_zone: Optional[Any] = None  # None = whole frame, or [[x1, y1, x2, y2], ...] (up to 10 boxes, backward-compatible with single [x1,y1,x2,y2])
     gpu_acceleration: bool = True
     ptz_presets: List[Dict[str, Any]] = field(default_factory=list)
     ignored_objects: List[Dict[str, Any]] = field(default_factory=list)
+    auto_track: bool = False
+    auto_track_return_home: bool = True
+    spotter_cam_id: str = ""  # Optional fixed/wide spotter camera ID for cross-camera PTZ handoff
+
+    MAX_CHIME_ZONES = 10
 
     @staticmethod
-    def normalize_chime_zone(zone: Any) -> Optional[List[float]]:
-        """Validate and normalize a chime trigger region [x1, y1, x2, y2] in [0.0..1.0], or None for whole frame."""
+    def normalize_single_chime_box(zone: Any) -> Optional[List[float]]:
+        """Validate and normalize a single chime trigger box [x1, y1, x2, y2] in [0.0..1.0], or None."""
         if not zone or not isinstance(zone, (list, tuple)) or len(zone) < 4:
+            return None
+        if isinstance(zone[0], (list, tuple)):
             return None
         try:
             x1 = max(0.0, min(1.0, float(zone[0])))
@@ -259,7 +266,7 @@ class CameraConfig:
                 x1, x2 = x2, x1
             if y1 > y2:
                 y1, y2 = y2, y1
-            if (x2 - x1) < 0.03 or (y2 - y1) < 0.03:
+            if (x2 - x1) < 0.025 or (y2 - y1) < 0.025:
                 return None
             if x1 <= 0.01 and y1 <= 0.01 and x2 >= 0.99 and y2 >= 0.99:
                 return None
@@ -268,17 +275,45 @@ class CameraConfig:
             return None
 
     @staticmethod
-    def box_in_chime_zone(
+    def normalize_chime_zones(zone: Any) -> List[List[float]]:
+        """
+        Normalize `zone` into a list of up to `MAX_CHIME_ZONES` (10) boxes `[[x1, y1, x2, y2], ...]`.
+        Accepts None, a legacy single `[x1, y1, x2, y2]` box, or a list of boxes.
+        Returns `[]` when Whole Frame is active.
+        """
+        if not zone or not isinstance(zone, (list, tuple)):
+            return []
+        # Legacy single box [x1, y1, x2, y2]
+        single = CameraConfig.normalize_single_chime_box(zone)
+        if single is not None:
+            return [single]
+        boxes: List[List[float]] = []
+        for item in zone:
+            b = CameraConfig.normalize_single_chime_box(item)
+            if b is not None:
+                boxes.append(b)
+                if len(boxes) >= CameraConfig.MAX_CHIME_ZONES:
+                    break
+        return boxes
+
+    @staticmethod
+    def normalize_chime_zone(zone: Any) -> Optional[List[List[float]]]:
+        """
+        Validate and normalize chime trigger zone(s) into `[[x1, y1, x2, y2], ...]` (up to 10 boxes),
+        or `None` for Whole Frame.
+        """
+        boxes = CameraConfig.normalize_chime_zones(zone)
+        return boxes if boxes else None
+
+    @staticmethod
+    def box_in_single_chime_box(
         box: Tuple[float, float, float, float],
-        chime_zone: Optional[List[float]],
+        single_zone: List[float],
     ) -> bool:
-        """
-        Return True if a detected person bounding box (x1, y1, x2, y2) is inside/overlapping
-        the configured chime trigger zone. If chime_zone is None, the whole frame triggers.
-        """
-        norm_zone = CameraConfig.normalize_chime_zone(chime_zone)
+        """Return True if a detected person bounding box (x1, y1, x2, y2) triggers `single_zone`."""
+        norm_zone = CameraConfig.normalize_single_chime_box(single_zone)
         if norm_zone is None:
-            return True
+            return False
         if not box or len(box) < 4:
             return False
         zx1, zy1, zx2, zy2 = norm_zone[0], norm_zone[1], norm_zone[2], norm_zone[3]
@@ -304,6 +339,22 @@ class CameraConfig:
         person_area = bw * bh
         zone_area = max(1e-6, (zx2 - zx1) * (zy2 - zy1))
         return (inter / person_area) >= 0.20 or (inter / zone_area) >= 0.20
+
+    @staticmethod
+    def box_in_chime_zone(
+        box: Tuple[float, float, float, float],
+        chime_zone: Any,
+    ) -> bool:
+        """
+        Return True if a detected person bounding box (x1, y1, x2, y2) is inside/overlapping
+        ANY of the configured chime trigger zones. If chime_zone is None/empty, the whole frame triggers.
+        """
+        zones = CameraConfig.normalize_chime_zones(chime_zone)
+        if not zones:
+            return True
+        if not box or len(box) < 4:
+            return False
+        return any(CameraConfig.box_in_single_chime_box(box, z) for z in zones)
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -861,10 +912,11 @@ class ClassicalPersonDetector:
         self.sensitivity = new_sens
         self.use_gpu = bool(use_gpu)
 
-    def notify_camera_motion(self, cooldown_sec: float = 1.8) -> None:
+    def notify_camera_motion(self, cooldown_sec: float = 1.8, clear_boxes: bool = True) -> None:
         """Pause detection briefly when PTZ gimbal moves or stream resets."""
         self._ptz_cooldown_until = max(self._ptz_cooldown_until, time.monotonic() + cooldown_sec)
-        self._active_boxes.clear()
+        if clear_boxes:
+            self._active_boxes.clear()
         self._tracks.clear()
         self._bg_gray = None
         self._prev_gray = None
@@ -1268,7 +1320,7 @@ class ClassicalPersonDetector:
                     break
             if not merged:
                 kept.append([bx1, by1, bx2, by2, conf])
-        return [(r[0], r[1], r[2], r[3], r[4]) for r in kept[:5]]
+        return [(r[0], r[1], r[2], r[3], r[4]) for r in kept[:15]]
 
     def _smooth_boxes(
         self, new_boxes: List[Tuple[float, float, float, float]]
@@ -1344,6 +1396,7 @@ class CameraStreamWorker(QThread):
     audio_ready = pyqtSignal(str, bytes, float)          # cam_id, pcm16_bytes, level (0.0..1.0)
     status_changed = pyqtSignal(str, str, bool)          # cam_id, status_text, is_connected
     recording_changed = pyqtSignal(str, bool, str)       # cam_id, is_recording, file_path
+    tracking_state_changed = pyqtSignal(str, str)        # cam_id, state ("", "LOCKED", "PAN LEFT", "PAN RIGHT", "TILT UP", "TILT DOWN", "RETURNING HOME")
 
     def __init__(self, config: CameraConfig, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
@@ -1375,7 +1428,26 @@ class CameraStreamWorker(QThread):
         self._latest_qimage: Optional[QImage] = None
         self._latest_jpeg_bytes: Optional[bytes] = None
         self._recording_active = False
+        self._rec_thumb_has_person: bool = False
+        self._rec_thumb_saved: bool = False
+        self._last_event_thumb_mono: float = 0.0
         self._preset_autopan_token: int = 0
+
+        # PTZ Auto-Tracking & Return-to-Home state
+        self._autotrack_lock = threading.Lock()
+        self._autotrack_last_step_mono: float = 0.0
+        self._autotrack_manual_override_until: float = 0.0
+        self._autotrack_last_target_center: Optional[Tuple[float, float]] = None
+        self._autotrack_last_seen_mono: float = 0.0
+        self._autotrack_displaced: bool = False
+        self._autotrack_net_pan_sec: float = 0.0
+        self._autotrack_net_tilt_sec: float = 0.0
+        self._autotrack_home_slot_saved: bool = False
+        safe_cid = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in (config.cam_id or "cam"))
+        cand_home_thumb = _get_default_backup_root().parent.parent / "presets" / f"preset_{safe_cid}_slot99.jpg"
+        self._autotrack_home_thumb: Optional[str] = str(cand_home_thumb) if cand_home_thumb.is_file() else None
+        self._autotrack_home_demo_coords: Tuple[float, float] = (0.0, 0.0)
+        self._autotrack_state: str = ""
 
         # Demo mode interactive state
         self._demo_pan = 0.0
@@ -1392,6 +1464,12 @@ class CameraStreamWorker(QThread):
         self._det_event = threading.Event()
         self._pending_det_jpeg: Optional[bytes] = None
         self._pending_det_bgr: Optional[np.ndarray] = None
+
+        # Asynchronous NAL feed queue so the TCP 8800 receive thread NEVER blocks on FFmpeg pipe writes
+        self._nal_queue: queue.Queue = queue.Queue()
+        self._nal_queue_lock = threading.Lock()
+        self._nal_pending_pframes: int = 0
+        self._nal_drop_until_keyframe: bool = False
 
         # Telemetry counters
         self._bytes_window = 0
@@ -1416,6 +1494,7 @@ class CameraStreamWorker(QThread):
     def stop_stream(self) -> None:
         self._stop_flag.set()
         self._det_event.set()
+        self._clear_nal_queue()
         if self._lan_client is not None:
             self._lan_client.stop()
         self._stop_ffmpeg()
@@ -1426,6 +1505,7 @@ class CameraStreamWorker(QThread):
         new_q = 1 if int(quality) else 0
         self.config.quality = new_q
         self._seen_keyframe = False
+        self._clear_nal_queue()
         with self._ffmpeg_lock:
             self._stop_ffmpeg_video_unlocked()
         if self._lan_client is not None:
@@ -1466,8 +1546,303 @@ class CameraStreamWorker(QThread):
         self._person_detector.set_ignored_objects([])
 
     # --- Camera Control Actions ---
+    def _set_tracking_state(self, state: str) -> None:
+        if self._autotrack_state != state:
+            self._autotrack_state = state
+            self.tracking_state_changed.emit(self.config.cam_id, state)
+
+    def set_auto_track(self, enabled: bool, preset_thumb_dir: Optional[Path] = None) -> None:
+        """Enable or disable automatic PTZ person/motion tracking and snapshot current Home reference."""
+        self.config.auto_track = bool(enabled)
+        if enabled:
+            self.config.person_detection = True
+            self._autotrack_last_seen_mono = time.monotonic()
+            self._autotrack_displaced = False
+            self._autotrack_net_pan_sec = 0.0
+            self._autotrack_net_tilt_sec = 0.0
+            self._autotrack_last_target_center = None
+            if self.config.protocol == "demo":
+                self._autotrack_home_demo_coords = (round(self._demo_pan, 2), round(self._demo_tilt, 2))
+            if preset_thumb_dir is not None:
+                thumb = self.capture_preset_thumbnail(preset_thumb_dir, slot_id=99)
+                if thumb:
+                    self._autotrack_home_thumb = thumb
+            self._set_tracking_state("STANDBY")
+        else:
+            self._autotrack_displaced = False
+            self._autotrack_net_pan_sec = 0.0
+            self._autotrack_net_tilt_sec = 0.0
+            self._autotrack_last_target_center = None
+            self._set_tracking_state("")
+
+    def _select_primary_tracking_box(
+        self, boxes: List[Tuple[float, float, float, float, str]]
+    ) -> Optional[Tuple[float, float, float, float, str]]:
+        """Pick the best person bounding box to track (smoothly sticks to active target or largest person)."""
+        if not boxes:
+            return None
+        prev_c = self._autotrack_last_target_center
+        best_box = None
+        best_score = -999.0
+        for b in boxes:
+            if len(b) < 4:
+                continue
+            bx1, by1, bx2, by2 = float(b[0]), float(b[1]), float(b[2]), float(b[3])
+            bw = max(0.01, bx2 - bx1)
+            bh = max(0.01, by2 - by1)
+            cx = (bx1 + bx2) * 0.5
+            cy = (by1 + by2) * 0.5
+            area_score = (bw * bh) * 3.0 + bh
+            prox_bonus = 0.0
+            if prev_c is not None:
+                dist = math.hypot(cx - prev_c[0], cy - prev_c[1])
+                if dist < 0.32:
+                    prox_bonus = (0.32 - dist) * 2.5
+            score = area_score + prox_bonus
+            if score > best_score:
+                best_score = score
+                best_box = b
+        return best_box
+
+    def _execute_autotrack_pulse(self, direction: str, duration_sec: float) -> None:
+        """Fire a brief proportional PTZ step-pulse and stop cleanly without blurring the stream."""
+        with self._autotrack_lock:
+            if self._stop_flag.is_set() or not getattr(self.config, "auto_track", False):
+                return
+            if time.monotonic() < self._autotrack_manual_override_until:
+                return
+            self._person_detector.notify_camera_motion(cooldown_sec=duration_sec + 0.35, clear_boxes=False)
+            if self.config.protocol == "demo":
+                step_deg = 16.0 * duration_sec
+                self._demo_target_pan = None
+                self._demo_target_tilt = None
+                if direction == "left":
+                    self._demo_pan = max(-180.0, min(180.0, self._demo_pan - step_deg))
+                elif direction == "right":
+                    self._demo_pan = max(-180.0, min(180.0, self._demo_pan + step_deg))
+                elif direction == "up":
+                    self._demo_tilt = max(-65.0, min(65.0, self._demo_tilt - step_deg * 0.65))
+                elif direction == "down":
+                    self._demo_tilt = max(-65.0, min(65.0, self._demo_tilt + step_deg * 0.65))
+                return
+
+            client = self._lan_client
+            if client is None:
+                return
+            try:
+                if direction == "up":
+                    client.ptz_up()
+                elif direction == "down":
+                    client.ptz_down()
+                elif direction == "left":
+                    client.ptz_left()
+                elif direction == "right":
+                    client.ptz_right()
+                time.sleep(max(0.08, min(0.32, duration_sec)))
+            finally:
+                try:
+                    client.ptz_stop()
+                except Exception:
+                    pass
+
+    def _update_ptz_autotrack(self, boxes: List[Tuple[float, float, float, float, str]], now_mono: float) -> None:
+        """Proportional deadzone PTZ servo loop + automatic Return-to-Home after 12s of inactivity."""
+        if not bool(getattr(self.config, "auto_track", False)):
+            if self._autotrack_state:
+                self._set_tracking_state("")
+            return
+
+        if now_mono < self._autotrack_manual_override_until:
+            return
+
+        target_box = self._select_primary_tracking_box(boxes)
+        if target_box is not None:
+            bx1, by1, bx2, by2 = float(target_box[0]), float(target_box[1]), float(target_box[2]), float(target_box[3])
+            cx = (bx1 + bx2) * 0.5
+            cy = by1 + (by2 - by1) * 0.42  # Track upper-torso/center of person
+            self._autotrack_last_target_center = (cx, cy)
+            self._autotrack_last_seen_mono = now_mono
+
+            err_x = cx - 0.50
+            err_y = cy - 0.50
+            # Central deadzone: [0.37 .. 0.63] horizontally, [0.31 .. 0.69] vertically
+            dead_x = 0.13
+            dead_y = 0.19
+
+            if abs(err_x) <= dead_x and abs(err_y) <= dead_y:
+                self._set_tracking_state("LOCKED")
+                return
+
+            # Minimum interval between PTZ micro-pulses so video stabilizes and YOLOv8 re-detects
+            if (now_mono - self._autotrack_last_step_mono) < 0.72:
+                return
+
+            flipped = bool(getattr(self.config, "flipped", False))
+            # Prioritize horizontal pan when horizontal offset is dominant or comparable
+            if abs(err_x) - dead_x >= (abs(err_y) - dead_y) * 0.85:
+                raw_dir = "right" if err_x > 0 else "left"
+                if flipped and self.config.protocol != "demo":
+                    raw_dir = "left" if raw_dir == "right" else "right"
+                pulse_dur = min(0.26, max(0.11, abs(err_x) * 0.52))
+                hud_lbl = "TRACKING RIGHT" if err_x > 0 else "TRACKING LEFT"
+            else:
+                raw_dir = "down" if err_y > 0 else "up"
+                if flipped and self.config.protocol != "demo":
+                    raw_dir = "up" if raw_dir == "down" else "down"
+                pulse_dur = min(0.22, max(0.10, abs(err_y) * 0.45))
+                hud_lbl = "TRACKING DOWN" if err_y > 0 else "TRACKING UP"
+
+            self._autotrack_last_step_mono = now_mono
+            if not self._autotrack_displaced:
+                # Snapshot Home reference right before the first tracking step from Home (never overwrite camera presets 1-6!)
+                if not self._autotrack_home_thumb:
+                    home_dir = _get_default_backup_root().parent.parent / "presets"
+                    t_home = self.capture_preset_thumbnail(home_dir, slot_id=99)
+                    if t_home:
+                        self._autotrack_home_thumb = t_home
+            self._autotrack_displaced = True
+            if raw_dir == "right":
+                self._autotrack_net_pan_sec += pulse_dur
+            elif raw_dir == "left":
+                self._autotrack_net_pan_sec -= pulse_dur
+            elif raw_dir == "down":
+                self._autotrack_net_tilt_sec += pulse_dur
+            elif raw_dir == "up":
+                self._autotrack_net_tilt_sec -= pulse_dur
+            self._set_tracking_state(hud_lbl)
+            threading.Thread(
+                target=self._execute_autotrack_pulse,
+                args=(raw_dir, pulse_dur),
+                daemon=True,
+            ).start()
+            return
+
+        # No person currently in frame
+        idle_sec = now_mono - self._autotrack_last_seen_mono
+        if idle_sec >= 2.0:
+            self._autotrack_last_target_center = None
+
+        if (
+            self._autotrack_displaced
+            and bool(getattr(self.config, "auto_track_return_home", True))
+            and idle_sec >= 7.5
+        ):
+            net_pan = self._autotrack_net_pan_sec
+            net_tilt = self._autotrack_net_tilt_sec
+            self._autotrack_displaced = False
+            self._autotrack_net_pan_sec = 0.0
+            self._autotrack_net_tilt_sec = 0.0
+            self._autotrack_last_step_mono = now_mono + 3.5
+            self._set_tracking_state("RETURNING HOME")
+            self._return_to_autotrack_home(net_pan, net_tilt)
+        elif idle_sec >= 1.8 and self._autotrack_state not in ("", "STANDBY"):
+            self._set_tracking_state("STANDBY")
+
+    def _reverse_dead_reckon_and_align(
+        self,
+        token: int,
+        slot_id: int,
+        net_pan_sec: float,
+        net_tilt_sec: float,
+        thumb_path: Optional[str],
+    ) -> None:
+        """
+        Return the camera to its Home angle using:
+        1. Hardware PTZX preset recall (already sent by caller if available)
+        2. Dead-reckoning reverse PTZ step-pulses for the exact net pan/tilt accumulated during tracking
+           (essential for V380 cameras whose firmware ignores PTZX preset slots or when panned far off-template)
+        3. Template-matching visual fine alignment against the Home reference thumbnail
+        """
+        client = self._lan_client
+        if client is None:
+            return
+
+        # Step 1: Reverse accumulated pan/tilt in clean 0.24s pulses so the camera returns to the Home neighborhood
+        rem_pan = -float(net_pan_sec)
+        rem_tilt = -float(net_tilt_sec)
+        for _ in range(18):
+            if self._stop_flag.is_set() or self._preset_autopan_token != token:
+                return
+            if abs(rem_pan) <= 0.05 and abs(rem_tilt) <= 0.05:
+                break
+            self._person_detector.notify_camera_motion(0.9, clear_boxes=False)
+            try:
+                if abs(rem_pan) >= abs(rem_tilt) and abs(rem_pan) > 0.05:
+                    step = min(0.24, abs(rem_pan))
+                    if rem_pan > 0:
+                        client.ptz_right()
+                        rem_pan -= step
+                    else:
+                        client.ptz_left()
+                        rem_pan += step
+                    time.sleep(step)
+                elif abs(rem_tilt) > 0.05:
+                    step = min(0.22, abs(rem_tilt))
+                    if rem_tilt > 0:
+                        client.ptz_down()
+                        rem_tilt -= step
+                    else:
+                        client.ptz_up()
+                        rem_tilt += step
+                    time.sleep(step)
+            finally:
+                try:
+                    client.ptz_stop()
+                except Exception:
+                    pass
+            time.sleep(0.18)
+
+        # Step 2: Fine visual alignment via template matching if Home thumbnail exists
+        if thumb_path and os.path.isfile(thumb_path):
+            self._visual_autopan_fallback(token, slot_id, thumb_path)
+        if self._autotrack_state == "RETURNING HOME":
+            self._set_tracking_state("STANDBY")
+
+    def _return_to_autotrack_home(self, net_pan_sec: float = 0.0, net_tilt_sec: float = 0.0) -> None:
+        """Return camera to Preset Slot 0 (if saved), Auto-Home Slot 5, or dead-reckoning + visual Home reference."""
+        presets = getattr(self.config, "ptz_presets", None) or []
+        slot0 = next(
+            (
+                p
+                for p in presets
+                if isinstance(p, dict)
+                and int(p.get("slot", -1)) == 0
+                and (p.get("thumb") or p.get("name") or p.get("updated_at") or p.get("saved"))
+            ),
+            None,
+        )
+        if self.config.protocol == "demo":
+            if slot0 is not None:
+                demo_c = (
+                    float(slot0.get("demo_pan", slot0.get("pan", 0.0))),
+                    float(slot0.get("demo_tilt", slot0.get("tilt", 0.0))),
+                )
+                self.ptz_preset_goto(0, demo_coords=demo_c)
+            else:
+                self.ptz_preset_goto(0, demo_coords=self._autotrack_home_demo_coords)
+            return
+
+        thumb_p = (
+            (slot0.get("thumb") or slot0.get("thumb_path")) if slot0 is not None else None
+        ) or self._autotrack_home_thumb
+
+        self._preset_autopan_token += 1
+        token = self._preset_autopan_token
+        self._person_detector.notify_camera_motion(2.2, clear_boxes=False)
+
+        target_hw_slot = 0 if slot0 is not None else (5 if self._autotrack_home_slot_saved else -1)
+        if target_hw_slot >= 0 and self._lan_client is not None:
+            self._lan_client.ptz_preset_goto(target_hw_slot)
+
+        threading.Thread(
+            target=self._reverse_dead_reckon_and_align,
+            args=(token, max(0, target_hw_slot), net_pan_sec, net_tilt_sec, thumb_p),
+            daemon=True,
+        ).start()
+
     def ptz_move(self, direction: str) -> None:
         self._preset_autopan_token += 1
+        self._autotrack_manual_override_until = time.monotonic() + 7.5
         self._person_detector.notify_camera_motion(1.6)
         if self._latest_detections:
             self._latest_detections = []
@@ -1527,15 +1902,38 @@ class CameraStreamWorker(QThread):
 
     def _visual_autopan_fallback(self, token: int, slot_id: int, thumb_path: Optional[str]) -> None:
         """
-        Wait for native hardware SetPTZXParam (0xAB, 103, slot) recall to finish (~2.0s),
-        then verify alignment against the saved preset thumbnail and step-pan if still offset.
+        Wait for native hardware SetPTZXParam (0xAB, 103, slot) + Port 8800 cmd 129 recall to finish (~2.2s).
+        - If the camera's onboard motor moved to its hardware preset (e.g. updated via the V380 mobile app),
+          trust the hardware position and auto-refresh the local preset thumbnail so Mobile & PC stay in sync!
+        - Only step-pan via visual template matching if the camera firmware ignored the hardware preset command.
         """
-        for _ in range(10):
+        pre_gray = self._get_live_gray320()
+        for _ in range(11):
             if self._stop_flag.is_set() or self._preset_autopan_token != token:
                 return
             time.sleep(0.2)
 
+        post_gray = self._get_live_gray320()
+        hw_moved = False
+        if pre_gray is not None and post_gray is not None and pre_gray.shape == post_gray.shape:
+            try:
+                mad = float(np.mean(cv2.absdiff(pre_gray, post_gray)))
+                if mad >= 9.5:
+                    hw_moved = True
+            except Exception:
+                pass
+
+        if hw_moved:
+            # Camera physically moved to its onboard hardware preset: refresh PC thumbnail to match mobile/camera!
+            if 0 <= int(slot_id) <= 5:
+                out_dir = Path(thumb_path).parent if thumb_path else (_get_default_backup_root().parent.parent / "presets")
+                self.capture_preset_thumbnail(out_dir, int(slot_id))
+            return
+
         if not thumb_path or not os.path.isfile(thumb_path):
+            if 0 <= int(slot_id) <= 5:
+                out_dir = _get_default_backup_root().parent.parent / "presets"
+                self.capture_preset_thumbnail(out_dir, int(slot_id))
             return
 
         try:
@@ -1716,6 +2114,8 @@ class CameraStreamWorker(QThread):
             self._recording_path = str(filepath)
             self._video_writer = None
             self._recording_active = True
+            self._rec_thumb_has_person = False
+            self._rec_thumb_saved = False
 
         self.recording_changed.emit(self.config.cam_id, True, self._recording_path)
         return self._recording_path
@@ -1751,6 +2151,11 @@ class CameraStreamWorker(QThread):
         det_thread = threading.Thread(target=self._detection_worker_loop, daemon=True)
         det_thread.start()
 
+        # Launch dedicated background thread for feeding NAL units into FFmpeg stdin
+        # so the TCP 8800 socket receive loop NEVER blocks on pipe backpressure during HD streaming.
+        nal_thread = threading.Thread(target=self._nal_feeder_loop, daemon=True)
+        nal_thread.start()
+
         try:
             proto = (self.config.protocol or "lan8800").lower()
             if proto == "demo":
@@ -1763,9 +2168,44 @@ class CameraStreamWorker(QThread):
             self.status_changed.emit(self.config.cam_id, f"Stream Error: {exc}", False)
         finally:
             self._det_event.set()
+            self._clear_nal_queue()
             self._stop_ffmpeg()
             self.stop_recording()
             self.status_changed.emit(self.config.cam_id, "Offline / Stopped", False)
+
+    def _clear_nal_queue(self) -> None:
+        with self._nal_queue_lock:
+            while True:
+                try:
+                    self._nal_queue.get_nowait()
+                except queue.Empty:
+                    break
+            self._nal_pending_pframes = 0
+            self._nal_drop_until_keyframe = False
+            try:
+                self._nal_queue.put_nowait(None)
+            except Exception:
+                pass
+
+    def _nal_feeder_loop(self) -> None:
+        """
+        Dedicated consumer thread that feeds NAL packets into FFmpeg stdin.
+        Decouples TCP socket reception from FFmpeg pipe I/O so HD keyframe bursts
+        never stall socket.recv() or overflow the camera's tiny TCP send buffer.
+        """
+        while not self._stop_flag.is_set():
+            try:
+                item = self._nal_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if item is None or self._stop_flag.is_set():
+                continue
+            nal_bytes, codec, is_first_kf, is_kf = item
+            if not is_kf:
+                with self._nal_queue_lock:
+                    if self._nal_pending_pframes > 0:
+                        self._nal_pending_pframes -= 1
+            self._feed_nal_to_ffmpeg(nal_bytes, codec, is_first_keyframe=is_first_kf)
 
     def _detection_worker_loop(self) -> None:
         """
@@ -1782,12 +2222,15 @@ class CameraStreamWorker(QThread):
             if self._lan_streaming_connected and self._lan_client is not None:
                 now_wd = time.monotonic()
                 idle_dec = now_wd - self._last_decoded_frame_mono
-                if idle_dec >= 6.5 and (now_wd - self._last_wake_prod_mono) >= 3.5:
+                idle_vid = now_wd - self._lan_client._last_video_frame_mono
+                # Only prod or force reconnect if BOTH the wire video stream and decoder are stalled
+                if idle_dec >= 8.5 and idle_vid >= 6.5 and (now_wd - self._last_wake_prod_mono) >= 4.0:
                     self._last_wake_prod_mono = now_wd
                     self._lan_client.send_wake_pulse()
-                if idle_dec >= 18.0:
+                if idle_dec >= 24.0 and idle_vid >= 16.0:
                     self._last_decoded_frame_mono = now_wd
                     self._seen_keyframe = False
+                    self._clear_nal_queue()
                     with self._ffmpeg_lock:
                         self._stop_ffmpeg_video_unlocked()
                     self._lan_client.trigger_wake_reconnect()
@@ -1833,16 +2276,49 @@ class CameraStreamWorker(QThread):
                             sensitivity=getattr(self.config, "detection_sensitivity", "ultra"),
                             use_gpu=bool(getattr(self.config, "gpu_acceleration", True)),
                         )
+                        had_prev_boxes = bool(self._latest_detections)
                         if boxes != self._latest_detections:
                             self._latest_detections = boxes
                             self.detections_ready.emit(self.config.cam_id, boxes)
+                        if boxes and (
+                            not had_prev_boxes or (now_det - self._last_event_thumb_mono) >= 4.0
+                        ):
+                            self._last_event_thumb_mono = now_det
+                            save_live_detection_thumbnail(
+                                _get_default_backup_root(),
+                                self.config,
+                                bgr,
+                                boxes,
+                            )
+                        self._update_ptz_autotrack(boxes, now_det)
                 elif self._latest_detections:
                     self._latest_detections = []
                     self.detections_ready.emit(self.config.cam_id, [])
+                    self._update_ptz_autotrack([], now_det)
 
                 if self._recording_active:
                     rec_bgr = ClassicalPersonDetector.draw_boxes_on_bgr(bgr, self._latest_detections)
                     self._write_recording_frame(rec_bgr)
+                    has_det = bool(self._latest_detections)
+                    if self._recording_path and (
+                        not self._rec_thumb_saved
+                        or (has_det and not self._rec_thumb_has_person)
+                    ):
+                        try:
+                            rec_p = Path(self._recording_path)
+                            t_dir = rec_p.parent / "thumbs"
+                            t_dir.mkdir(parents=True, exist_ok=True)
+                            t_img = cv2.resize(rec_bgr, (320, 180), interpolation=cv2.INTER_AREA)
+                            cv2.imwrite(
+                                str(t_dir / f"{rec_p.stem}.jpg"),
+                                t_img,
+                                [int(cv2.IMWRITE_JPEG_QUALITY), 86],
+                            )
+                            self._rec_thumb_saved = True
+                            if has_det:
+                                self._rec_thumb_has_person = True
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
@@ -1859,6 +2335,7 @@ class CameraStreamWorker(QThread):
                 self._bytes_window = 0
             else:
                 self._seen_keyframe = False
+                self._clear_nal_queue()
                 with self._ffmpeg_lock:
                     self._stop_ffmpeg_video_unlocked()
             self.status_changed.emit(self.config.cam_id, msg, connected)
@@ -1896,7 +2373,20 @@ class CameraStreamWorker(QThread):
                     self._active_codec = VideoCodec.H265 if frame.raw_type in (0x28, 0x29) else VideoCodec.H264
 
             codec = self._active_codec if self._active_codec != VideoCodec.UNKNOWN else VideoCodec.H264
-            self._feed_nal_to_ffmpeg(frame.payload, codec, is_first_keyframe=is_first_kf)
+            with self._nal_queue_lock:
+                if frame.is_keyframe:
+                    self._nal_drop_until_keyframe = False
+                    self._nal_queue.put_nowait((frame.payload, codec, is_first_kf, True))
+                else:
+                    if self._nal_drop_until_keyframe:
+                        return
+                    if self._nal_pending_pframes >= 35:
+                        # Decoder is temporarily behind on HD frames: drop remaining P-frames
+                        # until the next keyframe so FFmpeg catches up cleanly without corruption.
+                        self._nal_drop_until_keyframe = True
+                        return
+                    self._nal_pending_pframes += 1
+                    self._nal_queue.put_nowait((frame.payload, codec, False, False))
 
         self._lan_client = LanCameraClient(
             ip=self.config.ip,
@@ -1923,22 +2413,24 @@ class CameraStreamWorker(QThread):
             self._decoded_any_frame = False
             fmt = "hevc" if codec == VideoCodec.H265 else "h264"
 
-            # Use low-latency software decode for MJPEG pipe (avoids GPU->CPU hwdownload stall
+            # Use low-latency multi-threaded software decode for MJPEG pipe (avoids GPU->CPU hwdownload stall
             # and reserves 100% of GPU bandwidth for DirectML YOLOv8 AI inference).
             cmd = [
                 get_ffmpeg_executable(),
                 "-hide_banner",
                 "-loglevel", "error",
-                "-probesize", "320000",
+                "-probesize", "32768",
                 "-analyzeduration", "0",
                 "-fpsprobesize", "0",
                 "-fflags", "nobuffer",
                 "-flags", "low_delay",
+                "-threads", "2",
                 "-f", fmt,
                 "-i", "pipe:0",
+                "-vf", "scale='min(1920,iw)':-2:flags=fast_bilinear",
                 "-f", "image2pipe",
                 "-vcodec", "mjpeg",
-                "-q:v", "3",
+                "-q:v", "4",
                 "pipe:1",
             ]
 
@@ -1975,7 +2467,7 @@ class CameraStreamWorker(QThread):
                 )
                 pkt = nal_bytes + aud
                 if is_first_keyframe and len(pkt) > 0:
-                    repeats = max(2, (340000 // len(pkt)) + 1)
+                    repeats = 1 if len(pkt) >= 32768 else max(2, (36000 // len(pkt)) + 1)
                     proc.stdin.write(pkt * repeats)
                 else:
                     proc.stdin.write(pkt)
@@ -2111,12 +2603,17 @@ class CameraStreamWorker(QThread):
         self._ffmpeg_proc = None
         if proc is not None:
             try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
                 if proc.stdin:
                     proc.stdin.close()
             except Exception:
                 pass
             try:
-                proc.kill()
+                if proc.stdout:
+                    proc.stdout.close()
             except Exception:
                 pass
 
@@ -2125,12 +2622,17 @@ class CameraStreamWorker(QThread):
         self._ffmpeg_audio_proc = None
         if proc is not None:
             try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
                 if proc.stdin:
                     proc.stdin.close()
             except Exception:
                 pass
             try:
-                proc.kill()
+                if proc.stdout:
+                    proc.stdout.close()
             except Exception:
                 pass
 
@@ -3056,7 +3558,7 @@ class SDCardPlaybackWorker(QThread):
                 "-loglevel",
                 "error",
                 "-probesize",
-                "320000",
+                "32768",
                 "-analyzeduration",
                 "0",
                 "-fpsprobesize",
@@ -3065,6 +3567,8 @@ class SDCardPlaybackWorker(QThread):
                 "nobuffer",
                 "-flags",
                 "low_delay",
+                "-threads",
+                "2",
                 "-f",
                 fmt,
                 "-i",
@@ -3114,7 +3618,7 @@ class SDCardPlaybackWorker(QThread):
                 )
                 pkt = nal_bytes + aud
                 if is_first_keyframe and len(pkt) > 0:
-                    repeats = max(2, (340000 // len(pkt)) + 1)
+                    repeats = 1 if len(pkt) >= 32768 else max(2, (36000 // len(pkt)) + 1)
                     proc.stdin.write(pkt * repeats)
                 else:
                     proc.stdin.write(pkt)
@@ -3472,6 +3976,12 @@ class SDCardExportWorker(QThread):
             return
 
         if video_frames_written > 0 and os.path.isfile(self.output_path) and os.path.getsize(self.output_path) > 512:
+            try:
+                seg_thumb = get_segment_thumbnail_path(_get_default_backup_root(), self.config, self.segment)
+                if not seg_thumb.is_file():
+                    extract_best_video_thumbnail(Path(self.output_path), seg_thumb)
+            except Exception:
+                pass
             self.progress_changed.emit(100)
             self.export_finished.emit(True, f"Saved {Path(self.output_path).name}", self.output_path)
         else:
@@ -3822,3 +4332,486 @@ class SDCardBulkBackupWorker(QThread):
             if skipped_count > 0:
                 msg += f" ({skipped_count} already saved)"
             self.backup_finished.emit(saved_count > 0, msg, saved_count, last_folder)
+
+
+def _get_default_backup_root() -> Path:
+    base = (
+        Path(sys.executable).resolve().parent
+        if getattr(sys, "frozen", False)
+        else Path(__file__).resolve().parent
+    )
+    return base / "captures" / "recordings" / "backups"
+
+
+def get_segment_thumbnail_path(backup_root: Path, cfg: CameraConfig, seg: RecordingSegment) -> Path:
+    """
+    Canonical `.jpg` action thumbnail path for an SD card recording segment:
+    `captures/recordings/backups/<CameraName>/<YYYY-MM-DD>/thumbs/seg_<seg_id>.jpg`
+    """
+    cam_dir = _safe_camera_folder_name(cfg)
+    day_dir = seg.iso_date_str
+    return backup_root / cam_dir / day_dir / "thumbs" / f"seg_{seg.seg_id}.jpg"
+
+
+def save_live_detection_thumbnail(
+    backup_root: Path,
+    cfg: CameraConfig,
+    bgr: np.ndarray,
+    boxes: List[Tuple[float, float, float, float, str]],
+    wall_dt: Optional[datetime] = None,
+) -> Optional[Path]:
+    """
+    Save a 320x180 16:9 action thumbnail when a person is detected on the live stream.
+    Stamped with the camera-compatible wall-clock UTC timestamp (`event_<ts>.jpg`) so any
+    SD card segment covering that timestamp immediately displays the person's action thumbnail.
+    """
+    if bgr is None or bgr.size == 0:
+        return None
+    try:
+        dt = wall_dt if wall_dt is not None else datetime.now()
+        cam_wall_ts = int(
+            datetime(
+                dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, tzinfo=timezone.utc
+            ).timestamp()
+        )
+        day_str = dt.strftime("%Y-%m-%d")
+        thumbs_dir = backup_root / _safe_camera_folder_name(cfg) / day_str / "thumbs"
+        thumbs_dir.mkdir(parents=True, exist_ok=True)
+        annotated = ClassicalPersonDetector.draw_boxes_on_bgr(bgr, boxes) if boxes else bgr
+        thumb_bgr = cv2.resize(annotated, (320, 180), interpolation=cv2.INTER_AREA)
+        out_path = thumbs_dir / f"event_{cam_wall_ts}.jpg"
+        cv2.imwrite(str(out_path), thumb_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 86])
+        return out_path
+    except Exception:
+        return None
+
+
+def extract_best_video_thumbnail(
+    mp4_path: Path,
+    out_jpg_path: Path,
+    use_gpu: bool = False,
+) -> Optional[Path]:
+    """
+    Scan key frames across `mp4_path` to find the clearest action frame:
+    1. Prefer frames where YOLOv8 detects a person (drawing red 4-corner L-brackets on the subject).
+    2. Otherwise pick the frame with the highest inter-frame motion & visual contrast near the middle of the clip.
+    Saves a crisp 320x180 16:9 `.jpg` to `out_jpg_path`.
+    """
+    if not mp4_path or not mp4_path.is_file():
+        return None
+    cap = None
+    try:
+        cap = cv2.VideoCapture(str(mp4_path))
+        if not cap.isOpened():
+            return None
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if total_frames > 12:
+            fracs = (0.14, 0.28, 0.42, 0.56, 0.72, 0.86)
+            indices = sorted({max(0, min(total_frames - 1, int(round(f * total_frames)))) for f in fracs})
+        elif total_frames > 0:
+            indices = list(range(0, total_frames, max(1, total_frames // 4)))
+        else:
+            indices = [0, 15, 35, 60]
+
+        sampled: List[np.ndarray] = []
+        for idx in indices:
+            if total_frames > 0:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, float(idx))
+            ok, frm = cap.read()
+            if ok and frm is not None and frm.size > 0:
+                sampled.append(cv2.resize(frm, (320, 180), interpolation=cv2.INTER_AREA))
+        if not sampled:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ok, frm = cap.read()
+            if ok and frm is not None and frm.size > 0:
+                sampled.append(cv2.resize(frm, (320, 180), interpolation=cv2.INTER_AREA))
+        if not sampled:
+            return None
+
+        best_bgr: Optional[np.ndarray] = None
+        best_person_score: float = -1.0
+
+        # Pass 1: Check for person detections via YOLOv8 ONNX if available
+        if _ONNXPersonEngine.is_available():
+            for frm in sampled:
+                dets = _ONNXPersonEngine.detect_persons(frm, conf_thresh=0.22, use_gpu=use_gpu)
+                if dets:
+                    # Score by highest confidence + box area
+                    top_score = max(float(d[4]) + 0.35 * ((d[2] - d[0]) * (d[3] - d[1])) for d in dets)
+                    if top_score > best_person_score:
+                        best_person_score = top_score
+                        boxes_labeled = [(d[0], d[1], d[2], d[3], "PERSON") for d in dets]
+                        best_bgr = ClassicalPersonDetector.draw_boxes_on_bgr(frm, boxes_labeled)
+
+        # Pass 2: Fallback to frame with highest inter-frame motion + contrast
+        if best_bgr is None:
+            best_motion_score = -1.0
+            prev_gray: Optional[np.ndarray] = None
+            for i, frm in enumerate(sampled):
+                gray = cv2.cvtColor(frm, cv2.COLOR_BGR2GRAY)
+                contrast = float(np.std(gray))
+                motion = 0.0
+                if prev_gray is not None:
+                    diff = cv2.absdiff(gray, prev_gray)
+                    motion = float(np.mean(diff)) * 3.0
+                prev_gray = gray
+                # Prefer middle frames slightly over very start/end
+                mid_bonus = 1.15 if 0 < i < (len(sampled) - 1) else 1.0
+                score = (motion + contrast * 0.25) * mid_bonus
+                if score > best_motion_score:
+                    best_motion_score = score
+                    best_bgr = frm
+
+        if best_bgr is None:
+            best_bgr = sampled[len(sampled) // 2]
+
+        out_jpg_path.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(out_jpg_path), best_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 86])
+        return out_jpg_path if out_jpg_path.is_file() else None
+    except Exception:
+        return None
+    finally:
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+
+
+def get_local_capture_thumbnail_path(media_path: Path, auto_extract: bool = True) -> Optional[Path]:
+    """
+    Return the `.jpg` thumbnail path for a local capture (`.mp4` or `.jpg`).
+    For `.mp4` recordings in `captures/recordings/`, looks in `captures/recordings/thumbs/<stem>.jpg`
+    and extracts the action frame automatically if `auto_extract` is True.
+    """
+    if not media_path or not media_path.is_file():
+        return None
+    suf = media_path.suffix.lower()
+    if suf in (".jpg", ".jpeg", ".png"):
+        return media_path
+    if suf == ".mp4":
+        thumb_path = media_path.parent / "thumbs" / f"{media_path.stem}.jpg"
+        if thumb_path.is_file() and thumb_path.stat().st_size > 200:
+            return thumb_path
+        if auto_extract:
+            return extract_best_video_thumbnail(media_path, thumb_path)
+    return None
+
+
+def find_segment_thumbnail_file(
+    backup_root: Path,
+    cfg: CameraConfig,
+    seg: RecordingSegment,
+    auto_extract_from_backup: bool = True,
+) -> Optional[Path]:
+    """
+    Locate or materialize the event action thumbnail `.jpg` for `seg`:
+    1. Direct segment thumbnail `thumbs/seg_<seg_id>.jpg`
+    2. Live-detection event thumbnail `thumbs/event_<ts>.jpg` captured within `[seg.start_ts - 8, seg.end_ts + 8]`
+    3. Extracted action frame from local `.mp4` backup if `seg` is backed up on disk
+    """
+    seg_thumb = get_segment_thumbnail_path(backup_root, cfg, seg)
+    try:
+        if seg_thumb.is_file() and seg_thumb.stat().st_size > 200:
+            return seg_thumb
+    except Exception:
+        pass
+
+    thumbs_dir = seg_thumb.parent
+    if thumbs_dir.is_dir():
+        best_ev: Optional[Path] = None
+        best_dist: float = 1e12
+        ideal_ts = float(seg.start_ts) + min(4.0, max(1.0, float(seg.duration_sec) * 0.25))
+        for ev_file in thumbs_dir.glob("event_*.jpg"):
+            try:
+                ts_str = ev_file.stem.split("_", 1)[1]
+                ev_ts = int(ts_str)
+                if (seg.start_ts - 8) <= ev_ts <= (seg.end_ts + 8) and ev_file.stat().st_size > 200:
+                    dist = abs(float(ev_ts) - ideal_ts)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_ev = ev_file
+            except Exception:
+                continue
+        if best_ev is not None:
+            try:
+                shutil.copy2(str(best_ev), str(seg_thumb))
+                return seg_thumb
+            except Exception:
+                return best_ev
+
+    if auto_extract_from_backup:
+        bk_mp4 = find_segment_backup_file(backup_root, cfg, seg)
+        if bk_mp4 is not None:
+            extracted = extract_best_video_thumbnail(bk_mp4, seg_thumb)
+            if extracted is not None:
+                return extracted
+
+    return None
+
+
+def save_qimage_as_segment_thumbnail(
+    backup_root: Path,
+    cfg: CameraConfig,
+    seg: RecordingSegment,
+    qimg: QImage,
+    run_person_box: bool = True,
+) -> Optional[Path]:
+    """
+    Convert a `QImage` frame (e.g. decoded during live SD card playback) into a 320x180
+    action thumbnail for `seg`, drawing red corner brackets if a person is detected.
+    """
+    if qimg is None or qimg.isNull():
+        return None
+    try:
+        seg_thumb = get_segment_thumbnail_path(backup_root, cfg, seg)
+        q_rgb = qimg.convertToFormat(QImage.Format.Format_RGB888)
+        w, h = q_rgb.width(), q_rgb.height()
+        if w <= 0 or h <= 0:
+            return None
+        bpl = q_rgb.bytesPerLine()
+        ptr = q_rgb.bits()
+        ptr.setsize(h * bpl)
+        arr = np.frombuffer(ptr, dtype=np.uint8).reshape((h, bpl))
+        rgb = arr[:, : w * 3].reshape((h, w, 3))
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        thumb_bgr = cv2.resize(bgr, (320, 180), interpolation=cv2.INTER_AREA)
+        if run_person_box and _ONNXPersonEngine.is_available():
+            dets = _ONNXPersonEngine.detect_persons(thumb_bgr, conf_thresh=0.22, use_gpu=False)
+            if dets:
+                boxes_labeled = [(d[0], d[1], d[2], d[3], "PERSON") for d in dets]
+                thumb_bgr = ClassicalPersonDetector.draw_boxes_on_bgr(thumb_bgr, boxes_labeled)
+        seg_thumb.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(seg_thumb), thumb_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 86])
+        return seg_thumb if seg_thumb.is_file() else None
+    except Exception:
+        return None
+
+
+class SDCardThumbnailFetchWorker(QThread):
+    """
+    Cooperative background worker that generates/fetches event action thumbnails for
+    SD card segments on the currently selected day:
+    1. First extracts thumbnails from any local `.mp4` backups that don't have a cached `.jpg` yet.
+    2. Next, for un-cached SD card segments (prioritizing Anomaly/Alarm & Motion clips first),
+       fetches a single action keyframe ~2s into the clip over port 8800, runs YOLOv8 person
+       detection to highlight the person with red corner brackets, and caches `thumbs/seg_<id>.jpg`.
+    Yields immediately whenever the user starts playback, date change, or backup.
+    """
+
+    thumbnail_ready = pyqtSignal(int, str)  # (seg_id, thumb_jpg_path)
+
+    def __init__(
+        self,
+        config: CameraConfig,
+        segments: List[RecordingSegment],
+        backup_root: Path,
+        max_remote_fetch: int = 24,
+        parent: Optional[QObject] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.config = config
+        self.segments = list(segments)
+        self.backup_root = Path(backup_root)
+        self.max_remote_fetch = int(max_remote_fetch)
+        self._stop_flag = threading.Event()
+        self._client: Optional[LanCameraClient] = None
+
+    def request_stop(self) -> None:
+        self._stop_flag.set()
+        client = self._client
+        if client is not None:
+            client.stop()
+
+    def _generate_demo_thumbnail(self, seg: RecordingSegment, out_path: Path) -> bool:
+        try:
+            frm = np.zeros((180, 320, 3), dtype=np.uint8)
+            # Rich surveillance background gradient
+            for y in range(180):
+                val = int(20 + (y / 180.0) * 26)
+                frm[y, :] = (val + 6, val + 2, val)
+            # Gate / pathway perspective lines
+            cv2.line(frm, (40, 180), (120, 75), (65, 70, 78), 2, cv2.LINE_AA)
+            cv2.line(frm, (280, 180), (200, 75), (65, 70, 78), 2, cv2.LINE_AA)
+            cv2.rectangle(frm, (110, 42), (210, 82), (48, 52, 60), 1)
+
+            if seg.is_anomaly:
+                # Draw silhouette of person walking through gate + red corner L-brackets
+                px, py = 148 + (seg.seg_id % 19) - 9, 66
+                cv2.circle(frm, (px, py), 10, (185, 195, 205), -1, cv2.LINE_AA)
+                cv2.ellipse(frm, (px, py + 28), (14, 20), 0, 0, 360, (160, 175, 190), -1, cv2.LINE_AA)
+                cv2.line(frm, (px - 6, py + 46), (px - 10, py + 72), (150, 165, 180), 5, cv2.LINE_AA)
+                cv2.line(frm, (px + 6, py + 46), (px + 11, py + 72), (150, 165, 180), 5, cv2.LINE_AA)
+                bx1 = (px - 22) / 320.0
+                by1 = (py - 16) / 180.0
+                bx2 = (px + 22) / 320.0
+                by2 = (py + 78) / 180.0
+                frm = ClassicalPersonDetector.draw_boxes_on_bgr(
+                    frm, [(bx1, by1, bx2, by2, "PERSON")]
+                )
+
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(out_path), frm, [int(cv2.IMWRITE_JPEG_QUALITY), 86])
+            return out_path.is_file()
+        except Exception:
+            return False
+
+    def _decode_single_keyframe_to_bgr(self, payload: bytes, codec: VideoCodec) -> Optional[np.ndarray]:
+        fmt = "hevc" if codec == VideoCodec.H265 else "h264"
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        cmd = [
+            get_ffmpeg_executable(),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            fmt,
+            "-i",
+            "pipe:0",
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=320:180",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "-q:v",
+            "3",
+            "pipe:1",
+        ]
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+            out_bytes, _ = proc.communicate(input=payload, timeout=2.5)
+            if out_bytes:
+                soi = out_bytes.find(b"\xff\xd8")
+                eoi = out_bytes.rfind(b"\xff\xd9")
+                if soi != -1 and eoi != -1 and eoi > soi:
+                    arr = np.frombuffer(out_bytes[soi : eoi + 2], dtype=np.uint8)
+                    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        except Exception:
+            pass
+        return None
+
+    def run(self) -> None:
+        # 1. Fast local pass (matches live event_<ts>.jpg or extracts from local .mp4 backups)
+        remote_queue: List[RecordingSegment] = []
+        for seg in self.segments:
+            if self._stop_flag.is_set():
+                return
+            existing = find_segment_thumbnail_file(
+                self.backup_root, self.config, seg, auto_extract_from_backup=True
+            )
+            if existing is not None:
+                self.thumbnail_ready.emit(seg.seg_id, str(existing))
+            else:
+                remote_queue.append(seg)
+
+        if not remote_queue or self._stop_flag.is_set():
+            return
+
+        # Prioritize Anomaly/Alarm (3) and Motion (2) segments newest-first so event clips get thumbnails first
+        remote_queue.sort(
+            key=lambda s: (1 if s.is_anomaly else 0, int(s.raw_type), int(s.start_ts)),
+            reverse=True,
+        )
+        remote_queue = remote_queue[: self.max_remote_fetch]
+
+        proto = (self.config.protocol or "lan8800").lower()
+        if proto == "demo":
+            for seg in remote_queue:
+                if self._stop_flag.is_set():
+                    return
+                out_p = get_segment_thumbnail_path(self.backup_root, self.config, seg)
+                if self._generate_demo_thumbnail(seg, out_p):
+                    self.thumbnail_ready.emit(seg.seg_id, str(out_p))
+                self._stop_flag.wait(0.03)
+            return
+
+        # 2. Cooperative single-keyframe fetch from camera microSD card
+        for seg in remote_queue:
+            if self._stop_flag.is_set():
+                return
+            out_p = get_segment_thumbnail_path(self.backup_root, self.config, seg)
+            if out_p.is_file() and out_p.stat().st_size > 200:
+                self.thumbnail_ready.emit(seg.seg_id, str(out_p))
+                continue
+
+            # Seek ~2s into anomaly clips (right when the person enters)
+            offset = min(2, max(0, seg.duration_sec // 3)) if seg.is_anomaly else 0
+            target_ts = seg.start_ts + offset
+            got_keyframe_bytes: List[Tuple[bytes, VideoCodec]] = []
+            local_stop = threading.Event()
+
+            client = LanCameraClient(
+                ip=self.config.ip,
+                port=self.config.port,
+                device_id=self.config.device_id,
+                username=self.config.username,
+                password=self.config.password,
+                enable_audio=False,
+            )
+            self._client = client
+
+            def on_kf(frame: CameraFrame) -> None:
+                if self._stop_flag.is_set() or local_stop.is_set() or frame.is_audio:
+                    if self._stop_flag.is_set():
+                        local_stop.set()
+                        client.stop()
+                    return
+                if frame.is_keyframe and len(frame.payload) > 128:
+                    codec = frame.codec if frame.codec != VideoCodec.UNKNOWN else VideoCodec.H265
+                    got_keyframe_bytes.append(( bytes(frame.payload), codec ))
+                    local_stop.set()
+                    client.stop()
+
+            with _get_camera_sd_lock(self.config.ip):
+                if self._stop_flag.is_set():
+                    self._client = None
+                    return
+                _wait_camera_sd_cooldown(self.config.ip, self._stop_flag, 0.18)
+                if self._stop_flag.is_set():
+                    self._client = None
+                    return
+                try:
+                    client.stream_sd_segment(
+                        segment=seg,
+                        start_ts=target_ts,
+                        stop_event=local_stop,
+                        on_frame=on_kf,
+                    )
+                except Exception:
+                    pass
+                finally:
+                    _mark_camera_sd_closed(self.config.ip)
+
+            self._client = None
+            if self._stop_flag.is_set():
+                return
+
+            if got_keyframe_bytes:
+                kf_payload, kf_codec = got_keyframe_bytes[0]
+                bgr = self._decode_single_keyframe_to_bgr(kf_payload, kf_codec)
+                if bgr is not None and bgr.size > 0:
+                    if _ONNXPersonEngine.is_available():
+                        dets = _ONNXPersonEngine.detect_persons(bgr, conf_thresh=0.22, use_gpu=False)
+                        if dets:
+                            boxes_labeled = [(d[0], d[1], d[2], d[3], "PERSON") for d in dets]
+                            bgr = ClassicalPersonDetector.draw_boxes_on_bgr(bgr, boxes_labeled)
+                    try:
+                        out_p.parent.mkdir(parents=True, exist_ok=True)
+                        cv2.imwrite(str(out_p), bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 86])
+                        if out_p.is_file():
+                            self.thumbnail_ready.emit(seg.seg_id, str(out_p))
+                    except Exception:
+                        pass
+
+            # Brief breather between background thumbnail fetches so the camera stays responsive
+            self._stop_flag.wait(0.12)
+

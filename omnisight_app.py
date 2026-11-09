@@ -105,10 +105,14 @@ from stream_worker import (
     SDCardExportWorker,
     SDCardListWorker,
     SDCardPlaybackWorker,
+    SDCardThumbnailFetchWorker,
     find_segment_backup_file,
+    find_segment_thumbnail_file,
     get_gpu_capabilities,
+    get_local_capture_thumbnail_path,
     get_segment_backup_path,
     load_local_backup_segments,
+    save_qimage_as_segment_thumbnail,
     save_segment_backup_meta,
 )
 from omnisight_protocol import (
@@ -407,13 +411,29 @@ def lucide_icon(name: str, color: str = "#e4e4e7", size: int = 16, stroke_width:
     return ico
 
 
-def clip_row_icon(event_icon_name: str, event_color: str, is_backed_up: bool = False) -> QIcon:
+def clip_row_icon(
+    event_icon_name: str,
+    event_color: str,
+    is_backed_up: bool = False,
+    thumb_path: Optional[str] = None,
+) -> QIcon:
     """
-    Renders a crisp 26x26 rounded badge QIcon for recording clip rows:
-    - Rounded badge container tinted with `event_color` + 16x16 centered event glyph
-    - Optional bottom-right green checkmark badge (`#10b981`) when backed up locally on disk
+    Renders a crisp 60x34 (16:9 widescreen) QIcon for recording clip rows:
+    - When `thumb_path` exists on disk: draws the 16:9 event action thumbnail framed in `event_color`,
+      with a compact top-left event badge and optional bottom-right green local-backup checkmark.
+    - When `thumb_path` is None: renders a styled 60x34 dark 16:9 card tinted with `event_color` +
+      centered event glyph + optional bottom-right green checkmark badge (`#10b981`).
     """
-    key = f"cliprow26:{event_icon_name}:{event_color}:{int(is_backed_up)}"
+    mtime_tag = 0
+    has_thumb = False
+    if thumb_path and os.path.isfile(thumb_path):
+        try:
+            mtime_tag = int(os.path.getmtime(thumb_path))
+            has_thumb = True
+        except Exception:
+            has_thumb = False
+
+    key = f"cliprow60x34:{event_icon_name}:{event_color}:{int(is_backed_up)}:{thumb_path if has_thumb else ''}:{mtime_tag}"
     cached = _ICON_CACHE.get(key)
     if cached is not None:
         return cached
@@ -423,35 +443,123 @@ def clip_row_icon(event_icon_name: str, event_color: str, is_backed_up: bool = F
     if app is not None and app.primaryScreen() is not None:
         dpr = max(1.0, float(app.primaryScreen().devicePixelRatio()))
 
-    w, h = 26, 26
+    w, h = 60, 34
     pixmap = QPixmap(max(1, int(round(w * dpr))), max(1, int(round(h * dpr))))
     pixmap.fill(Qt.GlobalColor.transparent)
     pixmap.setDevicePixelRatio(dpr)
 
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
 
     base_col = QColor(event_color)
-    fill_col = QColor(base_col.red(), base_col.green(), base_col.blue(), 42)
-    border_col = QColor(base_col.red(), base_col.green(), base_col.blue(), 155)
-    painter.setPen(QPen(border_col, 1.2))
-    painter.setBrush(fill_col)
-    painter.drawRoundedRect(QRectF(1.0, 1.0, 24.0, 24.0), 6.0, 6.0)
+    card_rect = QRectF(1.0, 1.0, float(w - 2), float(h - 2))
 
-    ev_px = lucide_pixmap(event_icon_name, color=event_color, size=16, stroke_width=2.1)
-    painter.drawPixmap(5, 5, ev_px)
+    drew_photo = False
+    if has_thumb and thumb_path:
+        src_px = QPixmap(thumb_path)
+        if not src_px.isNull():
+            from PyQt6.QtGui import QPainterPath
+
+            clip_path = QPainterPath()
+            clip_path.addRoundedRect(card_rect, 4.5, 4.5)
+            painter.save()
+            painter.setClipPath(clip_path)
+            scaled_px = src_px.scaled(
+                int(round((w - 2) * dpr)),
+                int(round((h - 2) * dpr)),
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            scaled_px.setDevicePixelRatio(dpr)
+            painter.drawPixmap(1, 1, scaled_px)
+            painter.restore()
+
+            # Crisp event-colored frame around the 16:9 action thumbnail
+            border_col = QColor(base_col.red(), base_col.green(), base_col.blue(), 215)
+            painter.setPen(QPen(border_col, 1.3))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(card_rect, 4.5, 4.5)
+
+            # Compact top-left event badge pill
+            painter.setPen(QPen(QColor(base_col.red(), base_col.green(), base_col.blue(), 190), 0.9))
+            painter.setBrush(QColor(9, 9, 12, 215))
+            painter.drawRoundedRect(QRectF(2.5, 2.5, 13.0, 13.0), 3.2, 3.2)
+            ev_px = lucide_pixmap(event_icon_name, color=event_color, size=9, stroke_width=2.4)
+            painter.drawPixmap(4, 4, ev_px)
+            drew_photo = True
+
+    if not drew_photo:
+        fill_col = QColor(base_col.red(), base_col.green(), base_col.blue(), 36)
+        border_col = QColor(base_col.red(), base_col.green(), base_col.blue(), 145)
+        painter.setPen(QPen(border_col, 1.2))
+        painter.setBrush(fill_col)
+        painter.drawRoundedRect(card_rect, 4.5, 4.5)
+        ev_px = lucide_pixmap(event_icon_name, color=event_color, size=16, stroke_width=2.1)
+        painter.drawPixmap((w - 16) // 2, (h - 16) // 2, ev_px)
 
     if is_backed_up:
         painter.setPen(QPen(QColor("#10b981"), 1.2))
         painter.setBrush(QColor("#064e3b"))
-        painter.drawEllipse(QRectF(14.0, 14.0, 11.5, 11.5))
+        painter.drawEllipse(QRectF(float(w - 13), float(h - 13), 11.5, 11.5))
         chk_px = lucide_pixmap("check", color="#34d399", size=8, stroke_width=3.0)
-        painter.drawPixmap(16, 16, chk_px)
+        painter.drawPixmap(w - 11, h - 11, chk_px)
 
     painter.end()
     ico = QIcon(pixmap)
     _ICON_CACHE[key] = ico
     return ico
+
+
+_TOOLTIP_B64_CACHE: Dict[str, str] = {}
+
+
+def build_clip_tooltip_html(
+    header_text: str,
+    sub_text: str,
+    thumb_path: Optional[str] = None,
+    accent_color: str = "#60a5fa",
+) -> str:
+    """Build a rich HTML tooltip with an embedded 240x135 16:9 action thumbnail preview when available."""
+    import html as _html
+
+    hdr_esc = _html.escape(header_text)
+    sub_esc = _html.escape(sub_text).replace("\n", "<br/>")
+    if thumb_path and os.path.isfile(thumb_path):
+        try:
+            mtime = int(os.path.getmtime(thumb_path))
+            ckey = f"{thumb_path}:{mtime}"
+            b64 = _TOOLTIP_B64_CACHE.get(ckey)
+            if b64 is None:
+                raw = Path(thumb_path).read_bytes()
+                b64 = base64.b64encode(raw).decode("ascii")
+                if len(_TOOLTIP_B64_CACHE) > 256:
+                    _TOOLTIP_B64_CACHE.clear()
+                _TOOLTIP_B64_CACHE[ckey] = b64
+            return (
+                f"<div style='padding:3px;'>"
+                f"<div style='margin-bottom:5px;'><img src='data:image/jpeg;base64,{b64}' width='240' height='135' style='border-radius:4px;'/></div>"
+                f"<div style='color:{accent_color}; font-weight:700; font-size:11px;'>{hdr_esc}</div>"
+                f"<div style='color:#d4d4d8; font-size:11px; margin-top:2px;'>{sub_esc}</div>"
+                f"</div>"
+            )
+        except Exception:
+            pass
+    return f"<b>{hdr_esc}</b><br/>{sub_esc}"
+
+
+def clean_display_status(text: str) -> str:
+    """Clean up connection/status text for display without stripping valid closing parentheses."""
+    if not text:
+        return ""
+    import re
+    s = re.sub(r"\(\s*\)", "", text)
+    # Strip trailing punctuation/bullets/spaces, but NEVER strip ')' if it matches an '('
+    s = re.sub(r"[\s•\-.,:]+$", "", s)
+    if s.count("(") > s.count(")"):
+        s = re.sub(r"\s*\(\s*$", "", s)
+    s = re.sub(r"^[\s•\-.,:]+", "", s)
+    return s.strip()
 
 
 class StatusDot(QWidget):
@@ -1375,12 +1483,15 @@ class VideoCanvas(QWidget):
         self._last_detection_ts: float = 0.0
         self._dismiss_hit_rects: List[Tuple[QRect, tuple]] = []
         self._box_hit_rects: List[Tuple[QRect, tuple]] = []
-        self._chime_zone: Optional[List[float]] = None
+        self._chime_zone: Optional[List[List[float]]] = None
         self._editing_chime_zone: bool = False
         self._chime_drag_start: Optional[Tuple[float, float]] = None
         self._chime_drag_curr: Optional[Tuple[float, float]] = None
         self._chime_done_rect: QRect = QRect()
         self._chime_reset_rect: QRect = QRect()
+        self._chime_delete_rects: List[Tuple[QRect, int]] = []
+        self._auto_track_enabled: bool = False
+        self._tracking_state: str = ""
         self._flash_step: int = 0
         self._flash_timer = QTimer(self)
         self._flash_timer.setInterval(95)
@@ -1624,7 +1735,7 @@ class VideoCanvas(QWidget):
             if self.btn_reconnect.isVisible():
                 self.btn_reconnect.hide()
 
-    def set_chime_zone(self, zone: Optional[List[float]]) -> None:
+    def set_chime_zone(self, zone: Any) -> None:
         self._chime_zone = CameraConfig.normalize_chime_zone(zone)
         self.update()
 
@@ -1686,6 +1797,11 @@ class VideoCanvas(QWidget):
     def set_camera_info(self, name: str, endpoint: str) -> None:
         self._cam_name = name
         self._cam_endpoint = endpoint
+        self.update()
+
+    def set_auto_track_state(self, enabled: bool, state: str = "") -> None:
+        self._auto_track_enabled = bool(enabled)
+        self._tracking_state = state if enabled else ""
         self.update()
 
     def _on_anim_tick(self) -> None:
@@ -1917,6 +2033,18 @@ class VideoCanvas(QWidget):
                     self.update()
                     event.accept()
                     return
+                for del_rect, box_idx in self._chime_delete_rects:
+                    if del_rect.contains(event.pos()):
+                        zones = CameraConfig.normalize_chime_zones(self._chime_zone)
+                        if 0 <= box_idx < len(zones):
+                            zones.pop(box_idx)
+                        self._chime_zone = zones if zones else None
+                        self._chime_drag_start = None
+                        self._chime_drag_curr = None
+                        self.chime_zone_changed.emit(self._chime_zone)
+                        self.update()
+                        event.accept()
+                        return
                 self._chime_drag_start = self._pos_to_norm(event.pos())
                 self._chime_drag_curr = self._chime_drag_start
                 self.update()
@@ -1952,7 +2080,12 @@ class VideoCanvas(QWidget):
                 self.update()
                 event.accept()
                 return
-            if self._chime_done_rect.contains(event.pos()) or self._chime_reset_rect.contains(event.pos()):
+            over_del = any(dr.contains(event.pos()) for dr, _ in self._chime_delete_rects)
+            if (
+                self._chime_done_rect.contains(event.pos())
+                or self._chime_reset_rect.contains(event.pos())
+                or over_del
+            ):
                 self.setCursor(Qt.CursorShape.PointingHandCursor)
             else:
                 self.setCursor(Qt.CursorShape.CrossCursor)
@@ -2005,9 +2138,14 @@ class VideoCanvas(QWidget):
             y2 = max(self._chime_drag_start[1], end_pt[1])
             self._chime_drag_start = None
             self._chime_drag_curr = None
-            if (x2 - x1) >= 0.03 and (y2 - y1) >= 0.03:
-                norm = CameraConfig.normalize_chime_zone([x1, y1, x2, y2])
-                self._chime_zone = norm
+            new_box = CameraConfig.normalize_single_chime_box([x1, y1, x2, y2])
+            if new_box is not None:
+                zones = CameraConfig.normalize_chime_zones(self._chime_zone)
+                if len(zones) >= CameraConfig.MAX_CHIME_ZONES:
+                    zones[-1] = new_box
+                else:
+                    zones.append(new_box)
+                self._chime_zone = zones
                 self.chime_zone_changed.emit(self._chime_zone)
             self.update()
             event.accept()
@@ -2147,6 +2285,60 @@ class VideoCanvas(QWidget):
                     painter.setPen(QColor("#f4f4f5"))
                     painter.setFont(QFont("Cascadia Mono", 9, QFont.Weight.DemiBold))
                     painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, f"{self._zoom:.1f}x")
+
+                if self._auto_track_enabled and not self._editing_chime_zone:
+                    st_lbl = (self._tracking_state or "STANDBY").upper()
+                    is_active_track = st_lbl.startswith("TRACKING") or st_lbl == "LOCKED"
+                    is_home = "HOME" in st_lbl
+                    if is_active_track and self._detections:
+                        # Subtle center deadzone reticle when actively tracking a person
+                        dz_w = int(target.width() * 0.26)
+                        dz_h = int(target.height() * 0.38)
+                        dz_rect = QRect(
+                            target.center().x() - dz_w // 2,
+                            target.center().y() - dz_h // 2,
+                            dz_w,
+                            dz_h,
+                        )
+                        painter.setPen(QPen(QColor(16, 185, 129, 75), 1.0, Qt.PenStyle.DotLine))
+                        painter.setBrush(Qt.BrushStyle.NoBrush)
+                        painter.drawRect(dz_rect)
+
+                    if is_active_track or is_home or self._hover_pos is not None:
+                        pill_txt = (
+                            f"AUTO-TRACK • {st_lbl}"
+                            if st_lbl not in ("", "STANDBY")
+                            else "AUTO-TRACK ON"
+                        )
+                        fm = painter.fontMetrics()
+                        pw = max(106, min(195, fm.horizontalAdvance(pill_txt) + 28))
+                        ph = 20
+                        px = target.left() + 8
+                        py = target.top() + 8
+                        t_rect = QRect(px, py, pw, ph)
+                        border_c = (
+                            QColor("#10b981")
+                            if is_active_track
+                            else (QColor("#38bdf8") if is_home else QColor(16, 185, 129, 140))
+                        )
+                        bg_c = (
+                            QColor(6, 78, 59, 225)
+                            if is_active_track
+                            else (QColor(15, 23, 42, 225) if is_home else QColor(14, 14, 20, 210))
+                        )
+                        painter.setPen(QPen(border_c, 1.1))
+                        painter.setBrush(bg_c)
+                        painter.drawRoundedRect(t_rect, 4, 4)
+                        painter.setPen(Qt.PenStyle.NoPen)
+                        painter.setBrush(QColor("#34d399" if is_active_track else "#38bdf8"))
+                        painter.drawEllipse(QPoint(px + 10, py + ph // 2), 3, 3)
+                        painter.setPen(QColor("#ecfdf5" if is_active_track else "#bae6fd"))
+                        painter.setFont(QFont("Cascadia Mono", 8, QFont.Weight.Bold))
+                        painter.drawText(
+                            QRect(px + 16, py, pw - 20, ph),
+                            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                            pill_txt,
+                        )
         elif self._editing_chime_zone and self._last_frame is not None and not self._last_frame.isNull():
             # When editing the chime trigger area while stream is offline, show crisp cached last frame
             target = self._get_video_target_rect()
@@ -2435,7 +2627,7 @@ class VideoCanvas(QWidget):
                 cleaned = re.sub(r'Connecting to[^\.]+\.{0,3}', 'Establishing live video stream...', cleaned, flags=re.I)
                 cleaned = re.sub(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?\b', '', cleaned)
                 cleaned = re.sub(r'\s+\b(for|to|at)\b\s*$', '', cleaned, flags=re.I)
-                cleaned = cleaned.replace("()", "").strip(" (•-.,)")
+                cleaned = clean_display_status(cleaned)
                 if not cleaned or cleaned.lower() in ("standby", "stopped", "connecting", ""):
                     sub_text = f"{self._cam_name or 'Camera'}  •  Live Feed"
                 else:
@@ -2458,7 +2650,9 @@ class VideoCanvas(QWidget):
                 raw_err = (self._status_text or "").strip()
                 cleaned_err = re.sub(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?\b', '', raw_err)
                 cleaned_err = re.sub(r'\s*—\s*retrying.*$', '', cleaned_err, flags=re.I)
-                cleaned_err = re.sub(r'\s+\b(for|to|at)\b\s*$', '', cleaned_err, flags=re.I).strip(" (•-.,)")
+                cleaned_err = re.sub(r'\s*-\s*retrying.*$', '', cleaned_err, flags=re.I)
+                cleaned_err = re.sub(r'\s+\b(for|to|at)\b\s*$', '', cleaned_err, flags=re.I)
+                cleaned_err = clean_display_status(cleaned_err)
                 if not cleaned_err or cleaned_err.lower() in ("stopped", "standby", "offline", "idle", "disconnected"):
                     sub_lbl = "Camera Disconnected"
                 elif any(k in cleaned_err.lower() for k in ("invalid", "password", "username", "error", "rejected", "refused")):
@@ -2500,7 +2694,8 @@ class VideoCanvas(QWidget):
 
                 import re
                 err_text = re.sub(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?\b', '', self._status_text or "Connection Error")
-                err_text = re.sub(r'\s+\b(for|to|at)\b\s*$', '', err_text, flags=re.I).strip(" (•-.,)")
+                err_text = re.sub(r'\s+\b(for|to|at)\b\s*$', '', err_text, flags=re.I)
+                err_text = clean_display_status(err_text)
                 painter.setPen(QColor("#f87171"))
                 painter.setFont(QFont("Cascadia Mono", 8))
                 painter.drawText(QRect(rect.left() + 20, cy + 68, rect.width() - 40, 36), Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, err_text)
@@ -2543,101 +2738,108 @@ class VideoCanvas(QWidget):
     def _paint_chime_zone_overlay(self, painter: QPainter, target: QRect) -> None:
         self._chime_done_rect = QRect()
         self._chime_reset_rect = QRect()
+        self._chime_delete_rects.clear()
         rect = self.rect()
         if target.width() < 24 or target.height() < 24:
             return
 
+        saved_zones = CameraConfig.normalize_chime_zones(self._chime_zone)
+
         if self._editing_chime_zone:
-            # Determine active box being dragged or currently configured
-            active_box: Optional[List[float]] = None
+            drag_box: Optional[List[float]] = None
             if self._chime_drag_start is not None and self._chime_drag_curr is not None:
                 x1 = min(self._chime_drag_start[0], self._chime_drag_curr[0])
                 y1 = min(self._chime_drag_start[1], self._chime_drag_curr[1])
                 x2 = max(self._chime_drag_start[0], self._chime_drag_curr[0])
                 y2 = max(self._chime_drag_start[1], self._chime_drag_curr[1])
                 if (x2 - x1) >= 0.015 and (y2 - y1) >= 0.015:
-                    active_box = [x1, y1, x2, y2]
-            if active_box is None and self._chime_zone is not None:
-                active_box = list(self._chime_zone)
+                    drag_box = [x1, y1, x2, y2]
 
-            if active_box is not None and len(active_box) >= 4:
-                zx = int(round(target.left() + active_box[0] * target.width()))
-                zy = int(round(target.top() + active_box[1] * target.height()))
-                zw = max(10, int(round((active_box[2] - active_box[0]) * target.width())))
-                zh = max(10, int(round((active_box[3] - active_box[1]) * target.height())))
-                z_rect = QRect(zx, zy, zw, zh).intersected(target)
+            all_boxes: List[Tuple[List[float], int, bool]] = [
+                (b, idx, False) for idx, b in enumerate(saved_zones)
+            ]
+            if drag_box is not None:
+                all_boxes.append((drag_box, len(saved_zones), True))
 
-                # Dim areas outside the Chime Trigger Area
-                dim_col = QColor(5, 5, 10, 148)
-                if z_rect.top() > target.top():
-                    painter.fillRect(
-                        QRect(target.left(), target.top(), target.width(), z_rect.top() - target.top()),
-                        dim_col,
+            if all_boxes:
+                from PyQt6.QtGui import QPainterPath
+
+                zone_rects: List[Tuple[QRect, int, bool]] = []
+                for b, idx, is_drag in all_boxes:
+                    zx = int(round(target.left() + b[0] * target.width()))
+                    zy = int(round(target.top() + b[1] * target.height()))
+                    zw = max(10, int(round((b[2] - b[0]) * target.width())))
+                    zh = max(10, int(round((b[3] - b[1]) * target.height())))
+                    zr = QRect(zx, zy, zw, zh).intersected(target)
+                    if zr.width() >= 8 and zr.height() >= 8:
+                        zone_rects.append((zr, idx, is_drag))
+
+                # Dim areas outside the union of all Chime Trigger Zones
+                if zone_rects:
+                    outer_path = QPainterPath()
+                    outer_path.addRect(QRectF(target))
+                    holes_path = QPainterPath()
+                    holes_path.setFillRule(Qt.FillRule.WindingFill)
+                    for zr, _, _ in zone_rects:
+                        holes_path.addRect(QRectF(zr))
+                    dim_path = outer_path.subtracted(holes_path.simplified())
+                    painter.save()
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.setBrush(QColor(5, 5, 10, 148))
+                    painter.drawPath(dim_path)
+                    painter.restore()
+
+                for z_rect, idx, is_drag in zone_rects:
+                    painter.fillRect(z_rect, QColor(245, 158, 11, 34 if is_drag else 24))
+                    dash_pen = QPen(
+                        QColor("#fde68a" if is_drag else "#f59e0b"),
+                        2.0,
+                        Qt.PenStyle.DashLine,
                     )
-                if z_rect.bottom() < target.bottom():
-                    painter.fillRect(
-                        QRect(
-                            target.left(),
-                            z_rect.bottom() + 1,
-                            target.width(),
-                            target.bottom() - z_rect.bottom(),
-                        ),
-                        dim_col,
-                    )
-                if z_rect.left() > target.left():
-                    painter.fillRect(
-                        QRect(
-                            target.left(),
-                            z_rect.top(),
-                            z_rect.left() - target.left(),
-                            z_rect.height(),
-                        ),
-                        dim_col,
-                    )
-                if z_rect.right() < target.right():
-                    painter.fillRect(
-                        QRect(
-                            z_rect.right() + 1,
-                            z_rect.top(),
-                            target.right() - z_rect.right(),
-                            z_rect.height(),
-                        ),
-                        dim_col,
-                    )
+                    painter.setPen(dash_pen)
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawRect(z_rect)
 
-                # Subtle warm amber highlight inside trigger zone
-                painter.fillRect(z_rect, QColor(245, 158, 11, 28))
-                dash_pen = QPen(QColor("#f59e0b"), 2.0, Qt.PenStyle.DashLine)
-                painter.setPen(dash_pen)
-                painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.drawRect(z_rect)
+                    # Bold corner L-handles on each zone rectangle
+                    arm = max(8, min(18, min(z_rect.width(), z_rect.height()) // 4))
+                    c_pen = QPen(QColor("#fbbf24"), 3.2)
+                    c_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                    painter.setPen(c_pen)
+                    zl, zt, zr, zb = z_rect.left(), z_rect.top(), z_rect.right(), z_rect.bottom()
+                    painter.drawLine(zl, zt, zl + arm, zt)
+                    painter.drawLine(zl, zt, zl, zt + arm)
+                    painter.drawLine(zr - arm, zt, zr, zt)
+                    painter.drawLine(zr, zt, zr, zt + arm)
+                    painter.drawLine(zl, zb - arm, zl, zb)
+                    painter.drawLine(zl, zb, zl + arm, zb)
+                    painter.drawLine(zr - arm, zb, zr, zb)
+                    painter.drawLine(zr, zb - arm, zr, zb)
 
-                # Bold corner L-handles on the zone rectangle
-                arm = max(8, min(18, min(z_rect.width(), z_rect.height()) // 4))
-                c_pen = QPen(QColor("#fbbf24"), 3.2)
-                c_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-                painter.setPen(c_pen)
-                zl, zt, zr, zb = z_rect.left(), z_rect.top(), z_rect.right(), z_rect.bottom()
-                painter.drawLine(zl, zt, zl + arm, zt)
-                painter.drawLine(zl, zt, zl, zt + arm)
-                painter.drawLine(zr - arm, zt, zr, zt)
-                painter.drawLine(zr, zt, zr, zt + arm)
-                painter.drawLine(zl, zb - arm, zl, zb)
-                painter.drawLine(zl, zb, zl + arm, zb)
-                painter.drawLine(zr - arm, zb, zr, zb)
-                painter.drawLine(zr, zb - arm, zr, zb)
-
-                # Zone tag badge
-                tag_w, tag_h = min(146, max(96, z_rect.width())), 20
-                tag_x = max(target.left() + 4, min(target.right() - tag_w - 4, zl))
-                tag_y = zt - tag_h - 4 if (zt - tag_h - 4) >= (target.top() + 38) else (zt + 5)
-                tag_rect = QRect(tag_x, tag_y, tag_w, tag_h)
-                painter.setPen(QPen(QColor("#f59e0b"), 1.0))
-                painter.setBrush(QColor(24, 18, 10, 230))
-                painter.drawRoundedRect(tag_rect, 4, 4)
-                painter.setPen(QColor("#fde68a"))
-                painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-                painter.drawText(tag_rect, Qt.AlignmentFlag.AlignCenter, "CHIME TRIGGER AREA")
+                    # Zone tag badge (with clickable '×' delete hit rect for saved boxes)
+                    tag_label = f"NEW ZONE #{idx + 1}" if is_drag else f"CHIME #{idx + 1}  ×"
+                    tag_w, tag_h = (92 if is_drag else 88), 20
+                    tag_x = max(target.left() + 4, min(target.right() - tag_w - 4, zl))
+                    tag_y = zt - tag_h - 4 if (zt - tag_h - 4) >= (target.top() + 38) else (zt + 5)
+                    tag_rect = QRect(tag_x, tag_y, tag_w, tag_h)
+                    hov_del = (
+                        not is_drag
+                        and self._hover_pos is not None
+                        and tag_rect.contains(self._hover_pos)
+                    )
+                    if not is_drag:
+                        self._chime_delete_rects.append((tag_rect, idx))
+                    painter.setPen(QPen(QColor("#ef4444" if hov_del else "#f59e0b"), 1.1))
+                    painter.setBrush(
+                        QColor(153, 27, 27, 240) if hov_del else QColor(24, 18, 10, 232)
+                    )
+                    painter.drawRoundedRect(tag_rect, 4, 4)
+                    painter.setPen(QColor("#ffffff" if hov_del else "#fde68a"))
+                    painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+                    painter.drawText(
+                        tag_rect,
+                        Qt.AlignmentFlag.AlignCenter,
+                        f"REMOVE #{idx + 1}" if hov_del else tag_label,
+                    )
             else:
                 # Whole Frame currently active in edit mode
                 vis_t = target.adjusted(2, 2, -2, -2)
@@ -2645,7 +2847,7 @@ class VideoCanvas(QWidget):
                 painter.setBrush(QColor(245, 158, 11, 14))
                 painter.drawRect(vis_t)
 
-                hint_w = min(rect.width() - 24, 340)
+                hint_w = min(rect.width() - 24, 380)
                 hint_h = 28
                 hint_rect = QRect(rect.center().x() - hint_w // 2, rect.center().y() - hint_h // 2, hint_w, hint_h)
                 painter.setPen(QPen(QColor(245, 158, 11, 160), 1.0))
@@ -2656,11 +2858,11 @@ class VideoCanvas(QWidget):
                 painter.drawText(
                     hint_rect,
                     Qt.AlignmentFlag.AlignCenter,
-                    "Whole Frame Active — Drag on footage to set Gate / Chime Area",
+                    f"Whole Frame Active — Drag to add up to {CameraConfig.MAX_CHIME_ZONES} Chime Zones",
                 )
 
-            # Top Interactive HUD Control Bar for Chime Area Editor
-            bar_w = min(rect.width() - 12, 410)
+            # Top Interactive HUD Control Bar for Multi-Zone Chime Area Editor
+            bar_w = min(rect.width() - 12, 440)
             bar_h = 30
             bar_x = max(6, rect.center().x() - bar_w // 2)
             bar_y = 8
@@ -2683,9 +2885,9 @@ class VideoCanvas(QWidget):
             painter.setPen(QColor("#fef3c7"))
             painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
             status_lbl = (
-                "DRAG TO SET CHIME AREA (CUSTOM)"
-                if self._chime_zone is not None
-                else "DRAG TO SET CHIME AREA (FULL FRAME)"
+                f"CHIME ZONES ({len(saved_zones)}/{CameraConfig.MAX_CHIME_ZONES}) — DRAG TO ADD • × TO REMOVE"
+                if saved_zones
+                else f"DRAG TO ADD CHIME ZONES (0/{CameraConfig.MAX_CHIME_ZONES})"
             )
             painter.drawText(
                 lbl_rect,
@@ -2695,7 +2897,7 @@ class VideoCanvas(QWidget):
 
             # 'Full Frame' reset pill
             hov_reset = self._hover_pos is not None and self._chime_reset_rect.contains(self._hover_pos)
-            is_custom = self._chime_zone is not None
+            is_custom = bool(saved_zones)
             painter.setPen(
                 QPen(
                     QColor("#fbbf24" if hov_reset else ("#52525b" if is_custom else "#27272a")),
@@ -2720,52 +2922,55 @@ class VideoCanvas(QWidget):
             painter.drawText(self._chime_done_rect, Qt.AlignmentFlag.AlignCenter, "Done")
             return
 
-        # Passive indicator when a custom Chime Zone is configured and user hovers or person is detected
-        if self._chime_zone is not None and len(self._chime_zone) >= 4:
+        # Passive indicator when custom Chime Zones are configured and user hovers or person is detected
+        if saved_zones:
             if not self._is_connected and (self._qimage is None or self._qimage.isNull()):
                 return
-            triggered = any(
-                len(det) >= 4
-                and CameraConfig.box_in_chime_zone(
-                    (float(det[0]), float(det[1]), float(det[2]), float(det[3])),
-                    self._chime_zone,
-                )
-                for det in self._detections
-            )
             if self._hover_pos is None and not self._detections:
                 return
 
-            zx = int(round(target.left() + self._chime_zone[0] * target.width()))
-            zy = int(round(target.top() + self._chime_zone[1] * target.height()))
-            zw = max(10, int(round((self._chime_zone[2] - self._chime_zone[0]) * target.width())))
-            zh = max(10, int(round((self._chime_zone[3] - self._chime_zone[1]) * target.height())))
-            z_rect = QRect(zx, zy, zw, zh).intersected(target)
-            if z_rect.width() < 8 or z_rect.height() < 8:
-                return
+            multi = len(saved_zones) > 1
+            for idx, z_box in enumerate(saved_zones):
+                triggered = any(
+                    len(det) >= 4
+                    and CameraConfig.box_in_single_chime_box(
+                        (float(det[0]), float(det[1]), float(det[2]), float(det[3])),
+                        z_box,
+                    )
+                    for det in self._detections
+                )
+                zx = int(round(target.left() + z_box[0] * target.width()))
+                zy = int(round(target.top() + z_box[1] * target.height()))
+                zw = max(10, int(round((z_box[2] - z_box[0]) * target.width())))
+                zh = max(10, int(round((z_box[3] - z_box[1]) * target.height())))
+                z_rect = QRect(zx, zy, zw, zh).intersected(target)
+                if z_rect.width() < 8 or z_rect.height() < 8:
+                    continue
 
-            border_col = QColor(251, 191, 36, 225) if triggered else QColor(245, 158, 11, 145)
-            if triggered:
-                painter.fillRect(z_rect, QColor(245, 158, 11, 22))
-            painter.setPen(QPen(border_col, 1.8 if triggered else 1.4, Qt.PenStyle.DashLine))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(z_rect)
+                border_col = QColor(251, 191, 36, 225) if triggered else QColor(245, 158, 11, 145)
+                if triggered:
+                    painter.fillRect(z_rect, QColor(245, 158, 11, 22))
+                painter.setPen(QPen(border_col, 1.8 if triggered else 1.4, Qt.PenStyle.DashLine))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRect(z_rect)
 
-            tag_text = "CHIME AREA • TRIGGERED" if triggered else "CHIME AREA"
-            tag_w = 132 if triggered else 76
-            tag_h = 17
-            tag_x = max(target.left() + 4, min(target.right() - tag_w - 4, z_rect.left()))
-            tag_y = (
-                z_rect.top() - tag_h - 3
-                if (z_rect.top() - tag_h - 3) >= (target.top() + 4)
-                else (z_rect.top() + 3)
-            )
-            tag_rect = QRect(tag_x, tag_y, tag_w, tag_h)
-            painter.setPen(QPen(border_col, 1.0))
-            painter.setBrush(QColor(20, 16, 10, 210))
-            painter.drawRoundedRect(tag_rect, 3, 3)
-            painter.setPen(QColor("#fef3c7" if triggered else "#fcd34d"))
-            painter.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
-            painter.drawText(tag_rect, Qt.AlignmentFlag.AlignCenter, tag_text)
+                base_lbl = f"CHIME #{idx + 1}" if multi else "CHIME AREA"
+                tag_text = f"{base_lbl} • TRIGGERED" if triggered else base_lbl
+                tag_w = (128 if multi else 132) if triggered else (68 if multi else 76)
+                tag_h = 17
+                tag_x = max(target.left() + 4, min(target.right() - tag_w - 4, z_rect.left()))
+                tag_y = (
+                    z_rect.top() - tag_h - 3
+                    if (z_rect.top() - tag_h - 3) >= (target.top() + 4)
+                    else (z_rect.top() + 3)
+                )
+                tag_rect = QRect(tag_x, tag_y, tag_w, tag_h)
+                painter.setPen(QPen(border_col, 1.0))
+                painter.setBrush(QColor(20, 16, 10, 210))
+                painter.drawRoundedRect(tag_rect, 3, 3)
+                painter.setPen(QColor("#fef3c7" if triggered else "#fcd34d"))
+                painter.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+                painter.drawText(tag_rect, Qt.AlignmentFlag.AlignCenter, tag_text)
 
 
 class CameraTileWidget(QFrame):
@@ -2783,6 +2988,7 @@ class CameraTileWidget(QFrame):
     config_changed = pyqtSignal()
     snapshot_saved = pyqtSignal(str)
     recording_toggled = pyqtSignal(str, bool, str)
+    detections_updated = pyqtSignal(str, list)
 
     def __init__(self, config: CameraConfig, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -2977,14 +3183,23 @@ class CameraTileWidget(QFrame):
         self.btn_chime_zone.setIconSize(QSize(14, 14))
         self.btn_chime_zone.setFixedSize(26, 24)
         self.btn_chime_zone.clicked.connect(self.toggle_chime_zone_editor)
-        self._update_chime_btn()
         c_layout.addWidget(self.btn_chime_zone)
+
+        self.btn_auto_track = QPushButton()
+        self.btn_auto_track.setObjectName("ghostBtn")
+        self.btn_auto_track.setCheckable(True)
+        self.btn_auto_track.setIconSize(QSize(14, 14))
+        self.btn_auto_track.setFixedSize(26, 24)
+        self.btn_auto_track.clicked.connect(self.toggle_auto_track)
+        self._update_chime_btn()
+        self._update_auto_track_btn()
+        c_layout.addWidget(self.btn_auto_track)
 
         c_layout.addStretch()
 
         self.btn_quality = QPushButton("HD" if self.config.quality == 1 else "SD")
         self.btn_quality.setObjectName("segBtn")
-        self.btn_quality.setFixedSize(34, 22)
+        self.btn_quality.setFixedSize(40, 22)
         self.btn_quality.setToolTip("Switch HD / SD Stream Profile")
         self.btn_quality.clicked.connect(self._toggle_quality)
         self._update_quality_btn()
@@ -3103,6 +3318,10 @@ class CameraTileWidget(QFrame):
         )
         act_max = menu.addAction("Solo / Restore This Camera (Double-Click)")
         act_ptz = menu.addAction("PTZ & Camera Controls")
+        track_on = bool(getattr(self.config, "auto_track", False))
+        act_auto_track = menu.addAction(
+            "Disable PTZ Auto-Tracking" if track_on else "Enable PTZ Auto-Tracking (Follow Person)"
+        )
         chime_on = bool(getattr(self.config, "detection_sound", True))
         cd_sec = int(getattr(self.config, "detection_sound_cooldown", 10) or 10)
         act_chime = menu.addAction(
@@ -3141,6 +3360,8 @@ class CameraTileWidget(QFrame):
             self.maximize_requested.emit(self.config.cam_id)
         elif chosen == act_ptz:
             self.controls_requested.emit(self.config.cam_id)
+        elif chosen == act_auto_track:
+            self.toggle_auto_track()
         elif chosen == act_chime:
             self._toggle_detection_sound()
         elif chosen == act_chime_zone:
@@ -3352,12 +3573,17 @@ class CameraTileWidget(QFrame):
         self.canvas.set_chime_zone(getattr(config, "chime_zone", None))
         self._update_quality_btn()
         self._update_chime_btn()
+        self._update_auto_track_btn()
         if self.worker is not None and not stream_changed:
             self.worker.config.name = config.name
             self.worker.set_detection_options(
                 enabled=bool(getattr(config, "person_detection", True)),
                 sensitivity=getattr(config, "detection_sensitivity", "ultra"),
                 gpu_acceleration=bool(getattr(config, "gpu_acceleration", True)),
+            )
+            self.worker.set_auto_track(
+                bool(getattr(config, "auto_track", False)),
+                preset_thumb_dir=PRESET_THUMB_DIR,
             )
         if was_running and stream_changed:
             self.start_stream()
@@ -3434,6 +3660,9 @@ class CameraTileWidget(QFrame):
         self.worker.audio_ready.connect(self._on_audio)
         self.worker.status_changed.connect(self._on_status)
         self.worker.recording_changed.connect(self._on_recording_state)
+        self.worker.tracking_state_changed.connect(self._on_tracking_state_changed)
+        if bool(getattr(self.config, "auto_track", False)):
+            self.canvas.set_auto_track_state(True, "STANDBY")
         self.worker.start()
 
     def _retire_worker(self, worker: Optional[CameraStreamWorker]) -> None:
@@ -3469,6 +3698,7 @@ class CameraTileWidget(QFrame):
                 worker.audio_ready.disconnect()
                 worker.status_changed.disconnect()
                 worker.recording_changed.disconnect()
+                worker.tracking_state_changed.disconnect()
             except Exception:
                 pass
             self._retire_worker(worker)
@@ -3519,6 +3749,7 @@ class CameraTileWidget(QFrame):
         _ = cam_id
         has_person = bool(boxes)
         self.canvas.set_detections(boxes)
+        self.detections_updated.emit(self.config.cam_id, list(boxes))
         if has_person != self._person_detected:
             self._person_detected = has_person
             self.person_lbl.setVisible(has_person)
@@ -3579,8 +3810,13 @@ class CameraTileWidget(QFrame):
     def _update_chime_btn(self) -> None:
         chime_on = bool(getattr(self.config, "detection_sound", True))
         cd_sec = int(getattr(self.config, "detection_sound_cooldown", 10) or 10)
-        zone = CameraConfig.normalize_chime_zone(getattr(self.config, "chime_zone", None))
-        zone_desc = "Custom Area" if zone is not None else "Whole Frame"
+        zones = CameraConfig.normalize_chime_zones(getattr(self.config, "chime_zone", None))
+        n_zones = len(zones)
+        zone_desc = (
+            f"{n_zones} Custom Zones"
+            if n_zones > 1
+            else ("1 Custom Zone" if n_zones == 1 else "Whole Frame")
+        )
         self.btn_chime.blockSignals(True)
         self.btn_chime.setChecked(chime_on)
         self.btn_chime.blockSignals(False)
@@ -3597,22 +3833,22 @@ class CameraTileWidget(QFrame):
         if hasattr(self, "btn_chime_zone"):
             editing = bool(getattr(self.canvas, "_editing_chime_zone", False))
             self.btn_chime_zone.blockSignals(True)
-            self.btn_chime_zone.setChecked(editing or zone is not None)
+            self.btn_chime_zone.setChecked(editing or n_zones > 0)
             self.btn_chime_zone.blockSignals(False)
             if editing:
                 self.btn_chime_zone.setIcon(lucide_icon("scan", "#fbbf24", 14))
                 self.btn_chime_zone.setToolTip(
-                    "Editing Chime Trigger Area — Drag a box on the footage or click to finish"
+                    f"Editing Chime Trigger Zones ({n_zones}/{CameraConfig.MAX_CHIME_ZONES}) — Drag on footage to add zones or click to finish"
                 )
-            elif zone is not None:
+            elif n_zones > 0:
                 self.btn_chime_zone.setIcon(lucide_icon("scan", "#f59e0b", 14))
                 self.btn_chime_zone.setToolTip(
-                    "Chime Trigger Area: Custom Area Set — Click to edit area on footage"
+                    f"Chime Trigger Area: {zone_desc} Set — Click to add/remove zones (up to {CameraConfig.MAX_CHIME_ZONES})"
                 )
             else:
                 self.btn_chime_zone.setIcon(lucide_icon("scan", "#71717a", 14))
                 self.btn_chime_zone.setToolTip(
-                    "Chime Trigger Area: Whole Frame (Default) — Click to draw a custom trigger area (e.g. Gate)"
+                    f"Chime Trigger Area: Whole Frame (Default) — Click to draw up to {CameraConfig.MAX_CHIME_ZONES} custom trigger areas"
                 )
 
     def toggle_chime_zone_editor(self) -> None:
@@ -3635,7 +3871,9 @@ class CameraTileWidget(QFrame):
         self.canvas.set_chime_zone(norm)
         self._update_chime_btn()
         if norm is not None:
-            self.canvas.show_info_toast(f"Saved custom Chime Trigger Area on {self.config.name}")
+            cnt = len(norm)
+            lbl = f"{cnt} Chime Trigger Zones" if cnt > 1 else "1 Chime Trigger Zone"
+            self.canvas.show_info_toast(f"Saved {lbl} ({cnt}/{CameraConfig.MAX_CHIME_ZONES}) on {self.config.name}")
         else:
             self.canvas.show_info_toast(f"Chime Trigger Area set to Whole Frame on {self.config.name}")
         self.config_changed.emit()
@@ -3643,6 +3881,45 @@ class CameraTileWidget(QFrame):
     def _on_canvas_chime_zone_edit_toggled(self, editing: bool) -> None:
         _ = editing
         self._update_chime_btn()
+        self.config_changed.emit()
+
+    def _on_tracking_state_changed(self, cam_id: str, state: str) -> None:
+        _ = cam_id
+        enabled = bool(getattr(self.config, "auto_track", False))
+        self.canvas.set_auto_track_state(enabled, state)
+
+    def _update_auto_track_btn(self) -> None:
+        if not hasattr(self, "btn_auto_track"):
+            return
+        track_on = bool(getattr(self.config, "auto_track", False))
+        self.btn_auto_track.blockSignals(True)
+        self.btn_auto_track.setChecked(track_on)
+        self.btn_auto_track.blockSignals(False)
+        if track_on:
+            self.btn_auto_track.setIcon(lucide_icon("crosshair", "#10b981", 14))
+            self.btn_auto_track.setToolTip(
+                "PTZ Auto-Tracking: ON (Follows detected person & returns Home after 12s idle) — Click to Disable"
+            )
+        else:
+            self.btn_auto_track.setIcon(lucide_icon("crosshair", "#71717a", 14))
+            self.btn_auto_track.setToolTip(
+                "PTZ Auto-Tracking: OFF — Click to Automatically Pan/Tilt to Follow Detected Person"
+            )
+        self.canvas.set_auto_track_state(track_on, self.canvas._tracking_state if track_on else "")
+
+    def toggle_auto_track(self) -> None:
+        self.selected.emit(self.config.cam_id)
+        new_state = not bool(getattr(self.config, "auto_track", False))
+        self.config.auto_track = new_state
+        if new_state:
+            self.config.person_detection = True
+        if self.worker is not None:
+            self.worker.set_auto_track(new_state, preset_thumb_dir=PRESET_THUMB_DIR)
+        self._update_auto_track_btn()
+        if new_state:
+            self.canvas.show_info_toast(f"PTZ Auto-Tracking ENABLED on {self.config.name} (Home position saved)")
+        else:
+            self.canvas.show_info_toast(f"PTZ Auto-Tracking DISABLED on {self.config.name}")
         self.config_changed.emit()
 
     def _toggle_detection_sound(self) -> None:
@@ -3707,13 +3984,13 @@ class CameraTileWidget(QFrame):
         if is_hd:
             self.btn_quality.setStyleSheet(
                 "QPushButton { background-color: #172554; border: 1px solid #2563eb; border-radius: 4px; "
-                "color: #93c5fd; font-family: 'Cascadia Mono', 'Consolas', monospace; font-size: 10px; font-weight: 700; padding: 0; }"
+                "color: #93c5fd; font-family: 'Cascadia Mono', 'Consolas', monospace; font-size: 10px; font-weight: 700; padding: 0 6px; }"
                 "QPushButton:hover { background-color: #1e3a8a; border-color: #3b82f6; color: #ffffff; }"
             )
         else:
             self.btn_quality.setStyleSheet(
                 "QPushButton { background-color: #18181c; border: 1px solid #2e2e36; border-radius: 4px; "
-                "color: #a1a1aa; font-family: 'Cascadia Mono', 'Consolas', monospace; font-size: 10px; font-weight: 700; padding: 0; }"
+                "color: #a1a1aa; font-family: 'Cascadia Mono', 'Consolas', monospace; font-size: 10px; font-weight: 700; padding: 0 6px; }"
                 "QPushButton:hover { background-color: #24242b; border-color: #52525b; color: #f4f4f5; }"
             )
 
@@ -4049,10 +4326,17 @@ class PTZPresetPopup(QDialog):
                 btn_go = QPushButton("Go")
                 btn_go.setObjectName("primaryBtn")
                 btn_go.setIcon(lucide_icon("pan", "#ffffff", 13))
-                btn_go.setFixedSize(56, 28)
-                btn_go.setToolTip(f"Pan camera to {entry.get('name', f'Preset {slot_num}')}")
+                btn_go.setFixedSize(52, 28)
+                btn_go.setToolTip(f"Pan camera to {entry.get('name', f'Preset {slot_num}')} (auto-syncs with Mobile/Camera)")
                 btn_go.clicked.connect(lambda _, s=slot_idx: self._goto_preset(s))
                 row.addWidget(btn_go)
+
+                btn_sync = QPushButton()
+                btn_sync.setIcon(lucide_icon("refresh", "#60a5fa", 13))
+                btn_sync.setFixedSize(28, 28)
+                btn_sync.setToolTip("Sync from Camera/Mobile: Recall camera's hardware slot and refresh PC thumbnail")
+                btn_sync.clicked.connect(lambda _, s=slot_idx, ed=name_edit: self._sync_from_camera_slot(s, ed.text()))
+                row.addWidget(btn_sync)
 
                 btn_upd = QPushButton()
                 btn_upd.setIcon(lucide_icon("save", "#a1a1aa", 13))
@@ -4069,12 +4353,26 @@ class PTZPresetPopup(QDialog):
                 btn_del.clicked.connect(lambda _, s=slot_idx: self._clear_preset(s))
                 row.addWidget(btn_del)
             else:
-                btn_save = QPushButton("Save Current")
+                btn_call_hw = QPushButton("Call Cam")
+                btn_call_hw.setIcon(lucide_icon("refresh", "#60a5fa", 12))
+                btn_call_hw.setFixedHeight(28)
+                btn_call_hw.setStyleSheet(
+                    "QPushButton { background-color: #18181f; border: 1px solid #272732; border-radius: 4px; "
+                    "color: #93c5fd; font-size: 11px; font-weight: 600; padding: 0 8px; }"
+                    "QPushButton:hover { background-color: #1e293b; border-color: #3b82f6; color: #ffffff; }"
+                )
+                btn_call_hw.setToolTip(
+                    f"Recall Hardware Slot #{slot_num} saved on V380 Mobile App & sync thumbnail to PC"
+                )
+                btn_call_hw.clicked.connect(lambda _, s=slot_idx, ed=name_edit: self._sync_from_camera_slot(s, ed.text()))
+                row.addWidget(btn_call_hw)
+
+                btn_save = QPushButton("Save")
                 btn_save.setIcon(lucide_icon("plus", "#93c5fd", 12))
                 btn_save.setFixedHeight(28)
                 btn_save.setStyleSheet(
                     "QPushButton { background-color: #172554; border: 1px solid #1e3a8a; border-radius: 4px; "
-                    "color: #93c5fd; font-size: 11px; font-weight: 600; padding: 0 10px; }"
+                    "color: #93c5fd; font-size: 11px; font-weight: 600; padding: 0 9px; }"
                     "QPushButton:hover { background-color: #1e3a8a; border-color: #3b82f6; color: #ffffff; }"
                 )
                 btn_save.setToolTip(f"Save camera's current PTZ angle into Slot #{slot_num}")
@@ -4127,6 +4425,46 @@ class PTZPresetPopup(QDialog):
             pmap[slot_idx]["name"] = clean
             self._save_preset_map(pmap)
             self.on_status_msg(f"Renamed PTZ Preset #{slot_idx + 1} to '{clean}'")
+
+    def _sync_from_camera_slot(self, slot_idx: int, raw_name: str) -> None:
+        """Recall the camera's onboard hardware preset slot (saved via V380 mobile app) and sync its thumbnail to PC."""
+        from datetime import datetime
+
+        slot_num = slot_idx + 1
+        if self.tile.worker is None:
+            self.on_status_msg(f"Connect {self.config.name} stream first to sync Preset #{slot_num} from camera")
+            return
+
+        pmap = self._preset_map()
+        prev = pmap.get(slot_idx, {})
+        clean_name = (raw_name or "").strip() or prev.get("name") or f"Preset {slot_num}"
+
+        # Recall hardware preset only (no stale template stepping)
+        self.tile.worker.ptz_preset_goto(slot_idx, thumb_path=None)
+        self.on_status_msg(f"Recalling Camera Hardware Slot #{slot_num} & syncing thumbnail in 2.4s...")
+
+        def _finish_sync() -> None:
+            if self.tile.worker is None:
+                return
+            t_path = self.tile.worker.capture_preset_thumbnail(PRESET_THUMB_DIR, slot_idx)
+            cur_map = self._preset_map()
+            cur_map[slot_idx] = {
+                "slot": slot_idx,
+                "name": clean_name,
+                "thumb": t_path or prev.get("thumb", ""),
+                "updated_at": f"Synced {datetime.now().strftime('%H:%M')}",
+                "demo_pan": prev.get("demo_pan", 0.0),
+                "demo_tilt": prev.get("demo_tilt", 0.0),
+            }
+            self._save_preset_map(cur_map)
+            self.on_status_msg(f"Synced Camera Hardware Slot #{slot_num} ('{clean_name}') to PC")
+            try:
+                if self.isVisible():
+                    self._rebuild_content()
+            except Exception:
+                pass
+
+        QTimer.singleShot(2400, _finish_sync)
 
     def _goto_preset(self, slot_idx: int) -> None:
         pmap = self._preset_map()
@@ -4861,6 +5199,8 @@ class FootageReviewWorkspace(QWidget):
         self.play_worker: Optional[SDCardPlaybackWorker] = None
         self.export_worker: Optional[SDCardExportWorker] = None
         self.bulk_worker: Optional[SDCardBulkBackupWorker] = None
+        self.thumb_worker: Optional[SDCardThumbnailFetchWorker] = None
+        self._playback_thumb_captured_seg_id: Optional[int] = None
         self._retiring_workers: List[QThread] = []
         self._pending_sd_play: Optional[Tuple[CameraConfig, RecordingSegment, int]] = None
         self._sd_play_timer = QTimer(self)
@@ -5135,13 +5475,13 @@ class FootageReviewWorkspace(QWidget):
         list_vbox.addWidget(self.lbl_list_status)
 
         self.clip_list = _ClipListWidget()
-        self.clip_list.setIconSize(QSize(26, 26))
+        self.clip_list.setIconSize(QSize(60, 34))
         self.clip_list.setSpacing(2)
         self.clip_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.clip_list.customContextMenuRequested.connect(self._show_clip_context_menu)
         self.clip_list.setStyleSheet(
-            "QListWidget { background-color: #0e0e12; border: 1px solid #23232b; border-radius: 5px; outline: none; qproperty-iconSize: 26px 26px; }"
-            "QListWidget::item { padding: 7px 10px; border-bottom: 1px solid #18181f; font-family: 'Cascadia Mono', 'Consolas', monospace; font-size: 12px; }"
+            "QListWidget { background-color: #0e0e12; border: 1px solid #23232b; border-radius: 5px; outline: none; qproperty-iconSize: 60px 34px; }"
+            "QListWidget::item { padding: 5px 8px; border-bottom: 1px solid #18181f; font-family: 'Cascadia Mono', 'Consolas', monospace; font-size: 12px; }"
             "QListWidget::item:selected { background-color: #1e3a8a; color: #ffffff; border-radius: 4px; }"
             "QListWidget::item:hover:!selected { background-color: #181820; }"
         )
@@ -5571,8 +5911,54 @@ class FootageReviewWorkspace(QWidget):
         dt = datetime(qd.year(), qd.month(), qd.day(), 0, 0, 0, tzinfo=timezone.utc)
         return int(dt.timestamp())
 
+    def _stop_thumb_worker(self) -> None:
+        if self.thumb_worker is not None:
+            tw = self.thumb_worker
+            self.thumb_worker = None
+            try:
+                tw.thumbnail_ready.disconnect()
+            except Exception:
+                pass
+            self._retire_thread(tw)
+
+    def _launch_sd_thumbnail_fetcher(self) -> None:
+        self._stop_thumb_worker()
+        if self.source_mode != "sdcard" or not self.all_segments:
+            return
+        # Don't contend with active SD card stream or bulk backup
+        if (self.play_worker is not None and self.play_worker.isRunning() and not self.play_worker.local_file) or (
+            self.bulk_worker is not None and self.bulk_worker.isRunning()
+        ):
+            return
+        cfg = self._active_config()
+        if cfg is None:
+            return
+        self.thumb_worker = SDCardThumbnailFetchWorker(
+            config=cfg,
+            segments=self.all_segments,
+            backup_root=BACKUP_DIR,
+            max_remote_fetch=24,
+            parent=self,
+        )
+        self.thumb_worker.thumbnail_ready.connect(self._on_segment_thumbnail_ready)
+        self.thumb_worker.start()
+
+    def _on_segment_thumbnail_ready(self, seg_id: int, thumb_path: str) -> None:
+        if not thumb_path or not os.path.isfile(thumb_path):
+            return
+        cfg = self._active_config()
+        for i in range(self.clip_list.count()):
+            it = self.clip_list.item(i)
+            if it is None:
+                continue
+            seg = it.data(Qt.ItemDataRole.UserRole)
+            if isinstance(seg, RecordingSegment) and seg.seg_id == seg_id:
+                has_bk = bool(cfg and find_segment_backup_file(BACKUP_DIR, cfg, seg) is not None)
+                self._apply_segment_item_appearance(it, seg, has_bk, thumb_path=thumb_path)
+
     # --- Listing SD Card & Local Recordings ---
     def refresh_recordings(self) -> None:
+        self._stop_thumb_worker()
         if self.source_mode == "local":
             self._load_local_captures()
             return
@@ -5670,6 +6056,7 @@ class FootageReviewWorkspace(QWidget):
 
         self.timeline.set_day_and_segments(self._day_start_utc_ts(), self.all_segments, backed_ids)
         self._populate_sd_clip_list()
+        self._launch_sd_thumbnail_fetcher()
 
         if not ok and not self.all_segments:
             self.canvas.set_status(summary, False)
@@ -5682,7 +6069,12 @@ class FootageReviewWorkspace(QWidget):
             )
 
     @staticmethod
-    def _apply_segment_item_appearance(item: QListWidgetItem, seg: RecordingSegment, has_backup: bool) -> None:
+    def _apply_segment_item_appearance(
+        item: QListWidgetItem,
+        seg: RecordingSegment,
+        has_backup: bool,
+        thumb_path: Optional[str] = None,
+    ) -> None:
         if seg.raw_type == 3:
             ev_ico, ev_col, fg = "alert_triangle", "#ef4444", "#fca5a5"
         elif seg.raw_type == 2:
@@ -5690,13 +6082,13 @@ class FootageReviewWorkspace(QWidget):
         else:
             ev_ico, ev_col, fg = "film", "#60a5fa", "#d4d4d8"
         item.setForeground(QColor(fg))
-        item.setIcon(clip_row_icon(ev_ico, ev_col, is_backed_up=has_backup))
-        tip = f"{seg.kind_label}  •  {seg.date_str}  {seg.start_time_str} – {seg.end_time_str} ({seg.duration_str})"
+        item.setIcon(clip_row_icon(ev_ico, ev_col, is_backed_up=has_backup, thumb_path=thumb_path))
+        hdr = f"{seg.kind_label}  •  {seg.date_str}  {seg.start_time_str} – {seg.end_time_str} ({seg.duration_str})"
         if has_backup:
-            tip += "\n✓ Local backup available on PC (plays directly from local disk)"
+            sub = "✓ Local backup available on PC (plays directly from local disk)"
         else:
-            tip += "\nRight-click to back up this clip to your PC"
-        item.setToolTip(tip)
+            sub = "Right-click to back up this clip to your PC"
+        item.setToolTip(build_clip_tooltip_html(hdr, sub, thumb_path=thumb_path, accent_color=ev_col))
 
     def _toggle_sort_order(self) -> None:
         self.sort_newest_first = not self.sort_newest_first
@@ -5723,7 +6115,14 @@ class FootageReviewWorkspace(QWidget):
             item = QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, seg)
             has_backup = bool(cfg and find_segment_backup_file(BACKUP_DIR, cfg, seg) is not None)
-            self._apply_segment_item_appearance(item, seg, has_backup)
+            thumb_p = (
+                find_segment_thumbnail_file(BACKUP_DIR, cfg, seg, auto_extract_from_backup=False)
+                if cfg is not None
+                else None
+            )
+            self._apply_segment_item_appearance(
+                item, seg, has_backup, thumb_path=str(thumb_p) if thumb_p else None
+            )
             self.clip_list.addItem(item)
             if self.current_segment is not None and seg.seg_id == self.current_segment.seg_id:
                 selected_item = item
@@ -5734,6 +6133,7 @@ class FootageReviewWorkspace(QWidget):
             self.clip_list.blockSignals(False)
 
     def _load_local_captures(self) -> None:
+        self._stop_thumb_worker()
         self.clip_list.clear()
         self.local_files.clear()
         RECORDING_DIR.mkdir(parents=True, exist_ok=True)
@@ -5753,9 +6153,19 @@ class FootageReviewWorkspace(QWidget):
             kind = "[MP4]" if is_vid else "[JPG]"
             item = QListWidgetItem(f"{kind}  {fp.name}  ({sz_str})")
             item.setData(Qt.ItemDataRole.UserRole, str(fp))
-            item.setToolTip(str(fp))
+            thumb_p = get_local_capture_thumbnail_path(fp, auto_extract=True)
+            t_str = str(thumb_p) if thumb_p else None
+            ev_col = "#38bdf8" if is_vid else "#10b981"
+            item.setToolTip(
+                build_clip_tooltip_html(f"{kind}  {fp.name}  ({sz_str})", str(fp), thumb_path=t_str, accent_color=ev_col)
+            )
             item.setIcon(
-                clip_row_icon("film" if is_vid else "camera", "#38bdf8" if is_vid else "#10b981", is_backed_up=False)
+                clip_row_icon(
+                    "film" if is_vid else "camera",
+                    ev_col,
+                    is_backed_up=False,
+                    thumb_path=t_str,
+                )
             )
             self.clip_list.addItem(item)
 
@@ -5859,6 +6269,7 @@ class FootageReviewWorkspace(QWidget):
             self.play_worker.start()
             self._update_play_pause_btn(is_playing=True)
         else:
+            self._stop_thumb_worker()
             self.lbl_backup_badge.setVisible(False)
             self.canvas.set_camera_info(cfg.name, f"SD Playback • {segment.kind_label}")
             self.canvas.set_status("Connecting to SD Card...", False)
@@ -5943,6 +6354,24 @@ class FootageReviewWorkspace(QWidget):
             self.lbl_clock_pos.setText(
                 datetime.fromtimestamp(ts_sec, timezone.utc).strftime("%I:%M:%S %p")
             )
+            seg = self.current_segment
+            cfg = self._active_config()
+            if (
+                seg is not None
+                and cfg is not None
+                and self._playback_thumb_captured_seg_id != seg.seg_id
+                and ts_sec >= (seg.start_ts + min(2, max(0, seg.duration_sec // 3)))
+            ):
+                existing_t = find_segment_thumbnail_file(
+                    BACKUP_DIR, cfg, seg, auto_extract_from_backup=False
+                )
+                if existing_t is None:
+                    saved_t = save_qimage_as_segment_thumbnail(
+                        BACKUP_DIR, cfg, seg, qimg, run_person_box=True
+                    )
+                    if saved_t is not None:
+                        self._on_segment_thumbnail_ready(seg.seg_id, str(saved_t))
+                self._playback_thumb_captured_seg_id = seg.seg_id
         else:
             m, s = divmod(max(0, ts_sec), 60)
             self.lbl_clock_pos.setText(f"{m:02d}:{s:02d}")
@@ -6142,6 +6571,7 @@ class FootageReviewWorkspace(QWidget):
         self._update_play_pause_btn(is_playing=False)
 
     def stop_all(self) -> None:
+        self._stop_thumb_worker()
         self.stop_playback()
         self.audio_out.close()
         if self.export_worker is not None:
@@ -6156,13 +6586,21 @@ class FootageReviewWorkspace(QWidget):
     # --- Local Backup & Date/Time Range Downloader ---
     def _mark_segment_backed_up_ui(self, seg_id: int) -> None:
         self.timeline.mark_segment_backed_up(seg_id)
+        cfg = self._active_config()
         for i in range(self.clip_list.count()):
             it = self.clip_list.item(i)
             if it is None:
                 continue
             seg = it.data(Qt.ItemDataRole.UserRole)
             if isinstance(seg, RecordingSegment) and seg.seg_id == seg_id:
-                self._apply_segment_item_appearance(it, seg, has_backup=True)
+                thumb_p = (
+                    find_segment_thumbnail_file(BACKUP_DIR, cfg, seg, auto_extract_from_backup=True)
+                    if cfg is not None
+                    else None
+                )
+                self._apply_segment_item_appearance(
+                    it, seg, has_backup=True, thumb_path=str(thumb_p) if thumb_p else None
+                )
         if self.current_segment is not None and self.current_segment.seg_id == seg_id:
             self.lbl_backup_badge.setVisible(True)
             self._update_speed_controls_lock(unlocked=True)
@@ -6228,6 +6666,7 @@ class FootageReviewWorkspace(QWidget):
             self._retire_thread(old_ew)
 
         # Pause active SD stream so the camera dedicates full bandwidth to the backup download
+        self._stop_thumb_worker()
         self.stop_playback()
         self.current_segment = seg
         self._select_clip_in_list(seg)
@@ -6290,6 +6729,7 @@ class FootageReviewWorkspace(QWidget):
 
         # Pause playback if backing up from the same camera
         if self.active_cam_id == cfg.cam_id:
+            self._stop_thumb_worker()
             self.stop_playback()
 
         self.backup_box.setVisible(True)
@@ -7038,6 +7478,54 @@ class OmniSightMainWindow(QMainWindow):
         ptz_hint.setStyleSheet("color: #71717a; font-size: 10px;")
         ptz_vbox.addWidget(ptz_hint)
         self.ptz_hint = ptz_hint
+
+        track_row = QHBoxLayout()
+        track_row.setSpacing(4)
+        self.btn_auto_track = QPushButton("Auto-Track Person")
+        self.btn_auto_track.setObjectName("optBtn")
+        self.btn_auto_track.setCheckable(True)
+        self.btn_auto_track.setMinimumWidth(0)
+        self.btn_auto_track.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.btn_auto_track.setIcon(lucide_icon("crosshair", "#a1a1aa", 12))
+        self.btn_auto_track.setToolTip(
+            "Single-Lens PTZ Motion Tracking — Automatically pans/tilts in smooth step-pulses to keep a detected person centered"
+        )
+        self.btn_auto_track.clicked.connect(self._toggle_auto_track)
+        track_row.addWidget(self.btn_auto_track, 1)
+
+        self.btn_track_home = QPushButton("Auto-Home")
+        self.btn_track_home.setObjectName("optBtn")
+        self.btn_track_home.setCheckable(True)
+        self.btn_track_home.setChecked(True)
+        self.btn_track_home.setMinimumWidth(0)
+        self.btn_track_home.setIcon(lucide_icon("refresh", "#a1a1aa", 11))
+        self.btn_track_home.setToolTip(
+            "Return to Home Position (Preset 1 or initial angle) automatically after 12 seconds with no person detected"
+        )
+        self.btn_track_home.clicked.connect(self._toggle_auto_track_return_home)
+        track_row.addWidget(self.btn_track_home)
+        ptz_vbox.addLayout(track_row)
+
+        spot_row = QHBoxLayout()
+        spot_row.setSpacing(4)
+        lbl_spot = QLabel("Spotter Link:")
+        lbl_spot.setMinimumWidth(0)
+        lbl_spot.setStyleSheet("color: #71717a; font-size: 10px; font-weight: 600;")
+        spot_row.addWidget(lbl_spot)
+
+        self.cmb_spotter = QComboBox()
+        self.cmb_spotter.setMinimumWidth(0)
+        self.cmb_spotter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.cmb_spotter.setFixedHeight(24)
+        self.cmb_spotter.setToolTip(
+            "Optional Cross-Camera / Dual-Lens Spotter Link:\n"
+            "• Single-Lens Independent (Default): Camera tracks movement within its own lens field of view\n"
+            "• Linked Spotter Camera: If a person enters Left/Center/Right of the fixed spotter camera, this PTZ camera recalls Preset 1/2/3"
+        )
+        self.cmb_spotter.currentIndexChanged.connect(self._on_spotter_combo_changed)
+        spot_row.addWidget(self.cmb_spotter, 1)
+        ptz_vbox.addLayout(spot_row)
+
         self._ptz_vbox = ptz_vbox
         d_vbox.addWidget(ptz_sec)
 
@@ -7776,6 +8264,7 @@ class OmniSightMainWindow(QMainWindow):
         )
         tile.recording_toggled.connect(self._on_tile_recording_toggled)
         tile.reorder_requested.connect(self._on_camera_reordered)
+        tile.detections_updated.connect(self._on_spotter_camera_detections)
         if self.monitor_mode:
             tile.set_monitor_mode(True)
         self.tiles[cfg.cam_id] = tile
@@ -8022,7 +8511,7 @@ class OmniSightMainWindow(QMainWindow):
             self.btn_chime_zone.setText("Done (Area)")
             self.btn_chime_zone.setIcon(lucide_icon("check", "#10b981", 12))
         elif zone is not None:
-            self.btn_chime_zone.setText("Area: Custom")
+            self.btn_chime_zone.setText(f"Zones ({len(zone)})")
             self.btn_chime_zone.setIcon(lucide_icon("scan", "#f59e0b", 12))
         else:
             self.btn_chime_zone.setText("Set Chime Area")
@@ -8036,6 +8525,36 @@ class OmniSightMainWindow(QMainWindow):
         self.btn_reset_ignored.setEnabled(ignored_count > 0)
         self.btn_gpu_accel.setChecked(gpu_on)
         self.btn_gpu_accel.setIcon(lucide_icon("zap", "#10b981" if gpu_on else "#71717a", 13))
+        track_on = bool(getattr(cfg, "auto_track", False))
+        home_on = bool(getattr(cfg, "auto_track_return_home", True))
+        if hasattr(self, "btn_auto_track"):
+            self.btn_auto_track.blockSignals(True)
+            self.btn_auto_track.setChecked(track_on)
+            self.btn_auto_track.blockSignals(False)
+            self.btn_auto_track.setIcon(
+                lucide_icon("crosshair", "#10b981" if track_on else "#a1a1aa", 12)
+            )
+            self.btn_auto_track.setText("Auto-Track: ON" if track_on else "Auto-Track Person")
+        if hasattr(self, "btn_track_home"):
+            self.btn_track_home.blockSignals(True)
+            self.btn_track_home.setChecked(home_on)
+            self.btn_track_home.blockSignals(False)
+            self.btn_track_home.setIcon(
+                lucide_icon("refresh", "#38bdf8" if home_on else "#a1a1aa", 11)
+            )
+        if hasattr(self, "cmb_spotter"):
+            self.cmb_spotter.blockSignals(True)
+            self.cmb_spotter.clear()
+            self.cmb_spotter.addItem("Single-Lens (Independent)", "")
+            cur_spot = str(getattr(cfg, "spotter_cam_id", "") or "")
+            sel_idx = 0
+            for other in self.cameras:
+                if other.cam_id != cfg.cam_id:
+                    self.cmb_spotter.addItem(f"Link: {other.name}", other.cam_id)
+                    if other.cam_id == cur_spot:
+                        sel_idx = self.cmb_spotter.count() - 1
+            self.cmb_spotter.setCurrentIndex(sel_idx)
+            self.cmb_spotter.blockSignals(False)
         self._sync_all_gpu_btn()
 
     def _on_list_row_changed(self, row: int) -> None:
@@ -8256,6 +8775,92 @@ class OmniSightMainWindow(QMainWindow):
         if not self.selected_cam_id:
             return None
         return self.tiles.get(self.selected_cam_id)
+
+    def _toggle_auto_track(self) -> None:
+        tile = self._active_tile()
+        if not tile:
+            self.status_bar.showMessage("Select a camera first to enable PTZ Auto-Tracking", 3000)
+            return
+        tile.toggle_auto_track()
+        self._sync_optics_buttons(tile.config)
+        self._save_cameras_list()
+        state_str = "ENABLED" if bool(getattr(tile.config, "auto_track", False)) else "DISABLED"
+        self.status_bar.showMessage(f"PTZ Auto-Tracking {state_str} on {tile.config.name}", 4000)
+
+    def _toggle_auto_track_return_home(self) -> None:
+        tile = self._active_tile()
+        if not tile:
+            return
+        new_home = not bool(getattr(tile.config, "auto_track_return_home", True))
+        tile.config.auto_track_return_home = new_home
+        self._sync_optics_buttons(tile.config)
+        self._save_cameras_list()
+        state_str = "ENABLED (returns Home after 12s idle)" if new_home else "DISABLED"
+        self.status_bar.showMessage(f"Auto-Track Return-to-Home {state_str} on {tile.config.name}", 4000)
+
+    def _on_spotter_combo_changed(self, idx: int) -> None:
+        _ = idx
+        tile = self._active_tile()
+        if not tile or not hasattr(self, "cmb_spotter"):
+            return
+        spot_id = str(self.cmb_spotter.currentData() or "")
+        if getattr(tile.config, "spotter_cam_id", "") == spot_id:
+            return
+        tile.config.spotter_cam_id = spot_id
+        self._save_cameras_list()
+        if spot_id:
+            spot_cfg = self._get_config(spot_id)
+            spot_name = spot_cfg.name if spot_cfg else spot_id
+            self.status_bar.showMessage(
+                f"Linked '{tile.config.name}' to Spotter Camera '{spot_name}' (Left/Center/Right → Preset 1/2/3)",
+                5000,
+            )
+        else:
+            self.status_bar.showMessage(
+                f"'{tile.config.name}' set to Single-Lens Independent PTZ tracking",
+                4000,
+            )
+
+    def _on_spotter_camera_detections(self, spotter_cam_id: str, boxes: list) -> None:
+        if not boxes:
+            return
+        import time as _time
+
+        now_t = _time.monotonic()
+        if not hasattr(self, "_spotter_handoff_cooldowns"):
+            self._spotter_handoff_cooldowns: Dict[str, float] = {}
+
+        # Compute horizontal center of primary detected person on the spotter camera
+        bx1, by1, bx2, by2 = float(boxes[0][0]), float(boxes[0][1]), float(boxes[0][2]), float(boxes[0][3])
+        cx = (bx1 + bx2) * 0.5
+        target_slot = 0 if cx < 0.34 else (1 if cx < 0.66 else 2)
+
+        for ptz_cfg in self.cameras:
+            if getattr(ptz_cfg, "spotter_cam_id", "") != spotter_cam_id:
+                continue
+            ptz_tile = self.tiles.get(ptz_cfg.cam_id)
+            if ptz_tile is None or ptz_tile.worker is None:
+                continue
+            # Do not interrupt if the PTZ camera already sees a person in its own lens
+            if ptz_tile._person_detected:
+                continue
+            last_handoff = self._spotter_handoff_cooldowns.get(ptz_cfg.cam_id, 0.0)
+            if (now_t - last_handoff) < 10.0:
+                continue
+            self._spotter_handoff_cooldowns[ptz_cfg.cam_id] = now_t
+            presets = getattr(ptz_cfg, "ptz_presets", None) or []
+            slot_info = next(
+                (p for p in presets if isinstance(p, dict) and int(p.get("slot", -1)) == target_slot),
+                None,
+            )
+            demo_c = (
+                (float(slot_info.get("pan", 0.0)), float(slot_info.get("tilt", 0.0)))
+                if slot_info
+                else ((-45.0 if target_slot == 0 else (0.0 if target_slot == 1 else 45.0)), 0.0)
+            )
+            thumb_p = slot_info.get("thumb_path") if slot_info else None
+            ptz_tile.worker.ptz_preset_goto(target_slot, demo_coords=demo_c, thumb_path=thumb_p)
+            ptz_tile.canvas.show_info_toast(f"Spotter handoff → Preset #{target_slot + 1}")
 
     def _send_ptz(self, direction: str) -> None:
         tile = self._active_tile()

@@ -1080,7 +1080,7 @@ class LanCameraClient:
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)
                 self._configure_tcp_keepalive(sock)
                 sock.settimeout(6.0)
                 sock.connect((self.ip, self.port))
@@ -1207,20 +1207,20 @@ class LanCameraClient:
         Returns False if the video watchdog timed out and requires a full reconnect.
         """
         now = time.monotonic()
-        if force_tcp or (now - self._last_keepalive_mono) >= 8.0:
+        no_video_sec = now - self._last_video_frame_mono
+        if force_tcp or (no_video_sec >= 4.0 and (now - self._last_keepalive_mono) >= 8.0):
             self._last_keepalive_mono = now
             self._send_raw(LanCameraCommands.PTZ_STOP)
 
-        if (now - self._last_udp_wake_mono) >= 12.0:
+        if no_video_sec >= 4.0 and (now - self._last_udp_wake_mono) >= 12.0:
             self._last_udp_wake_mono = now
             self._wake_camera_lan_udp(burst_count=1)
 
-        no_video_sec = now - self._last_video_frame_mono
-        if no_video_sec >= 6.5 and (now - self._last_encoder_prod_mono) >= 3.5:
+        if no_video_sec >= 8.5 and (now - self._last_encoder_prod_mono) >= 4.0:
             self._last_encoder_prod_mono = now
             self.send_wake_pulse()
 
-        if no_video_sec >= 18.0:
+        if no_video_sec >= 24.0:
             self._force_cloud_wake = True
             self._need_reconnect = True
             return False
@@ -1390,6 +1390,26 @@ class LanCameraClient:
         )
 
     def _try_extract_video_payload(self, full: bytes, need_decrypt: bool) -> Optional[bytes]:
+        # Fast-path for standard 16-byte outer media frame header:
+        # AES 80-byte stride decryption aligns with offset 16, and decrypted v31/v32 frames
+        # start directly with Annex-B 00 00 00 01 or 00 00 01 at offset 16.
+        if len(full) > 20:
+            d16 = full[16:]
+            if need_decrypt and len(d16) >= 16:
+                dec16 = bytearray(d16)
+                if self.communication_version == 21:
+                    self._decrypt_media_pre2k(dec16, mode=1)
+                else:
+                    self._decrypt_video_frame(dec16)
+                if dec16[:4] == b"\x00\x00\x00\x01" and self._is_likely_nal_header(dec16, 4):
+                    return bytes(dec16)
+                if dec16[:3] == b"\x00\x00\x01" and self._is_likely_nal_header(dec16, 3):
+                    return b"\x00" + bytes(dec16)
+            elif d16[:4] == b"\x00\x00\x00\x01" and self._is_likely_nal_header(d16, 4):
+                return d16
+            elif d16[:3] == b"\x00\x00\x01" and self._is_likely_nal_header(d16, 3):
+                return b"\x00" + d16
+
         best_score = -10**9
         best_payload: Optional[bytes] = None
 
@@ -1739,15 +1759,14 @@ class LanCameraClient:
         return ok_add or ok_reset
 
     def ptz_preset_goto(self, slot_id: int) -> bool:
-        """Recall and auto-pan camera to hardware preset slot (0..5) via SetPTZXParam (0xAB, 103, slot)."""
+        """Recall and auto-pan camera to hardware preset slot (0..5) via SetPTZXParam (0xAB, 103, slot) + Port 8800 cmd 129."""
         slot = max(0, min(5, int(slot_id)))
         ok_stream = self._send_raw(LanCameraCommands.ptzx_packet(LanCameraCommands.PTZX_ACTION_GOTO, slot))
-        if not ok_stream:
-            threading.Thread(
-                target=self._send_ptzx_port8800,
-                args=(LanCameraCommands.PTZX_ACTION_GOTO, slot),
-                daemon=True,
-            ).start()
+        threading.Thread(
+            target=self._send_ptzx_port8800,
+            args=(LanCameraCommands.PTZX_ACTION_GOTO, slot),
+            daemon=True,
+        ).start()
         return ok_stream
 
     def ptz_preset_clear(self, slot_id: int) -> bool:
