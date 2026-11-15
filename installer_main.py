@@ -35,7 +35,7 @@ from PyQt6.QtWidgets import (
 
 APP_NAME = "OmniSight"
 APP_EXE = "OmniSight.exe"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 APP_PUBLISHER = "OmniSight Open Source NVR"
 UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\OmniSight"
 

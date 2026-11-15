@@ -17,22 +17,28 @@ Supports:
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import ipaddress
 import json
+import os
 import random
+import re
 import secrets
 import socket
+import ssl
 import string
 import struct
+import subprocess
 import threading
 import time
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from Crypto.Cipher import AES
 
@@ -51,9 +57,12 @@ class DiscoveredCamera:
     port: int = 8800
     name: str = ""
     discovery_method: str = "UDP Broadcast"
+    protocol: str = "lan8800"  # "lan8800" | "hsc"
 
     def display_title(self) -> str:
         label = self.name or (f"Camera ({self.dev_id})" if self.dev_id else f"Camera @ {self.ip}")
+        if self.protocol == "hsc":
+            return f"{label} [{self.ip} • V380 Cloud/HSC]"
         return f"{label} [{self.ip}:{self.port}]"
 
 
@@ -68,20 +77,21 @@ class CameraFrame:
     frame_type: int = 0
     frame_rate: int = 20
     timestamp: int = 0
-    audio_codec: str = "adpcm"  # "adpcm" | "aac"
+    audio_codec: str = "adpcm"  # "adpcm" | "aac" | "alaw" | "pcm16"
 
 
 @dataclass
 class RecordingSegment:
     """
     Represents a single recording clip stored on a camera's microSD card
-    (returned by Segment Search `cmd 361` / `cmd 362`).
+    (returned by Segment Search `cmd 361` / `cmd 362` or HSC `0x30220`).
     """
 
     seg_id: int
     raw_type: int  # 1 = Continuous/Normal, 2 = Motion, 3 = Anomaly/Alarm
     start_ts: int  # Camera local wall-clock seconds stored as UTC epoch seconds
     end_ts: int    # Camera local wall-clock seconds stored as UTC epoch seconds
+    hsc_sts_ms: int = 0  # Optional UTC epoch milliseconds for V380 HSC SD playback
 
     @property
     def duration_sec(self) -> int:
@@ -266,6 +276,22 @@ def decode_adpcm_to_pcm16(adpcm_bytes: bytes) -> bytes:
     return bytes(out)
 
 
+def downsample_pcm16_2x(pcm16_bytes: bytes) -> bytes:
+    """
+    Decimate 16000 Hz signed 16-bit LE mono PCM by 2x into 8000 Hz signed 16-bit LE mono PCM
+    using a 2-tap boxcar anti-aliasing average.
+    """
+    total_samples = len(pcm16_bytes) // 2
+    if total_samples <= 0:
+        return b""
+    if total_samples == 1:
+        return pcm16_bytes[:2]
+    pairs = total_samples // 2
+    samples = struct.unpack_from(f"<{pairs * 2}h", pcm16_bytes, 0)
+    out = [(samples[2 * i] + samples[2 * i + 1]) >> 1 for i in range(pairs)]
+    return struct.pack(f"<{pairs}h", *out)
+
+
 def get_local_ipv4_addresses() -> List[str]:
     """Return all active local IPv4 addresses on this Windows machine."""
     ips = set()
@@ -301,6 +327,12 @@ class LanCameraDiscovery:
     """
 
     SEARCH_CMD = b"NVDEVSEARCH^100"
+    _REGISTRY_LOCK = threading.Lock()
+    _UDP_PROBE_LOCK = threading.Lock()
+    _DETECTED_HSC_DEVICES: set[str] = set()
+    _DETECTED_LAN_DEVICES: set[str] = set()
+    _NEGATIVE_PROBE_TS: Dict[str, float] = {}
+    _ARP_MAC_CACHE: Dict[str, Tuple[float, str]] = {}
 
     @staticmethod
     def _configure_udp_socket(sock: socket.socket) -> None:
@@ -313,41 +345,227 @@ class LanCameraDiscovery:
                 pass
 
     @classmethod
-    def query_single_ip(cls, target_ip: str, timeout_sec: float = 0.8) -> Optional[DiscoveredCamera]:
-        """Send targeted unicast UDP `NVDEVSEARCH^100` to a single IP and wait for `NVDEVRESULT`."""
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        cls._configure_udp_socket(sock)
+    def _lookup_arp_mac(cls, ip: str) -> str:
+        ip_clean = (ip or "").strip()
+        if not ip_clean:
+            return ""
+        now = time.monotonic()
+        with cls._REGISTRY_LOCK:
+            cached = cls._ARP_MAC_CACHE.get(ip_clean)
+            if cached and (now - cached[0]) < 90.0:
+                return cached[1]
+        mac_found = ""
         try:
-            try:
-                sock.bind(("0.0.0.0", 10009))
-            except OSError:
-                sock.bind(("0.0.0.0", 0))
-            sock.settimeout(0.05)
+            cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            proc = subprocess.run(
+                ["arp", "-a", ip_clean],
+                capture_output=True,
+                text=True,
+                timeout=1.2,
+                creationflags=cflags,
+            )
+            m = re.search(r"([0-9a-fA-F]{2}(?:[:-][0-9a-fA-F]{2}){5})", proc.stdout or "")
+            if m:
+                cand = m.group(1).replace("-", ":").lower()
+                if cand != "ff:ff:ff:ff:ff:ff":
+                    mac_found = cand
+        except Exception:
+            pass
+        with cls._REGISTRY_LOCK:
+            cls._ARP_MAC_CACHE[ip_clean] = (now, mac_found)
+        return mac_found
 
-            deadline = time.monotonic() + max(0.2, timeout_sec)
-            next_send = 0.0
-            while time.monotonic() < deadline:
-                now = time.monotonic()
-                if now >= next_send:
+    @staticmethod
+    def _probe_tcp_8800_open(ip: str, timeout_sec: float = 0.55) -> bool:
+        """Return True if local TCP port 8800 accepts connections (sending a safe 520-byte frame)."""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(timeout_sec)
+                if s.connect_ex((ip, 8800)) == 0:
+                    probe_pkt = bytearray(520)
+                    struct.pack_into("<I", probe_pkt, 0, 1167)
+                    struct.pack_into("<I", probe_pkt, 4, 120)
+                    probe_pkt[8] = 31
+                    struct.pack_into("<I", probe_pkt, 9, 1)
+                    s.sendall(probe_pkt)
                     try:
-                        sock.sendto(cls.SEARCH_CMD, (target_ip, 10008))
+                        s.recv(256)
                     except Exception:
                         pass
-                    next_send = now + 0.20
-                try:
-                    data, addr = sock.recvfrom(2048)
-                    cam = cls._parse_nvdevresult(data, addr[0], method="UDP Unicast Scan")
-                    if cam and (cam.ip == target_ip or addr[0] == target_ip):
-                        return cam
-                except socket.timeout:
-                    continue
-                except Exception:
-                    continue
-        finally:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def _is_lan_ip_reachable(ip: str) -> bool:
+        """Return True if `ip` responds to a quick ICMP echo on the local network."""
+        try:
+            cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            proc = subprocess.run(
+                ["ping", "-n", "1", "-w", "650", ip],
+                capture_output=True,
+                text=True,
+                timeout=1.5,
+                creationflags=cflags,
+            )
+            out = (proc.stdout or "").upper()
+            return "TTL=" in out
+        except Exception:
+            return False
+
+    @staticmethod
+    def _probe_legacy_platform1_status(dev_id: int) -> Optional[Tuple[int, int]]:
+        """
+        Query V380 legacy dispatch (`platform=10001`) and send a neutral `cmd 1167` probe.
+        Returns `(sub_status, ver)` from `resp 1168`, where:
+        - `sub_status >= 1` means the camera IS registered on legacy Platform-10001 (TCP 8800).
+        - `sub_status == -1` and `ver == 2` on a live LAN camera means Platform-2 (HSC).
+        """
+        try:
+            ts_now = int(time.time())
+            base = f"dev_id={dev_id}&platform=10001&timestamp={ts_now}hsdata2022"
+            sign = hashlib.sha1(base.encode("utf-8")).hexdigest().lower()
+            req = urllib.request.Request(
+                "http://dispa1.av380.net:8001/api/v1/get_stream_server",
+                data=json.dumps(
+                    {"dev_id": dev_id, "platform": 10001, "timestamp": ts_now, "sign": sign}
+                ).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=2.5) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            rows = data.get("data") if isinstance(data, dict) else None
+            if not isinstance(rows, list) or not rows:
+                return None
+            rip = str(rows[0].get("ip") or "").strip()
+            if not rip:
+                return None
+
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(2.2)
+                s.connect((rip, 8800))
+                host_b = f"{dev_id}.nvdvr.net".encode("ascii", errors="ignore")[:50]
+                enc_pw = LanCameraClient.generate_password("", block_bytes=48)
+                pkt = bytearray(520)
+                struct.pack_into("<I", pkt, 0, 1167)
+                struct.pack_into("<I", pkt, 4, 1022)
+                pkt[8] = 31
+                struct.pack_into("<I", pkt, 9, 1)
+                struct.pack_into("<I", pkt, 13, dev_id & 0xFFFFFFFF)
+                pkt[17 : 17 + len(host_b)] = host_b
+                struct.pack_into("<I", pkt, 67, 8800)
+                pkt[71 : 76] = b"admin"
+                pkt[103 : 103 + len(enc_pw)] = enc_pw
+                s.sendall(pkt)
+                reply = s.recv(256)
+                if reply and len(reply) >= 13:
+                    rcmd, _rres = struct.unpack_from("<II", reply, 0)
+                    if rcmd == 1168:
+                        sub = struct.unpack_from("<i", reply, 8)[0]
+                        ver = int(reply[12])
+                        return sub, ver
+        except Exception:
+            pass
+        return None
+
+    @classmethod
+    def is_hsc_camera(cls, ip: str, device_id: int | str = "") -> bool:
+        """
+        Return True if the camera at `ip` / `device_id` is a V380 Gen-3 HSC (`NVDEVRESULT^300`)
+        cloud/IOTC camera with local TCP port 8800 disabled.
+        """
+        ip_key = (ip or "").strip()
+        dev_key = str(device_id or "").strip()
+        with cls._REGISTRY_LOCK:
+            if (ip_key and ip_key in cls._DETECTED_HSC_DEVICES) or (
+                dev_key and dev_key != "0" and dev_key in cls._DETECTED_HSC_DEVICES
+            ):
+                return True
+            if (ip_key and ip_key in cls._DETECTED_LAN_DEVICES) or (
+                dev_key and dev_key != "0" and dev_key in cls._DETECTED_LAN_DEVICES
+            ):
+                return False
+            last_neg = cls._NEGATIVE_PROBE_TS.get(ip_key, 0.0)
+            if ip_key and (time.monotonic() - last_neg) < 20.0:
+                return False
+
+        # 1. Fast local TCP 8800 check: legacy Gen-2 cameras answer in ~10ms
+        if ip_key and cls._probe_tcp_8800_open(ip_key, timeout_sec=0.55):
+            with cls._REGISTRY_LOCK:
+                cls._DETECTED_LAN_DEVICES.add(ip_key)
+                if dev_key and dev_key != "0":
+                    cls._DETECTED_LAN_DEVICES.add(dev_key)
+            return False
+
+        # 2. Local UDP NVDEVSEARCH^100 check (`NVDEVRESULT^300` vs `NVDEVRESULT^200`)
+        if ip_key:
+            cam = cls.query_single_ip(ip_key, timeout_sec=0.75)
+            if cam is not None:
+                return cam.protocol == "hsc"
+
+        # 3. Fallback when HSC camera's UDP 10008 listener is asleep in idle standby:
+        #    If the IP is alive on the LAN (ICMP ping OK) with TCP 8800 closed, AND legacy
+        #    Platform-10001 relay reports `sub == -1, ver == 2`, it is a Platform-2 HSC camera.
+        if ip_key and dev_key.isdigit() and int(dev_key) > 0:
+            if cls._is_lan_ip_reachable(ip_key):
+                p1 = cls._probe_legacy_platform1_status(int(dev_key))
+                if p1 is not None:
+                    sub, ver = p1
+                    if sub == -1 and ver == 2:
+                        with cls._REGISTRY_LOCK:
+                            cls._DETECTED_HSC_DEVICES.add(ip_key)
+                            cls._DETECTED_HSC_DEVICES.add(dev_key)
+                        return True
+                    if sub > 0:
+                        with cls._REGISTRY_LOCK:
+                            cls._DETECTED_LAN_DEVICES.add(ip_key)
+                            cls._DETECTED_LAN_DEVICES.add(dev_key)
+                        return False
+
+        if ip_key:
+            with cls._REGISTRY_LOCK:
+                cls._NEGATIVE_PROBE_TS[ip_key] = time.monotonic()
+        return False
+
+    @classmethod
+    def query_single_ip(cls, target_ip: str, timeout_sec: float = 0.95) -> Optional[DiscoveredCamera]:
+        """Send targeted unicast UDP `NVDEVSEARCH^100` to a single IP and wait for `NVDEVRESULT`."""
+        with cls._UDP_PROBE_LOCK:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            cls._configure_udp_socket(sock)
             try:
-                sock.close()
-            except Exception:
-                pass
+                try:
+                    sock.bind(("0.0.0.0", 10009))
+                except OSError:
+                    sock.bind(("0.0.0.0", 0))
+                sock.settimeout(0.05)
+
+                deadline = time.monotonic() + max(0.25, timeout_sec)
+                next_send = 0.0
+                while time.monotonic() < deadline:
+                    now = time.monotonic()
+                    if now >= next_send:
+                        try:
+                            sock.sendto(cls.SEARCH_CMD, (target_ip, 10008))
+                            sock.sendto(cls.SEARCH_CMD.ljust(128, b"\x00"), (target_ip, 10008))
+                        except Exception:
+                            pass
+                        next_send = now + 0.20
+                    try:
+                        data, addr = sock.recvfrom(2048)
+                        cam = cls._parse_nvdevresult(data, addr[0], method="UDP Unicast Scan")
+                        if cam and (cam.ip == target_ip or addr[0] == target_ip):
+                            return cam
+                    except socket.timeout:
+                        continue
+                    except Exception:
+                        continue
+            finally:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
         return None
 
     @classmethod
@@ -453,7 +671,8 @@ class LanCameraDiscovery:
                         except Exception:
                             pass
                     _drain_replies(0.025, "UDP Unicast Scan")
-                _drain_replies(max(0.25, timeout_sec * 0.18), "UDP Unicast Scan")
+                tail_wait = 0.30 if pass_idx == 0 else max(0.65, timeout_sec * 0.32)
+                _drain_replies(tail_wait, "UDP Unicast Scan")
         finally:
             for sock in socks:
                 try:
@@ -486,25 +705,52 @@ class LanCameraDiscovery:
 
         return sorted(devices_by_ip.values(), key=lambda c: c.ip)
 
-    @staticmethod
+    @classmethod
     def _parse_nvdevresult(
-        raw: bytes, source_ip: str, method: str = "UDP Broadcast"
+        cls, raw: bytes, source_ip: str, method: str = "UDP Broadcast"
     ) -> Optional[DiscoveredCamera]:
         text = raw.decode("ascii", errors="ignore").strip("\x00\r\n ")
         parts = text.split("^")
         if len(parts) < 13 or parts[0] != "NVDEVRESULT":
             return None
 
+        ver_tag = parts[1].strip()
         mac = parts[2].strip().lower()
         ip = parts[3].strip() or source_ip
+        port_str = parts[9].strip() if len(parts) > 9 else "8800"
         dev_id = parts[12].strip()
+        plat_gen = parts[14].strip() if len(parts) > 14 else ""
+
+        is_hsc = ver_tag == "300" or (port_str == "0" and plat_gen == "2")
+        proto = "hsc" if is_hsc else "lan8800"
+        port = int(port_str) if (port_str.isdigit() and int(port_str) > 0) else 8800
+
+        with cls._REGISTRY_LOCK:
+            target_set = cls._DETECTED_HSC_DEVICES if is_hsc else cls._DETECTED_LAN_DEVICES
+            other_set = cls._DETECTED_LAN_DEVICES if is_hsc else cls._DETECTED_HSC_DEVICES
+            if ip:
+                target_set.add(ip)
+                other_set.discard(ip)
+                cls._NEGATIVE_PROBE_TS.pop(ip, None)
+            if dev_id and dev_id != "0":
+                target_set.add(dev_id)
+                other_set.discard(dev_id)
+
+        if not mac and ip:
+            mac = cls._lookup_arp_mac(ip)
+
+        method_label = method
+        if is_hsc and "HSC" not in method_label:
+            method_label = f"{method_label} (V380 Cloud / HSC)"
+
         return DiscoveredCamera(
             dev_id=dev_id,
             ip=ip,
             mac=mac,
-            port=8800,
+            port=port,
             name=f"Camera ({dev_id})" if dev_id else f"Camera ({ip})",
-            discovery_method=method,
+            discovery_method=method_label,
+            protocol=proto,
         )
 
     @staticmethod
@@ -2059,9 +2305,12 @@ class LanCameraClient:
                                     timestamp=fts,
                                 )
                             )
-                        elif ftype in (21, 22, 24, 25, 26) and self.enable_audio:
+                        elif ftype in (20, 21, 22, 23, 24, 25, 26, 27) and self.enable_audio:
                             if need_decrypt and len(fbody) >= 16:
-                                self._decrypt_audio_frame(fbody)
+                                if self.communication_version == 21:
+                                    self._decrypt_media_pre2k(fbody, mode=1)
+                                else:
+                                    self._decrypt_audio_frame(fbody)
                             if ftype == 24 or (
                                 len(fbody) >= 4 and fbody[0] == 0xFF and (fbody[1] & 0xF0) == 0xF0
                             ):
@@ -2116,3 +2365,1953 @@ class LanCameraClient:
                 except Exception:
                     pass
             self._close_stream_sock()
+
+
+# ===========================================================================
+# V380 Gen-3 HSC / Cloud IOTC Protocol Implementation (`NVDEVRESULT^300`)
+# ===========================================================================
+_X25519_P = (1 << 255) - 19
+_X25519_A24 = 121665  # (486662 - 2) // 4 per RFC 7748 Section 5
+
+
+def _x25519_cswap(swap: int, x2: int, x3: int) -> Tuple[int, int]:
+    mask = (-swap) & (x2 ^ x3)
+    return x2 ^ mask, x3 ^ mask
+
+
+def x25519(private_bytes: bytes, peer_public_bytes: bytes) -> bytes:
+    """Pure-Python RFC 7748 Section 5 X25519 scalar multiplication."""
+    if len(private_bytes) != 32 or len(peer_public_bytes) != 32:
+        raise ValueError("X25519 keys must be exactly 32 bytes")
+
+    k_buf = bytearray(private_bytes)
+    k_buf[0] &= 248
+    k_buf[31] &= 127
+    k_buf[31] |= 64
+    k = int.from_bytes(k_buf, "little")
+
+    u_buf = bytearray(peer_public_bytes)
+    u_buf[31] &= 127
+    u = int.from_bytes(u_buf, "little")
+
+    p = _X25519_P
+    a24 = _X25519_A24
+
+    x1 = u
+    x2 = 1
+    z2 = 0
+    x3 = u
+    z3 = 1
+    swap = 0
+
+    for t in range(254, -1, -1):
+        kt = (k >> t) & 1
+        swap ^= kt
+        x2, x3 = _x25519_cswap(swap, x2, x3)
+        z2, z3 = _x25519_cswap(swap, z2, z3)
+        swap = kt
+
+        a = (x2 + z2) % p
+        aa = (a * a) % p
+        b = (x2 - z2) % p
+        bb = (b * b) % p
+        e = (aa - bb) % p
+        c = (x3 + z3) % p
+        d = (x3 - z3) % p
+        da = (d * a) % p
+        cb = (c * b) % p
+        x3 = pow(da + cb, 2, p)
+        z3 = (x1 * pow(da - cb, 2, p)) % p
+        x2 = (aa * bb) % p
+        z2 = (e * (aa + a24 * e)) % p
+
+    x2, x3 = _x25519_cswap(swap, x2, x3)
+    z2, z3 = _x25519_cswap(swap, z2, z3)
+    res = (x2 * pow(z2, p - 2, p)) % p
+    return res.to_bytes(32, "little")
+
+
+def x25519_public_from_private(private_bytes: bytes) -> bytes:
+    """Derive 32-byte X25519 public key from 32-byte private key material."""
+    base_point = (9).to_bytes(32, "little")
+    return x25519(private_bytes, base_point)
+
+
+class _HscAuthError(Exception):
+    """Raised when V380 Cloud rejects account credentials or authorization."""
+
+
+class HscCameraClient:
+    """
+    V380 Gen-3 HSC (`NVDEVRESULT^300`, Platform 20001) Cloud + IOTC Camera Client.
+
+    Supports newer V380 Pro cameras (e.g. Allwinner HSC models) that disable local
+    TCP port 8800 and authenticate via V380 Pro account login + X25519 key exchange
+    + IOTC selective-AES-128-CBC media streaming.
+    """
+
+    API_BASE = "https://mapi.av380.net"
+    EXCH_URL = "http://secret.av380.net/v1/app/exch"
+    DISPATCH_URL = "http://dispatch.av380.net:8001/api/v1/get_stream_server"
+
+    _APP_LOGIN_AES_KEY = b"1234567890123456"
+    _APP_SIGN_SALT = "hsshop2016"
+    _DISPATCH_SALT = "hsdata2022"
+    _MR_SIGN_SALT = "2021Mr"
+
+    # IOTC Commands & Method IDs
+    IOTC_CMD_JSON_REQ = 0x38030818
+    IOTC_CMD_MEDIA = 0x38030820
+    IOTC_CMD_JSON_PUSH = 0x38030822
+
+    METHOD_KEY_EXCH = 0x30102     # 196866
+    METHOD_KEEPALIVE = 0x30200    # 197120
+    METHOD_LIVE_START = 0x30202   # 197122
+    METHOD_MEDIA_INFO = 0x30204   # 197124
+    METHOD_SD_LIST = 0x30220      # 197152
+    METHOD_SD_REPLAY = 0x30222    # 197154
+    METHOD_SD_INFO = 0x30224      # 197156
+    METHOD_SD_STOP = 0x30990      # 199056
+    METHOD_PROP_READ = 0x30300    # 197376
+    METHOD_PROP_WRITE = 0x30302   # 197378
+    METHOD_ACTION = 0x30308       # 197384
+
+    DAID_PTZ = 0x60200            # 393728
+    DPID_WHITE_LIGHT = 0x50100    # 327936
+    DPID_NIGHT_VISION = 0x80105   # 524549
+
+    # Shared process-wide account & key-session caches (prevents login rate-limiting)
+    _GLOBAL_LOCK = threading.Lock()
+    _REJECTED_CREDS: Dict[Tuple[str, str], str] = {}
+    _ACCOUNT_CACHE: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    _DEVICE_SESSIONS: Dict[int, Dict[str, Any]] = {}
+    _DISPATCH_CACHE: Dict[int, Tuple[float, List[Dict[str, Any]]]] = {}
+
+    def __init__(
+        self,
+        ip: str,
+        port: int = 8800,
+        device_id: int | str = 0,
+        username: str = "admin",
+        password: str = "",
+        stream_quality: int = 1,  # 1 = HD, 0 = SD
+        enable_audio: bool = True,
+        on_frame: Optional[Callable[[CameraFrame], None]] = None,
+        on_status: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        self.ip = (ip or "").strip()
+        self.port = int(port or 8800)
+        self.device_id = int(device_id) if str(device_id).strip().isdigit() else 0
+        self.username = (username or "").strip()
+        self.password = password or ""
+        self.stream_quality = 1 if int(stream_quality) else 0
+        self.enable_audio = bool(enable_audio)
+        self.on_frame = on_frame
+        self.on_status = on_status
+
+        self.frame_width: int = 1920
+        self.frame_height: int = 1080
+
+        self._sec_type: int = 2
+        self._sid: int = 0
+        self._aes_key: bytes = b"\x00" * 16
+        self._aes_iv: bytes = b"\x00" * 16
+        self._rk_bytes: bytes = b""
+        self._sub_server: str = ""
+        self._video_codec_hint: VideoCodec = VideoCodec.H265
+        self._audio_codec_id: int = 101  # 101 = IMA-ADPCM, 100 = PCM16
+        self._audio_sample_rate: int = 16000
+        self._locked_video_stream: Optional[int] = None
+
+        self._stream_sock: Optional[socket.socket] = None
+        self._send_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._need_reconnect = False
+        self._force_cloud_wake = False
+        self._last_video_frame_mono: float = 0.0
+        self._last_keepalive_mono: float = 0.0
+        self._req_seq: int = random.randint(1000, 50000)
+
+    # --- Helpers & Cryptography ---
+    @staticmethod
+    def _compact_json(obj: Any) -> str:
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+    @staticmethod
+    def _md5_hex(text: str) -> str:
+        return hashlib.md5(text.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _pkcs7_pad(data: bytes, block_size: int = 16) -> bytes:
+        pad_len = block_size - (len(data) % block_size)
+        return data + bytes([pad_len]) * pad_len
+
+    @staticmethod
+    def _pkcs7_unpad(data: bytes, block_size: int = 16) -> bytes:
+        if not data or (len(data) % block_size) != 0:
+            raise ValueError("Invalid PKCS#7 block length")
+        pad_len = data[-1]
+        if pad_len < 1 or pad_len > block_size:
+            raise ValueError("Invalid PKCS#7 pad value")
+        if data[-pad_len:] != bytes([pad_len]) * pad_len:
+            raise ValueError("Corrupt PKCS#7 padding")
+        return data[:-pad_len]
+
+    @classmethod
+    def _encode_login_password(cls, password: str) -> str:
+        padded = cls._pkcs7_pad(password.encode("utf-8"), 16)
+        return AES.new(cls._APP_LOGIN_AES_KEY, AES.MODE_ECB).encrypt(padded).hex()
+
+    @classmethod
+    def _mr_signature(cls, compact_body: str, timestamp: int) -> str:
+        inner = cls._md5_hex(compact_body + str(timestamp))
+        return cls._md5_hex(inner + cls._MR_SIGN_SALT)
+
+    @staticmethod
+    def _cred_key(username: str, password: str) -> Tuple[str, str]:
+        pw_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        return (username.strip(), pw_hash)
+
+    def _next_req_id(self) -> int:
+        self._req_seq = (self._req_seq + 1) & 0x7FFFFFFF
+        if self._req_seq == 0:
+            self._req_seq = 1
+        return self._req_seq
+
+    def _emit_status(self, msg: str) -> None:
+        if self.on_status:
+            try:
+                self.on_status(msg)
+            except Exception:
+                pass
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._close_stream_sock()
+
+    def _close_stream_sock(self) -> None:
+        sock = self._stream_sock
+        self._stream_sock = None
+        if sock is not None:
+            def _do_close(s: socket.socket = sock) -> None:
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
+            if threading.current_thread() is threading.main_thread():
+                threading.Thread(target=_do_close, daemon=True).start()
+            else:
+                _do_close()
+
+    def _wake_lan_udp(self, burst_count: int = 2) -> None:
+        """Wake Wi-Fi radio from DTIM power-save on the local subnet if reachable."""
+        if not self.ip:
+            return
+        padded_cmd = LanCameraDiscovery.SEARCH_CMD.ljust(128, b"\x00")
+        targets = [(self.ip, 10008)]
+        parts = self.ip.split(".")
+        if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+            bcast_ip = f"{parts[0]}.{parts[1]}.{parts[2]}.255"
+            if bcast_ip != self.ip:
+                targets.append((bcast_ip, 10008))
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as s:
+                LanCameraDiscovery._configure_udp_socket(s)
+                try:
+                    s.bind(("0.0.0.0", 10009))
+                except OSError:
+                    pass
+                for _ in range(max(1, burst_count)):
+                    for dst in targets:
+                        try:
+                            s.sendto(LanCameraDiscovery.SEARCH_CMD, dst)
+                            s.sendto(padded_cmd, dst)
+                        except Exception:
+                            pass
+                    time.sleep(0.02)
+        except Exception:
+            pass
+
+    def send_wake_pulse(self) -> None:
+        self._wake_lan_udp(burst_count=1)
+        sock = self._stream_sock
+        if sock is not None and (self._sid > 0 or self._sec_type in (0, 1)):
+            try:
+                self._send_iotc_json(
+                    sock,
+                    self.METHOD_KEEPALIVE,
+                    {"flag": 2, "tms1": 0, "decode_tms": 0},
+                )
+                self._last_keepalive_mono = time.monotonic()
+            except Exception:
+                pass
+
+    def trigger_wake_reconnect(self) -> None:
+        self._force_cloud_wake = True
+        self._need_reconnect = True
+        self._close_stream_sock()
+
+    def set_stream_quality(self, quality: int) -> None:
+        new_q = 1 if int(quality) else 0
+        self.stream_quality = new_q
+        sock = self._stream_sock
+        if sock is not None and (self._sid > 0 or self._sec_type in (0, 1)):
+            try:
+                self._send_iotc_json(
+                    sock,
+                    self.METHOD_LIVE_START,
+                    {
+                        "up": {
+                            "quality": new_q,
+                            "video": 1,
+                            "audio": 1 if self.enable_audio else 0,
+                            "IDRreq": 1,
+                        }
+                    },
+                )
+                self._emit_status(f"Streaming {'HD' if new_q else 'SD'} (V380 HSC)")
+                return
+            except Exception:
+                pass
+        self._need_reconnect = True
+        self._close_stream_sock()
+
+    # --- HTTP JSON Helpers ---
+    @classmethod
+    def _http_post_json(
+        cls,
+        url: str,
+        body_obj: Dict[str, Any],
+        extra_headers: Optional[Dict[str, str]] = None,
+        timeout: float = 10.0,
+    ) -> Tuple[Dict[str, Any], str]:
+        raw_str = cls._compact_json(body_obj)
+        raw_bytes = raw_str.encode("utf-8")
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+            "Accept": "application/json",
+            "User-Agent": "okhttp/4.9.3",
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+        req = urllib.request.Request(url, data=raw_bytes, headers=headers, method="POST")
+        ctx = ssl.create_default_context() if url.startswith("https://") else None
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                resp_bytes = resp.read(8 * 1024 * 1024)
+            parsed = json.loads(resp_bytes.decode("utf-8", errors="replace"))
+            if not isinstance(parsed, dict):
+                raise RuntimeError("Unexpected JSON format from V380 Cloud")
+            return parsed, raw_str
+        except urllib.error.HTTPError as he:
+            if he.code in (401, 403):
+                raise _HscAuthError(f"V380 Cloud HTTP {he.code} authorization rejected") from None
+            raise RuntimeError(f"V380 Cloud HTTP {he.code}") from None
+        except urllib.error.URLError as ue:
+            raise RuntimeError(f"Cannot reach V380 Cloud ({ue.reason})") from None
+
+    # --- Account Login, Public Key Discovery & X25519 Session ---
+    def _has_app_credentials(self) -> bool:
+        u = self.username.strip()
+        if not u or not self.password:
+            return False
+        if u.lower() == "admin":
+            return False
+        if self.device_id > 0 and u == str(self.device_id):
+            return False
+        return True
+
+    def _resolve_device_id_if_missing(self) -> bool:
+        if self.device_id > 0:
+            return True
+        if not self.ip:
+            return False
+        self._emit_status("Discovering HSC Device ID...")
+        cam = LanCameraDiscovery.query_single_ip(self.ip, timeout_sec=1.0)
+        if cam and cam.dev_id.isdigit():
+            self.device_id = int(cam.dev_id)
+            return True
+        return False
+
+    @classmethod
+    def _decode_pubkey_b64(cls, val: Any) -> Optional[bytes]:
+        if not isinstance(val, str) or len(val.strip()) < 40:
+            return None
+        try:
+            raw = base64.b64decode(val.strip())
+            if len(raw) == 32 and raw != (b"\x00" * 32):
+                return raw
+        except Exception:
+            pass
+        return None
+
+    @classmethod
+    def _extract_device_meta_map(cls, obj: Any, out_map: Dict[int, Dict[str, Any]]) -> None:
+        """Extract device metadata (`pk_bytes`, `ike`, `rk_bytes`, `sub_server`, `model`, `pver`) from API JSON."""
+        now_m = time.monotonic()
+        if isinstance(obj, dict):
+            did_val = obj.get("device_id")
+            if did_val is None:
+                did_val = obj.get("dev_id") if obj.get("dev_id") is not None else obj.get("deviceid")
+            if did_val is not None and str(did_val).strip().isdigit():
+                did_int = int(str(did_val).strip())
+                if did_int > 0:
+                    entry = out_map.setdefault(
+                        did_int,
+                        {
+                            "pk_bytes": None,
+                            "ike": 0,
+                            "rk_bytes": b"",
+                            "sub_server": "",
+                            "model": "",
+                            "pver": 0,
+                            "checked_mono": now_m,
+                        },
+                    )
+                    entry["checked_mono"] = now_m
+                    for k_name in ("public_key", "pKey", "p_key", "publicKey"):
+                        pk = cls._decode_pubkey_b64(obj.get(k_name))
+                        if pk is not None:
+                            entry["pk_bytes"] = pk
+                            entry["ike"] = 1
+                            break
+                    if "ike" in obj and obj.get("ike") is not None:
+                        try:
+                            entry["ike"] = int(obj["ike"])
+                        except Exception:
+                            pass
+                    rk_val = obj.get("rk")
+                    if isinstance(rk_val, str):
+                        rk_b = rk_val.encode("utf-8")
+                        if len(rk_b) == 16:
+                            entry["rk_bytes"] = rk_b
+                    sub_srv = obj.get("sub_server")
+                    if isinstance(sub_srv, str) and sub_srv.strip():
+                        entry["sub_server"] = sub_srv.strip()
+                    mdl = obj.get("model")
+                    if isinstance(mdl, str) and mdl.strip():
+                        entry["model"] = mdl.strip()
+                    if obj.get("pver") is not None:
+                        try:
+                            entry["pver"] = int(obj["pver"])
+                        except Exception:
+                            pass
+            for v in obj.values():
+                if isinstance(v, (dict, list)):
+                    cls._extract_device_meta_map(v, out_map)
+                elif isinstance(v, str) and len(v) > 24 and v.startswith(("eyJ", "{")):
+                    try:
+                        decoded_str = v if v.startswith("{") else base64.b64decode(v).decode("utf-8")
+                        cls._extract_device_meta_map(json.loads(decoded_str), out_map)
+                    except Exception:
+                        pass
+        elif isinstance(obj, list):
+            for item in obj:
+                if isinstance(item, str) and len(item) > 24:
+                    try:
+                        decoded_str = item if item.startswith("{") else base64.b64decode(item).decode("utf-8")
+                        item = json.loads(decoded_str)
+                    except Exception:
+                        continue
+                cls._extract_device_meta_map(item, out_map)
+
+    def _ensure_account_token_and_pubkey(
+        self, force_renew_pubkey: bool = False, force_relogin: bool = False
+    ) -> Tuple[str, Optional[bytes], Dict[str, Any]]:
+        ckey = self._cred_key(self.username, self.password)
+        with self._GLOBAL_LOCK:
+            rejected_msg = self._REJECTED_CREDS.get(ckey)
+            if rejected_msg:
+                raise _HscAuthError(rejected_msg)
+            acct = self._ACCOUNT_CACHE.get(ckey)
+            if acct is None:
+                acct = {
+                    "lock": threading.Lock(),
+                    "access_token": "",
+                    "pubkeys": {},
+                    "dev_meta": {},
+                    "login_mono": 0.0,
+                }
+                self._ACCOUNT_CACHE[ckey] = acct
+
+        with acct["lock"]:
+            with self._GLOBAL_LOCK:
+                rejected_msg = self._REJECTED_CREDS.get(ckey)
+                if rejected_msg:
+                    raise _HscAuthError(rejected_msg)
+
+            if force_relogin:
+                acct["access_token"] = ""
+
+            if not acct["access_token"]:
+                self._emit_status("Signing in to V380 Pro Cloud...")
+                ts = int(time.time())
+                enc_pw = self._encode_login_password(self.password)
+                sign = self._md5_hex(
+                    f"password={enc_pw}&phonetoken=100&timestamp={ts}&username={self.username}{self._APP_SIGN_SALT}"
+                )
+                login_body = {
+                    "username": self.username,
+                    "password": enc_pw,
+                    "phonetoken": "100",
+                    "sign": sign,
+                    "timestamp": ts,
+                }
+                resp, _ = self._http_post_json(f"{self.API_BASE}/user/login", login_body, timeout=12.0)
+                res_code = resp.get("result")
+                err_code = int(resp.get("error_code") or 0)
+                if res_code != 0 or err_code != 0:
+                    if err_code in (21004, 21005, 21006, 21007):
+                        rem = resp.get("remaining_time")
+                        rem_note = f" ({rem} tries left)" if isinstance(rem, int) and rem > 0 else ""
+                        msg = f"Invalid V380 Pro account or password{rem_note} — update in Camera Settings"
+                        with self._GLOBAL_LOCK:
+                            self._REJECTED_CREDS[ckey] = msg
+                        raise _HscAuthError(msg)
+                    raise RuntimeError(f"V380 Cloud login error (result={res_code}, code={err_code})")
+
+                data_obj = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+                token = str(data_obj.get("access_token") or "").strip()
+                if not token:
+                    raise RuntimeError("V380 Cloud login returned empty access_token")
+                acct["access_token"] = token
+                acct["login_mono"] = time.monotonic()
+
+            token = acct["access_token"]
+            dev_meta_map: Dict[int, Dict[str, Any]] = acct.setdefault("dev_meta", {})
+            existing_meta = dev_meta_map.get(self.device_id)
+            cached_pk: Optional[bytes] = None if force_renew_pubkey else acct["pubkeys"].get(self.device_id)
+            if not force_renew_pubkey and existing_meta is not None:
+                if cached_pk is not None and len(cached_pk) == 32:
+                    return token, cached_pk, dict(existing_meta)
+                if (
+                    cached_pk is None
+                    and int(existing_meta.get("ike") or 0) == 0
+                    and (time.monotonic() - float(existing_meta.get("checked_mono") or 0.0)) < 25.0
+                ):
+                    return token, None, dict(existing_meta)
+
+            # 1. Try /device/renew-public-key first when explicitly refreshing session keys
+            if force_renew_pubkey and existing_meta is not None:
+                self._emit_status("Waking HSC camera via V380 Cloud...")
+                pk_renewed, ike_renewed = self._request_renew_pubkey_info(token)
+                if pk_renewed is not None:
+                    acct["pubkeys"][self.device_id] = pk_renewed
+                    existing_meta["pk_bytes"] = pk_renewed
+                    existing_meta["ike"] = 1
+                    existing_meta["checked_mono"] = time.monotonic()
+                    return token, pk_renewed, dict(existing_meta)
+
+            # 2. Query /device/list (get_sub_server=10 so regional sub_server is populated)
+            resp_list: Dict[str, Any] = {}
+            for list_try in range(2):
+                ts = int(time.time())
+                canon = (
+                    f"accesstoken={token}&from_app=V380Pro&get_sub_server=10"
+                    f"&language=en&registrationid=&timestamp={ts}&type=all&ver=1008"
+                )
+                list_body = {
+                    "accesstoken": token,
+                    "from_app": "V380Pro",
+                    "get_sub_server": 10,
+                    "language": "en",
+                    "registrationid": "",
+                    "sign": self._md5_hex(canon + self._APP_SIGN_SALT),
+                    "timestamp": ts,
+                    "type": "all",
+                    "ver": 1008,
+                }
+                resp_list, _ = self._http_post_json(f"{self.API_BASE}/device/list", list_body, timeout=12.0)
+                err_list = int(resp_list.get("error_code") or 0)
+                if err_list == 21011 and not force_relogin:
+                    acct["access_token"] = ""
+                    return self._ensure_account_token_and_pubkey(
+                        force_renew_pubkey=force_renew_pubkey, force_relogin=True
+                    )
+
+                if resp_list.get("renew_token") is True:
+                    try:
+                        ts_r = int(time.time())
+                        r_resp, _ = self._http_post_json(
+                            f"{self.API_BASE}/user/get-new-token",
+                            {
+                                "accesstoken": token,
+                                "timestamp": ts_r,
+                                "sign": self._md5_hex(f"accesstoken={token}&timestamp={ts_r}{self._APP_SIGN_SALT}"),
+                            },
+                            timeout=10.0,
+                        )
+                        new_tok = str(r_resp.get("access_token") or "").strip()
+                        if new_tok:
+                            token = new_tok
+                            acct["access_token"] = new_tok
+                    except Exception:
+                        pass
+
+                self._extract_device_meta_map(resp_list, dev_meta_map)
+                for did_k, m_val in dev_meta_map.items():
+                    pk_b = m_val.get("pk_bytes")
+                    if isinstance(pk_b, bytes) and len(pk_b) == 32:
+                        acct["pubkeys"][did_k] = pk_b
+
+                if self.device_id in dev_meta_map:
+                    break
+                if resp_list.get("result") in (10005, 10007) and list_try == 0:
+                    time.sleep(0.7)
+                    continue
+                break
+
+            meta = dev_meta_map.get(self.device_id)
+            if meta is None:
+                list_res = resp_list.get("result")
+                if list_res not in (0, None):
+                    raise RuntimeError(f"V380 Cloud device list incomplete (result={list_res})")
+                raise _HscAuthError(
+                    f"Camera {self.device_id} not found in this V380 Pro account — verify account in Settings"
+                )
+
+            if meta.get("sub_server"):
+                self._sub_server = str(meta["sub_server"])
+            if meta.get("rk_bytes"):
+                self._rk_bytes = bytes(meta["rk_bytes"])
+
+            pk_bytes: Optional[bytes] = meta.get("pk_bytes") or acct["pubkeys"].get(self.device_id)
+            if pk_bytes is None or force_renew_pubkey:
+                self._emit_status("Waking HSC camera via V380 Cloud...")
+                pk_renewed, ike_renewed = self._request_renew_pubkey_info(token)
+                if pk_renewed is not None:
+                    pk_bytes = pk_renewed
+                    meta["pk_bytes"] = pk_renewed
+                    meta["ike"] = 1
+                elif ike_renewed is not None and pk_bytes is None:
+                    meta["ike"] = ike_renewed
+
+            meta["checked_mono"] = time.monotonic()
+            if pk_bytes is not None and len(pk_bytes) == 32:
+                acct["pubkeys"][self.device_id] = pk_bytes
+                return token, pk_bytes, dict(meta)
+
+            # Camera is bound to account with ike=0 / public_key=False (uses rk / plain IOTC or is asleep)
+            if int(meta.get("ike") or 0) == 0:
+                return token, None, dict(meta)
+
+            raise RuntimeError(f"Camera {self.device_id} is asleep/offline (no X25519 session key published)")
+
+    def _request_renew_pubkey_info(self, token: str) -> Tuple[Optional[bytes], Optional[int]]:
+        try:
+            ts = int(time.time())
+            sign = self._md5_hex(f"accesstoken={token}&deviceid={self.device_id}&timestamp={ts}{self._APP_SIGN_SALT}")
+            body = {
+                "accesstoken": token,
+                "deviceid": int(self.device_id),
+                "timestamp": ts,
+                "sign": sign,
+            }
+            resp, _ = self._http_post_json(f"{self.API_BASE}/device/renew-public-key", body, timeout=10.0)
+            ike_val: Optional[int] = None
+            if resp.get("ike") is not None:
+                try:
+                    ike_val = int(resp["ike"])
+                except Exception:
+                    pass
+            elif isinstance(resp.get("data"), dict) and resp["data"].get("ike") is not None:
+                try:
+                    ike_val = int(resp["data"]["ike"])
+                except Exception:
+                    pass
+            for k_name in ("public_key", "pKey", "p_key", "publicKey"):
+                pk = self._decode_pubkey_b64(resp.get(k_name))
+                if pk is not None:
+                    return pk, 1
+                if isinstance(resp.get("data"), dict):
+                    pk = self._decode_pubkey_b64(resp["data"].get(k_name))
+                    if pk is not None:
+                        return pk, 1
+            tmp_map: Dict[int, Dict[str, Any]] = {}
+            self._extract_device_meta_map(resp, tmp_map)
+            if self.device_id in tmp_map and tmp_map[self.device_id].get("pk_bytes") is not None:
+                return tmp_map[self.device_id]["pk_bytes"], 1
+            return None, ike_val
+        except Exception:
+            return None, None
+
+    def _ensure_hsc_key_session(self, force_refresh: bool = False) -> Tuple[str, int, int, bytes, bytes]:
+        """
+        Ensure a valid HSC IOTC session `(access_token, sec_type, sid, aes_key, aes_iv)` for
+        `self.device_id`:
+          - `ike == 1` (`dev_pub` 32B): X25519 `/v1/app/exch` -> `sec_type = 2` (AES-128-CBC)
+          - `ike == 0` (`dev_pub is None`): `sec_type = 1` (AES-128-ECB via 16B `rk`) or `0` (plain)
+        """
+        with self._GLOBAL_LOCK:
+            sess = self._DEVICE_SESSIONS.get(self.device_id)
+            if sess is None:
+                sess = {
+                    "lock": threading.Lock(),
+                    "sec_type": 2,
+                    "ike0_sec_type": None,
+                    "sid": 0,
+                    "aes_key": b"",
+                    "aes_iv": b"",
+                    "created_mono": 0.0,
+                }
+                self._DEVICE_SESSIONS[self.device_id] = sess
+
+        with sess["lock"]:
+            token, dev_pub, dev_meta = self._ensure_account_token_and_pubkey(force_renew_pubkey=force_refresh)
+            if dev_meta.get("sub_server"):
+                self._sub_server = str(dev_meta["sub_server"])
+            if dev_meta.get("rk_bytes"):
+                self._rk_bytes = bytes(dev_meta["rk_bytes"])
+
+            if dev_pub is None:
+                rk_b = self._rk_bytes
+                pref_sec = sess.get("ike0_sec_type")
+                if pref_sec in (0, 1):
+                    sec_t = int(pref_sec)
+                else:
+                    sec_t = 1 if len(rk_b) == 16 else 0
+                use_key = rk_b if len(rk_b) == 16 else (b"\x00" * 16)
+                use_iv = b"\x00" * 16
+                self._sec_type = sec_t
+                self._sid = 0
+                self._aes_key = use_key
+                self._aes_iv = use_iv
+                return token, sec_t, 0, use_key, use_iv
+
+            age = time.monotonic() - float(sess.get("created_mono") or 0.0)
+            if (
+                not force_refresh
+                and sess.get("sec_type") == 2
+                and sess.get("sid", 0) > 0
+                and len(sess.get("aes_key", b"")) == 16
+                and len(sess.get("aes_iv", b"")) == 16
+                and age < 1800.0
+            ):
+                self._sec_type = 2
+                self._sid = int(sess["sid"])
+                self._aes_key = bytes(sess["aes_key"])
+                self._aes_iv = bytes(sess["aes_iv"])
+                return token, 2, self._sid, self._aes_key, self._aes_iv
+
+            self._wake_lan_udp(burst_count=2)
+            last_err = "HSC key exchange failed"
+            for attempt in range(2):
+                if attempt > 0:
+                    token, dev_pub, dev_meta = self._ensure_account_token_and_pubkey(force_renew_pubkey=True)
+                    if dev_pub is None:
+                        rk_b = self._rk_bytes
+                        sec_t = 1 if len(rk_b) == 16 else 0
+                        use_key = rk_b if len(rk_b) == 16 else (b"\x00" * 16)
+                        self._sec_type = sec_t
+                        self._sid = 0
+                        self._aes_key = use_key
+                        self._aes_iv = b"\x00" * 16
+                        return token, sec_t, 0, use_key, self._aes_iv
+                self._emit_status("Negotiating HSC X25519 session key...")
+                priv = secrets.token_bytes(32)
+                client_pub = x25519_public_from_private(priv)
+                shared = x25519(priv, dev_pub)
+                if shared == (b"\x00" * 32):
+                    last_err = "Invalid X25519 public key from camera"
+                    continue
+
+                md5_c = hashlib.md5(client_pub).digest()
+                md5_d = hashlib.md5(dev_pub).digest()
+                ds_bytes = bytes(a ^ b for a, b in zip(md5_c, md5_d))
+
+                ts = int(time.time())
+                body = {
+                    "mr": {"params": {"access_token": token, "device_id": int(self.device_id)}},
+                    "tr": {
+                        "id": self._next_req_id(),
+                        "method_id": self.METHOD_KEY_EXCH,
+                        "chn": 1,
+                        "ts": ts,
+                        "params": {
+                            "cKM": base64.b64encode(client_pub).decode("ascii"),
+                            "dS": base64.b64encode(ds_bytes).decode("ascii"),
+                        },
+                    },
+                    "timestamp": ts,
+                }
+                sig = self._mr_signature(self._compact_json(body), ts)
+                resp, _ = self._http_post_json(self.EXCH_URL, body, extra_headers={"Signature": sig}, timeout=12.0)
+
+                outer_code = resp.get("code")
+                tr = resp.get("tr") if isinstance(resp.get("tr"), dict) else {}
+                tr_res = tr.get("result") if isinstance(tr.get("result"), dict) else {}
+                inner_code = tr_res.get("code")
+                if outer_code == 1000 and inner_code == 1000:
+                    tr_data = tr.get("data") if isinstance(tr.get("data"), dict) else {}
+                    sid = int(tr_data.get("sid") or 0)
+                    aes_key = shared[:16]
+                    aes_iv = shared[16:32]
+                    sess["sec_type"] = 2
+                    sess["sid"] = sid
+                    sess["aes_key"] = aes_key
+                    sess["aes_iv"] = aes_iv
+                    sess["created_mono"] = time.monotonic()
+                    self._sec_type = 2
+                    self._sid = sid
+                    self._aes_key = aes_key
+                    self._aes_iv = aes_iv
+                    return token, 2, sid, aes_key, aes_iv
+
+                if outer_code in (21011, 1004, 401):
+                    token, dev_pub, _ = self._ensure_account_token_and_pubkey(
+                        force_renew_pubkey=True, force_relogin=True
+                    )
+                    if dev_pub is None:
+                        break
+                if outer_code == 1003:
+                    last_err = (
+                        f"Camera {self.device_id} is asleep/offline in V380 Cloud — "
+                        "open in V380 Pro app or power-cycle"
+                    )
+                else:
+                    last_err = f"Key exchange rejected (code={outer_code}, tr={inner_code})"
+
+            raise RuntimeError(last_err)
+
+    def _invalidate_hsc_key_session(self, clear_meta: bool = False) -> None:
+        ckey = self._cred_key(self.username, self.password)
+        with self._GLOBAL_LOCK:
+            sess = self._DEVICE_SESSIONS.get(self.device_id)
+            if sess is not None:
+                sess["sid"] = 0
+                sess["created_mono"] = 0.0
+            acct = self._ACCOUNT_CACHE.get(ckey) if clear_meta else None
+        if acct is not None:
+            with acct["lock"]:
+                acct.get("pubkeys", {}).pop(self.device_id, None)
+                meta = acct.get("dev_meta", {}).get(self.device_id)
+                if isinstance(meta, dict):
+                    meta["checked_mono"] = 0.0
+
+    # --- Dispatch & Relay Channel Allocation ---
+    def _get_dispatch_relays(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
+        now = time.monotonic()
+        if not force_refresh:
+            with self._GLOBAL_LOCK:
+                cached = self._DISPATCH_CACHE.get(self.device_id)
+                if cached and (now - cached[0]) < 120.0 and cached[1]:
+                    return list(cached[1])
+
+        dispatch_urls: List[str] = []
+        sub_srv = (self._sub_server or "").strip()
+        if sub_srv:
+            if ":" in sub_srv:
+                h_part, p_part = sub_srv.rsplit(":", 1)
+                d_port = int(p_part) if p_part.isdigit() else 8001
+                dispatch_urls.append(f"http://{h_part}:{d_port}/api/v1/get_stream_server")
+            else:
+                dispatch_urls.append(f"http://{sub_srv}:8001/api/v1/get_stream_server")
+        if self.DISPATCH_URL not in dispatch_urls:
+            dispatch_urls.append(self.DISPATCH_URL)
+
+        relays: List[Dict[str, Any]] = []
+        seen_relays: set[Tuple[str, int, int]] = set()
+        for d_url in dispatch_urls:
+            try:
+                ts = int(time.time())
+                sign_src = f"dev_id={self.device_id}&platform=20001&timestamp={ts}{self._DISPATCH_SALT}"
+                sign = hashlib.sha1(sign_src.encode("utf-8")).hexdigest()
+                body = {
+                    "dev_id": int(self.device_id),
+                    "platform": 20001,
+                    "timestamp": ts,
+                    "sign": sign,
+                }
+                resp, _ = self._http_post_json(d_url, body, timeout=7.0)
+                rows = resp.get("data")
+                if isinstance(rows, list):
+                    for item in rows:
+                        if not isinstance(item, dict):
+                            continue
+                        host = str(item.get("ip") or item.get("domain") or "").strip()
+                        if not host:
+                            continue
+                        tp = item.get("tp") if isinstance(item.get("tp"), dict) else {}
+                        call_port = int(tp.get("call_port") or 80)
+                        trans_port = int(tp.get("trans_port") or 32100)
+                        r_key = (host, call_port, trans_port)
+                        if r_key not in seen_relays:
+                            seen_relays.add(r_key)
+                            relays.append({"host": host, "call_port": call_port, "trans_port": trans_port})
+            except Exception:
+                continue
+
+        if not relays:
+            raise RuntimeError(f"No V380 HSC relay servers returned for {self.device_id}")
+        with self._GLOBAL_LOCK:
+            self._DISPATCH_CACHE[self.device_id] = (now, relays)
+        return relays
+
+    def _open_relay_channel(self, access_token: str, call_type: int) -> socket.socket:
+        """
+        Allocate an HSC channel (`call=2` live, `3` SD list, `5` SD replay) via `/v1/app/call`,
+        connect TCP to `trs_ip:trs_port`, and verify the 1500-byte `1100 -> 1101/1000` handshake.
+        """
+        self._wake_lan_udp(burst_count=2)
+        relays = self._get_dispatch_relays(force_refresh=False)
+        last_err = "Relay connection failed"
+
+        for pass_idx in range(2):
+            if pass_idx > 0:
+                relays = self._get_dispatch_relays(force_refresh=True)
+            saw_1003 = False
+            saw_other_err = False
+            for r_idx, r_info in enumerate(relays):
+                if self._stop_event.is_set():
+                    raise InterruptedError("Stopped")
+                # If multiple relays confirm 1003 ("not found" in MR registry), avoid hammering all backups
+                if saw_1003 and not saw_other_err and r_idx >= 3:
+                    break
+                host = r_info["host"]
+                call_port = r_info["call_port"]
+                default_trans_port = r_info["trans_port"]
+                try:
+                    ts = int(time.time())
+                    body = {
+                        "mr": {
+                            "params": {
+                                "access_token": access_token,
+                                "device_id": int(self.device_id),
+                                "call": int(call_type),
+                            }
+                        },
+                        "timestamp": ts,
+                    }
+                    sig = self._mr_signature(self._compact_json(body), ts)
+                    call_url = f"http://{host}:{call_port}/v1/app/call"
+                    resp, _ = self._http_post_json(
+                        call_url, body, extra_headers={"Signature": sig}, timeout=7.0
+                    )
+                    outer_code = resp.get("code")
+                    mr = resp.get("mr") if isinstance(resp.get("mr"), dict) else {}
+                    info: Dict[str, Any] = {}
+                    if isinstance(resp.get("data"), dict):
+                        info.update(resp["data"])
+                    if isinstance(mr.get("data"), dict):
+                        info.update(mr["data"])
+                    if isinstance(mr.get("result"), dict):
+                        info.update(mr["result"])
+
+                    ch_token = str(info.get("channel_token") or "").strip()
+                    if outer_code in (21011, 1004, 401) and not ch_token:
+                        ckey = self._cred_key(self.username, self.password)
+                        with self._GLOBAL_LOCK:
+                            acct = self._ACCOUNT_CACHE.get(ckey)
+                        if acct is not None:
+                            with acct["lock"]:
+                                acct["access_token"] = ""
+                        raise RuntimeError("V380 Cloud token expired — refreshing...")
+
+                    if outer_code == 1003 and not ch_token:
+                        saw_1003 = True
+                        last_err = (
+                            f"Camera {self.device_id} is asleep/offline in V380 Cloud — "
+                            "open in V380 Pro app or power-cycle"
+                        )
+                        continue
+                    if outer_code not in (None, 1000) and not ch_token:
+                        saw_other_err = True
+                        last_err = f"Relay call rejected (code={outer_code})"
+                        continue
+                    if not ch_token:
+                        mr_code = info.get("code", outer_code)
+                        if mr_code == 1003:
+                            saw_1003 = True
+                            last_err = (
+                                f"Camera {self.device_id} is asleep/offline in V380 Cloud — "
+                                "open in V380 Pro app or power-cycle"
+                            )
+                        else:
+                            saw_other_err = True
+                            last_err = f"Camera offline or busy (call code={mr_code})"
+                        continue
+
+                    trs_ip = str(info.get("app_trs_ip") or info.get("trs_ip") or host).strip()
+                    trs_port = int(info.get("app_trs_port") or info.get("trs_port") or default_trans_port)
+                    ch_handle = int(info.get("channel_handle") or 0)
+
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    try:
+                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 524288)
+                        LanCameraClient._configure_tcp_keepalive(sock)
+                        sock.settimeout(7.0)
+                        sock.connect((trs_ip, trs_port))
+
+                        hs = bytearray(1500)
+                        struct.pack_into(
+                            "<III",
+                            hs,
+                            0,
+                            1100,
+                            int(self.device_id) & 0xFFFFFFFF,
+                            ch_handle & 0xFFFFFFFF,
+                        )
+                        tok_b = ch_token.encode("utf-8")[:36]
+                        hs[12 : 12 + len(tok_b)] = tok_b
+                        sock.sendall(hs)
+
+                        ack = self._read_exact(sock, 64, timeout=7.0)
+                        if len(ack) < 8:
+                            raise RuntimeError("Short relay handshake reply")
+                        rcmd, rcode = struct.unpack_from("<II", ack, 0)
+                        if rcmd != 1101 or rcode != 1000:
+                            raise RuntimeError(f"Relay forward rejected ({rcmd}/{rcode})")
+                        return sock
+                    except Exception:
+                        try:
+                            sock.close()
+                        except Exception:
+                            pass
+                        raise
+                except InterruptedError:
+                    raise
+                except Exception as exc:
+                    saw_other_err = True
+                    last_err = str(exc)
+                    continue
+
+            if saw_1003 and not saw_other_err:
+                self._invalidate_hsc_key_session(clear_meta=True)
+                break
+
+        raise RuntimeError(last_err)
+
+    # --- IOTC Packet Transport & Selective AES Decryption ---
+    def _read_exact(
+        self,
+        sock: socket.socket,
+        count: int,
+        timeout: float = 8.0,
+        stop_event: Optional[threading.Event] = None,
+    ) -> bytes:
+        buf = bytearray()
+        deadline = time.monotonic() + timeout
+        prev_to = sock.gettimeout()
+        try:
+            while len(buf) < count:
+                if self._stop_event.is_set() or (stop_event is not None and stop_event.is_set()):
+                    return bytes(buf)
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    raise socket.timeout("Read timed out")
+                sock.settimeout(min(1.0, max(0.05, rem)))
+                try:
+                    chunk = sock.recv(count - len(buf))
+                except socket.timeout:
+                    if time.monotonic() >= deadline:
+                        raise
+                    continue
+                if not chunk:
+                    return bytes(buf)
+                buf.extend(chunk)
+            return bytes(buf)
+        finally:
+            try:
+                sock.settimeout(prev_to)
+            except Exception:
+                pass
+
+    def _send_iotc_json(
+        self,
+        sock: socket.socket,
+        method_id: int,
+        params: Dict[str, Any],
+        sid: Optional[int] = None,
+        aes_key: Optional[bytes] = None,
+        aes_iv: Optional[bytes] = None,
+        sec_type: Optional[int] = None,
+    ) -> int:
+        use_sid = self._sid if sid is None else int(sid)
+        use_key = self._aes_key if aes_key is None else aes_key
+        use_iv = self._aes_iv if aes_iv is None else aes_iv
+        use_sec = self._sec_type if sec_type is None else int(sec_type)
+
+        req_id = self._next_req_id()
+        envelope = {
+            "id": req_id,
+            "chn": 1,
+            "method_id": int(method_id),
+            "ts": int(time.time()),
+            "params": params,
+        }
+        plain = self._compact_json(envelope).encode("utf-8")
+        if use_sec == 0:
+            enc = plain
+        elif use_sec == 1:
+            enc = AES.new(use_key, AES.MODE_ECB).encrypt(self._pkcs7_pad(plain, 16))
+        else:
+            use_sec = 2
+            enc = AES.new(use_key, AES.MODE_CBC, iv=use_iv).encrypt(self._pkcs7_pad(plain, 16))
+
+        iotc_hdr = bytearray(16)
+        struct.pack_into("<I", iotc_hdr, 0, self.IOTC_CMD_JSON_REQ)
+        iotc_hdr[4] = 1
+        iotc_hdr[5] = use_sec & 0xFF  # 0=plain, 1=AES-128-ECB, 2=AES-128-CBC
+        iotc_hdr[6] = use_sid & 0xFF
+        struct.pack_into("<I", iotc_hdr, 12, len(enc))
+        iotc_pkt = bytes(iotc_hdr) + enc
+
+        trans_hdr = bytearray(64)
+        struct.pack_into("<II", trans_hdr, 0, 1200, len(iotc_pkt))
+        with self._send_lock:
+            sock.sendall(bytes(trans_hdr) + iotc_pkt)
+        return req_id
+
+    def _recv_iotc_packet(
+        self,
+        sock: socket.socket,
+        header_timeout: float = 1.2,
+        stop_event: Optional[threading.Event] = None,
+    ) -> Tuple[int, int, int, bytes]:
+        """
+        Read one incoming 16-byte IOTC header + payload.
+        Returns `(iotc_cmd, sec_type, pkt_sid, payload_bytes)`.
+        Raises `socket.timeout` if no packet arrives within `header_timeout` so callers
+        can service periodic keepalives cleanly.
+        """
+        hdr = self._read_exact(sock, 16, timeout=header_timeout, stop_event=stop_event)
+        if len(hdr) == 0:
+            raise EOFError("Relay socket closed")
+        if len(hdr) < 16:
+            raise EOFError("Incomplete IOTC header")
+
+        iotc_cmd = struct.unpack_from("<I", hdr, 0)[0]
+        sec_type = hdr[5]
+        pkt_sid = hdr[6]
+        plen = struct.unpack_from("<I", hdr, 12)[0]
+        if plen > 16 * 1024 * 1024:
+            raise RuntimeError(f"IOTC packet exceeds 16 MB limit ({plen})")
+        payload = b""
+        if plen > 0:
+            payload = self._read_exact(sock, plen, timeout=10.0, stop_event=stop_event)
+            if len(payload) < plen:
+                raise EOFError("Relay socket closed mid-payload")
+        return iotc_cmd, sec_type, pkt_sid, payload
+
+    @classmethod
+    def decrypt_iotc_json(
+        cls, sec_type: int, payload: bytes, aes_key: bytes, aes_iv: bytes
+    ) -> Dict[str, Any]:
+        if not payload:
+            return {}
+        if sec_type == 0:
+            raw = payload.rstrip(b"\x00")
+        elif sec_type == 1:
+            raw = cls._pkcs7_unpad(AES.new(aes_key, AES.MODE_ECB).decrypt(payload), 16)
+        elif sec_type == 2:
+            raw = cls._pkcs7_unpad(AES.new(aes_key, AES.MODE_CBC, iv=aes_iv).decrypt(payload), 16)
+        else:
+            raise ValueError(f"Unsupported IOTC JSON secure_type={sec_type}")
+        obj = json.loads(raw.decode("utf-8"))
+        if not isinstance(obj, dict):
+            raise ValueError("IOTC JSON payload is not an object")
+        return obj
+
+    @staticmethod
+    def decrypt_iotc_media(
+        sec_type: int, payload: bytes, aes_key: bytes, aes_iv: bytes
+    ) -> Optional[Tuple[int, int, int, int, int, bytes]]:
+        """
+        Decrypt 32-byte HSC media header + selective AES blocks with continuing cipher context.
+        Returns `(quality, mtype, seq, ts_ms, stream_idx, media_bytes)` or `None` if malformed.
+        """
+        if len(payload) < 32:
+            return None
+
+        if sec_type == 0:
+            decryptor = None
+            hdr = payload[:32]
+        elif sec_type == 1:
+            decryptor = AES.new(aes_key, AES.MODE_ECB)
+            hdr = decryptor.decrypt(payload[:32])
+        elif sec_type == 2:
+            decryptor = AES.new(aes_key, AES.MODE_CBC, iv=aes_iv)
+            hdr = decryptor.decrypt(payload[:32])
+        else:
+            return None
+
+        (
+            quality,
+            mtype,
+            seq,
+            length,
+            ts_ms,
+            enc_offset,
+            block_align,
+            skip,
+            stream_idx,
+            _reserved,
+        ) = struct.unpack_from("<BBIIqIIIBB", hdr, 0)
+
+        tail_len = len(payload) - 32
+        if length > tail_len:
+            return None
+        if block_align > 0 and (block_align % 16) != 0:
+            return None
+
+        data = bytearray(payload[32:])
+        if decryptor is not None and block_align > 0 and length > 0:
+            if mtype == 4:
+                # Audio: decrypt initial min(block_align, length) region (16-byte aligned)
+                enc_len = (min(block_align, length) // 16) * 16
+                if enc_len > 0:
+                    data[:enc_len] = decryptor.decrypt(bytes(data[:enc_len]))
+            else:
+                # Video: selective stride decryption starting at enc_offset with continuing CBC state
+                pos = min(enc_offset, length)
+                while pos + block_align <= length:
+                    data[pos : pos + block_align] = decryptor.decrypt(
+                        bytes(data[pos : pos + block_align])
+                    )
+                    pos += block_align + skip
+
+        return int(quality), int(mtype), int(seq), int(ts_ms), int(stream_idx), bytes(data[:length])
+
+    def _update_media_attrs(self, obj: Dict[str, Any]) -> None:
+        """Update video/audio codec & sample-rate attributes from `0x30204` or `0x30224`."""
+        containers = [obj]
+        for k in ("params", "data", "result"):
+            sub = obj.get(k)
+            if isinstance(sub, dict):
+                containers.append(sub)
+        for c in containers:
+            vattr = c.get("vattr")
+            if isinstance(vattr, dict):
+                vc = vattr.get("codec")
+                if vc == 5:
+                    self._video_codec_hint = VideoCodec.H265
+                elif vc in (1, 4):
+                    self._video_codec_hint = VideoCodec.H264
+                w = vattr.get("width") or vattr.get("w")
+                h = vattr.get("height") or vattr.get("h")
+                if isinstance(w, int) and 160 <= w <= 8192:
+                    self.frame_width = w
+                if isinstance(h, int) and 120 <= h <= 8192:
+                    self.frame_height = h
+            aattr = c.get("aattr")
+            if isinstance(aattr, dict):
+                ac = aattr.get("codec")
+                if isinstance(ac, int):
+                    self._audio_codec_id = ac
+                sr = aattr.get("samplerate") or aattr.get("sample_rate") or aattr.get("rate")
+                if isinstance(sr, int) and 4000 <= sr <= 48000:
+                    self._audio_sample_rate = sr
+
+    @staticmethod
+    def _inspect_annexb_video(payload: bytes, hint: VideoCodec) -> Optional[Tuple[bytes, VideoCodec, bool]]:
+        """Normalize Annex-B start codes and inspect NAL headers for ground-truth codec & keyframe."""
+        idx3 = payload.find(b"\x00\x00\x01")
+        if idx3 < 0:
+            return None
+        start = idx3 - 1 if (idx3 > 0 and payload[idx3 - 1] == 0) else idx3
+        norm = (b"\x00" + payload[start:]) if payload[start : start + 3] == b"\x00\x00\x01" else payload[start:]
+        if len(norm) < 5:
+            return None
+
+        detected_codec = VideoCodec.UNKNOWN
+        has_h264_key = False
+        has_h265_key = False
+        pos = 0
+        scanned = 0
+        n = len(norm)
+        while pos < n - 4 and scanned < 10:
+            sc = norm.find(b"\x00\x00\x01", pos)
+            if sc < 0:
+                break
+            nal_off = sc + 3
+            if nal_off >= n:
+                break
+            nal_b0 = norm[nal_off]
+            nal_b1 = norm[nal_off + 1] if (nal_off + 1) < n else 0
+            h265_t = (nal_b0 >> 1) & 0x3F
+            h264_t = nal_b0 & 0x1F
+
+            if (nal_b0 & 0x80) == 0 and nal_b1 == 0x01 and h265_t in (1, 19, 20, 21, 32, 33, 34):
+                if detected_codec == VideoCodec.UNKNOWN:
+                    detected_codec = VideoCodec.H265
+                if h265_t in (19, 20, 21, 32, 33, 34):
+                    has_h265_key = True
+            elif (nal_b0 & 0x80) == 0 and 0 < h264_t < 24:
+                if detected_codec == VideoCodec.UNKNOWN:
+                    detected_codec = VideoCodec.H264
+                if h264_t in (5, 7, 8):
+                    has_h264_key = True
+
+            scanned += 1
+            pos = nal_off + 1
+
+        final_codec = detected_codec if detected_codec != VideoCodec.UNKNOWN else (
+            hint if hint != VideoCodec.UNKNOWN else VideoCodec.H265
+        )
+        is_key = has_h265_key if final_codec == VideoCodec.H265 else has_h264_key
+        return norm, final_codec, is_key
+
+    def _convert_hsc_audio_to_frame(self, seq: int, ts_ms: int, media_bytes: bytes) -> Optional[CameraFrame]:
+        if not media_bytes:
+            return None
+        # Check for ADTS AAC header just in case
+        if len(media_bytes) >= 7 and media_bytes[0] == 0xFF and (media_bytes[1] & 0xF0) == 0xF0:
+            return CameraFrame(
+                is_audio=True,
+                raw_type=24,
+                payload=media_bytes,
+                frame_id=seq,
+                timestamp=ts_ms,
+                audio_codec="aac",
+            )
+        if self._audio_codec_id == 100:
+            pcm = media_bytes
+        else:
+            pcm = decode_adpcm_to_pcm16(media_bytes)
+        if not pcm:
+            return None
+        if self._audio_sample_rate >= 14000:
+            pcm = downsample_pcm16_2x(pcm)
+        if not pcm:
+            return None
+        return CameraFrame(
+            is_audio=True,
+            raw_type=21,
+            payload=pcm,
+            frame_id=seq,
+            timestamp=ts_ms,
+            audio_codec="pcm16",
+        )
+
+    # --- Main Live Stream Loop ---
+    def run_forever(self) -> None:
+        backoff = 2.0
+        force_key_refresh = False
+
+        while not self._stop_event.is_set():
+            self._need_reconnect = False
+            self._locked_video_stream = None
+            if self._force_cloud_wake:
+                self._force_cloud_wake = False
+                force_key_refresh = True
+                self._wake_lan_udp(burst_count=4)
+
+            if not self._resolve_device_id_if_missing():
+                self._emit_status("Cannot find HSC Device ID — enter 9-digit Device ID in Settings")
+                self._stop_event.wait(4.0)
+                continue
+
+            if not self._has_app_credentials():
+                self._emit_status(
+                    "Invalid / missing V380 Pro login — enter V380 Pro account & password in Settings"
+                )
+                self._stop_event.wait(4.0)
+                continue
+
+            sock: Optional[socket.socket] = None
+            try:
+                token, send_sec, sid, aes_key, aes_iv = self._ensure_hsc_key_session(
+                    force_refresh=force_key_refresh
+                )
+                force_key_refresh = False
+
+                self._emit_status("Connecting to V380 HSC live channel...")
+                sock = self._open_relay_channel(token, call_type=2)
+                self._stream_sock = sock
+
+                req_q = 1 if self.stream_quality else 0
+                tried_alt_q = False
+                tried_alt_ike0_sec = False
+                live_req_id = self._send_iotc_json(
+                    sock,
+                    self.METHOD_LIVE_START,
+                    {
+                        "up": {
+                            "quality": req_q,
+                            "video": 1,
+                            "audio": 1 if self.enable_audio else 0,
+                            "IDRreq": 1,
+                        }
+                    },
+                    sid=sid,
+                    aes_key=aes_key,
+                    aes_iv=aes_iv,
+                    sec_type=send_sec,
+                )
+                self._last_keepalive_mono = time.monotonic()
+                live_started_mono = time.monotonic()
+                emitted_streaming = False
+                video_count = 0
+                backoff = 2.0
+
+                while not self._stop_event.is_set() and not self._need_reconnect:
+                    now_m = time.monotonic()
+                    if (now_m - self._last_keepalive_mono) >= 3.8:
+                        self._send_iotc_json(
+                            sock,
+                            self.METHOD_KEEPALIVE,
+                            {"flag": 2, "tms1": 0, "decode_tms": 0},
+                            sid=sid,
+                            aes_key=aes_key,
+                            aes_iv=aes_iv,
+                            sec_type=send_sec,
+                        )
+                        self._last_keepalive_mono = now_m
+
+                    if (
+                        video_count == 0
+                        and send_sec in (0, 1)
+                        and len(self._rk_bytes) == 16
+                        and not tried_alt_ike0_sec
+                        and (now_m - live_started_mono) >= 2.2
+                    ):
+                        tried_alt_ike0_sec = True
+                        send_sec = 0 if send_sec == 1 else 1
+                        self._sec_type = send_sec
+                        live_req_id = self._send_iotc_json(
+                            sock,
+                            self.METHOD_LIVE_START,
+                            {
+                                "up": {
+                                    "quality": req_q,
+                                    "video": 1,
+                                    "audio": 1 if self.enable_audio else 0,
+                                    "IDRreq": 1,
+                                }
+                            },
+                            sid=sid,
+                            aes_key=aes_key,
+                            aes_iv=aes_iv,
+                            sec_type=send_sec,
+                        )
+
+                    if video_count == 0 and not tried_alt_q and (now_m - live_started_mono) >= 4.5:
+                        tried_alt_q = True
+                        alt_q = 1 - req_q
+                        live_req_id = self._send_iotc_json(
+                            sock,
+                            self.METHOD_LIVE_START,
+                            {
+                                "up": {
+                                    "quality": alt_q,
+                                    "video": 1,
+                                    "audio": 1 if self.enable_audio else 0,
+                                    "IDRreq": 1,
+                                }
+                            },
+                            sid=sid,
+                            aes_key=aes_key,
+                            aes_iv=aes_iv,
+                            sec_type=send_sec,
+                        )
+
+                    try:
+                        iotc_cmd, pkt_sec, pkt_sid, payload = self._recv_iotc_packet(sock, header_timeout=1.2)
+                    except socket.timeout:
+                        continue
+
+                    if send_sec == 2 and pkt_sid not in (0, sid & 0xFF):
+                        continue
+
+                    if send_sec in (0, 1) and pkt_sec in (0, 1) and pkt_sec != send_sec:
+                        send_sec = pkt_sec
+                        self._sec_type = pkt_sec
+                        with self._GLOBAL_LOCK:
+                            sess_ref = self._DEVICE_SESSIONS.get(self.device_id)
+                            if sess_ref is not None:
+                                sess_ref["ike0_sec_type"] = pkt_sec
+
+                    if iotc_cmd in (self.IOTC_CMD_JSON_REQ, self.IOTC_CMD_JSON_PUSH):
+                        try:
+                            jobj = self.decrypt_iotc_json(pkt_sec, payload, aes_key, aes_iv)
+                        except Exception:
+                            continue
+                        res_obj = jobj.get("result") if isinstance(jobj.get("result"), dict) else {}
+                        rcode = res_obj.get("code")
+                        if rcode == 1104:
+                            self._invalidate_hsc_key_session(clear_meta=True)
+                            force_key_refresh = True
+                            break
+                        mid = jobj.get("method_id")
+                        if mid == self.METHOD_MEDIA_INFO or "vattr" in jobj or "vattr" in (jobj.get("params") or {}):
+                            self._update_media_attrs(jobj)
+                        if jobj.get("id") == live_req_id and rcode not in (None, 1000) and not tried_alt_q:
+                            tried_alt_q = True
+                            alt_q = 1 - req_q
+                            live_req_id = self._send_iotc_json(
+                                sock,
+                                self.METHOD_LIVE_START,
+                                {
+                                    "up": {
+                                        "quality": alt_q,
+                                        "video": 1,
+                                        "audio": 1 if self.enable_audio else 0,
+                                        "IDRreq": 1,
+                                    }
+                                },
+                                sid=sid,
+                                aes_key=aes_key,
+                                aes_iv=aes_iv,
+                                sec_type=send_sec,
+                            )
+
+                    elif iotc_cmd == self.IOTC_CMD_MEDIA:
+                        parsed_media = self.decrypt_iotc_media(pkt_sec, payload, aes_key, aes_iv)
+                        if parsed_media is None:
+                            continue
+                        _q, mtype, seq, ts_ms, stream_idx, media_bytes = parsed_media
+                        if mtype == 4:
+                            if self.enable_audio and self.on_frame:
+                                aframe = self._convert_hsc_audio_to_frame(seq, ts_ms, media_bytes)
+                                if aframe is not None:
+                                    self.on_frame(aframe)
+                        else:
+                            if self._locked_video_stream is None:
+                                self._locked_video_stream = stream_idx
+                            elif stream_idx != self._locked_video_stream:
+                                continue
+
+                            inspected = self._inspect_annexb_video(media_bytes, self._video_codec_hint)
+                            if inspected is None:
+                                continue
+                            norm_nal, vcodec, is_key = inspected
+                            self._video_codec_hint = vcodec
+                            self._last_video_frame_mono = time.monotonic()
+                            video_count += 1
+                            if not emitted_streaming:
+                                emitted_streaming = True
+                                self._emit_status(
+                                    f"Streaming {'HD' if self.stream_quality else 'SD'} (V380 HSC)"
+                                )
+                            if self.on_frame:
+                                self.on_frame(
+                                    CameraFrame(
+                                        is_audio=False,
+                                        raw_type=0x28 if vcodec == VideoCodec.H265 else 0x00,
+                                        payload=norm_nal,
+                                        codec=vcodec,
+                                        is_keyframe=is_key,
+                                        frame_id=seq,
+                                        frame_type=0 if is_key else 1,
+                                        frame_rate=20,
+                                        timestamp=ts_ms,
+                                    )
+                                )
+
+            except _HscAuthError as auth_err:
+                self._emit_status(str(auth_err))
+                self._close_stream_sock()
+                self._stop_event.wait(5.0)
+            except InterruptedError:
+                break
+            except Exception as exc:
+                self._close_stream_sock()
+                if self._stop_event.is_set():
+                    break
+                if not self._need_reconnect:
+                    err_text = str(exc)
+                    if err_text.startswith("Camera "):
+                        self._emit_status(err_text)
+                    else:
+                        self._emit_status(f"HSC connection error ({err_text}) — retrying...")
+                    self._stop_event.wait(backoff)
+                    backoff = min(8.0, backoff * 1.4)
+            finally:
+                self._close_stream_sock()
+
+    # --- PTZ, White Light & Night Vision Controls (`0x30308` / `0x30302`) ---
+    def _send_live_iotc_control(self, method_id: int, params: Dict[str, Any]) -> bool:
+        sock = self._stream_sock
+        if sock is None or (self._sid <= 0 and self._sec_type not in (0, 1)):
+            return False
+        try:
+            self._send_iotc_json(sock, method_id, params)
+            return True
+        except Exception:
+            return False
+
+    def _ptz_op(self, op_code: int) -> bool:
+        return self._send_live_iotc_control(
+            self.METHOD_ACTION,
+            {"daid": self.DAID_PTZ, "vsbmp": 1, "in": {"op": int(op_code), "cnt": 1}},
+        )
+
+    def ptz_stop(self) -> bool:
+        return self._ptz_op(0)
+
+    def ptz_left(self) -> bool:
+        return self._ptz_op(1)
+
+    def ptz_right(self) -> bool:
+        return self._ptz_op(2)
+
+    def ptz_up(self) -> bool:
+        return self._ptz_op(3)
+
+    def ptz_down(self) -> bool:
+        return self._ptz_op(4)
+
+    def light_auto(self) -> bool:
+        return self._send_live_iotc_control(
+            self.METHOD_PROP_WRITE, {"dplist": [{"dpid": self.DPID_WHITE_LIGHT, "value": 0}]}
+        )
+
+    def light_on(self) -> bool:
+        return self._send_live_iotc_control(
+            self.METHOD_PROP_WRITE, {"dplist": [{"dpid": self.DPID_WHITE_LIGHT, "value": 1}]}
+        )
+
+    def light_off(self) -> bool:
+        return self._send_live_iotc_control(
+            self.METHOD_PROP_WRITE, {"dplist": [{"dpid": self.DPID_WHITE_LIGHT, "value": 2}]}
+        )
+
+    def image_auto(self) -> bool:
+        return self._send_live_iotc_control(
+            self.METHOD_PROP_WRITE, {"dplist": [{"dpid": self.DPID_NIGHT_VISION, "value": 0}]}
+        )
+
+    def image_color(self) -> bool:
+        return self._send_live_iotc_control(
+            self.METHOD_PROP_WRITE, {"dplist": [{"dpid": self.DPID_NIGHT_VISION, "value": 1}]}
+        )
+
+    def image_bw(self) -> bool:
+        return self._send_live_iotc_control(
+            self.METHOD_PROP_WRITE, {"dplist": [{"dpid": self.DPID_NIGHT_VISION, "value": 2}]}
+        )
+
+    def image_flip(self) -> bool:
+        return True
+
+    def ptz_preset_set(self, slot_id: int) -> bool:
+        return False
+
+    def ptz_preset_goto(self, slot_id: int) -> bool:
+        return False
+
+    def ptz_preset_clear(self, slot_id: int) -> bool:
+        return False
+
+    # --- microSD Card Recording List (`call=3`, `0x30220`) & Playback (`call=5`, `0x30222`) ---
+    @staticmethod
+    def _local_day_utc_bounds_ms(year: int, month: int, day: int) -> Tuple[int, int, Any]:
+        local_tz = datetime.now().astimezone().tzinfo or timezone.utc
+        start_local = datetime(int(year), int(month), int(day), 0, 0, 0, tzinfo=local_tz)
+        end_local = datetime(int(year), int(month), int(day), 23, 59, 59, 999000, tzinfo=local_tz)
+        return int(start_local.timestamp() * 1000), int(end_local.timestamp() * 1000), local_tz
+
+    @staticmethod
+    def _utc_ms_to_wall_ts(utc_ms: int, local_tz: Any) -> int:
+        dt_loc = datetime.fromtimestamp(utc_ms / 1000.0, tz=local_tz)
+        return int(dt_loc.replace(tzinfo=timezone.utc).timestamp())
+
+    @staticmethod
+    def _wall_ts_to_utc_ms(wall_ts: int, local_tz: Any) -> int:
+        dt_wall = datetime.fromtimestamp(int(wall_ts), tz=timezone.utc)
+        dt_loc = datetime(
+            dt_wall.year,
+            dt_wall.month,
+            dt_wall.day,
+            dt_wall.hour,
+            dt_wall.minute,
+            dt_wall.second,
+            tzinfo=local_tz,
+        )
+        return int(dt_loc.timestamp() * 1000)
+
+    def list_sd_recordings(
+        self, year: int, month: int, day: int
+    ) -> Tuple[bool, str, List[RecordingSegment]]:
+        if not self._resolve_device_id_if_missing():
+            return False, "Missing HSC Device ID", []
+        if not self._has_app_credentials():
+            return False, "Enter V380 Pro account & password in Camera Settings", []
+
+        start_ms, end_ms, local_tz = self._local_day_utc_bounds_ms(year, month, day)
+        last_err = "HSC SD card list failed"
+
+        for attempt in range(2):
+            if self._stop_event.is_set():
+                return False, "Cancelled", []
+            sock: Optional[socket.socket] = None
+            try:
+                token, send_sec, sid, aes_key, aes_iv = self._ensure_hsc_key_session(force_refresh=(attempt > 0))
+                sock = self._open_relay_channel(token, call_type=3)
+                self._stream_sock = sock
+
+                self._send_iotc_json(
+                    sock,
+                    self.METHOD_SD_LIST,
+                    {"filter": 11, "mode": 2, "start": start_ms, "end": end_ms},
+                    sid=sid,
+                    aes_key=aes_key,
+                    aes_iv=aes_iv,
+                    sec_type=send_sec,
+                )
+
+                segments: List[RecordingSegment] = []
+                seen_sts: set[int] = set()
+                deadline = time.monotonic() + 14.0
+
+                while time.monotonic() < deadline and not self._stop_event.is_set():
+                    try:
+                        iotc_cmd, pkt_sec, pkt_sid, payload = self._recv_iotc_packet(sock, header_timeout=2.5)
+                    except socket.timeout:
+                        break
+                    if send_sec == 2 and pkt_sid not in (0, sid & 0xFF):
+                        continue
+                    if iotc_cmd not in (self.IOTC_CMD_JSON_REQ, self.IOTC_CMD_JSON_PUSH):
+                        continue
+
+                    jobj = self.decrypt_iotc_json(pkt_sec, payload, aes_key, aes_iv)
+                    res_obj = jobj.get("result") if isinstance(jobj.get("result"), dict) else {}
+                    rcode = res_obj.get("code")
+                    if rcode == 1104:
+                        self._invalidate_hsc_key_session(clear_meta=True)
+                        last_err = "HSC session expired (1104)"
+                        break
+
+                    data_obj = jobj.get("data") if isinstance(jobj.get("data"), dict) else (
+                        jobj.get("params") if isinstance(jobj.get("params"), dict) else jobj
+                    )
+                    rows = data_obj.get("list")
+                    if isinstance(rows, list):
+                        for item in rows:
+                            if not isinstance(item, dict):
+                                continue
+                            s_off = int(item.get("s") or 0)
+                            dur_ms = int(item.get("d") or 0)
+                            t_val = int(item.get("t") or 1)
+                            if dur_ms <= 0:
+                                continue
+                            sts_ms = start_ms + s_off
+                            if sts_ms in seen_sts:
+                                continue
+                            seen_sts.add(sts_ms)
+
+                            rtype = 2 if t_val == 2 else 1
+                            w_start = self._utc_ms_to_wall_ts(sts_ms, local_tz)
+                            w_end = w_start + max(1, int(round(dur_ms / 1000.0)))
+                            seg_id = int((sts_ms // 1000) & 0x7FFFFFFF) or 1
+                            segments.append(
+                                RecordingSegment(
+                                    seg_id=seg_id,
+                                    raw_type=rtype,
+                                    start_ts=w_start,
+                                    end_ts=w_end,
+                                    hsc_sts_ms=sts_ms,
+                                )
+                            )
+
+                    flag = data_obj.get("flag")
+                    if flag == 0 or (rcode not in (None, 1000) and not rows):
+                        segments.sort(key=lambda s: s.start_ts)
+                        if not segments:
+                            return True, "No recordings found for this date", []
+                        anom = sum(1 for s in segments if s.is_anomaly)
+                        summary = f"{len(segments)} clips ({anom} events)" if anom else f"{len(segments)} clips"
+                        return True, summary, segments
+
+                if last_err == "HSC session expired (1104)" and attempt == 0:
+                    continue
+
+                segments.sort(key=lambda s: s.start_ts)
+                if segments:
+                    anom = sum(1 for s in segments if s.is_anomaly)
+                    summary = f"{len(segments)} clips ({anom} events)" if anom else f"{len(segments)} clips"
+                    return True, summary, segments
+                return True, "No recordings found for this date", []
+
+            except _HscAuthError as ae:
+                return False, str(ae), []
+            except Exception as exc:
+                if self._stop_event.is_set():
+                    return False, "Cancelled", []
+                last_err = str(exc) if str(exc).startswith("Camera ") else f"HSC SD read error: {exc}"
+            finally:
+                self._close_stream_sock()
+
+        return False, last_err, []
+
+    def stream_sd_segment(
+        self,
+        segment: RecordingSegment,
+        start_ts: Optional[int] = None,
+        stop_event: Optional[threading.Event] = None,
+        on_frame: Optional[Callable[[CameraFrame], None]] = None,
+    ) -> Tuple[bool, str]:
+        cb = on_frame or self.on_frame
+        if cb is None:
+            return False, "No frame callback registered"
+        if not self._resolve_device_id_if_missing():
+            return False, "Missing HSC Device ID"
+        if not self._has_app_credentials():
+            return False, "Enter V380 Pro account & password in Camera Settings"
+
+        def is_stopped() -> bool:
+            return self._stop_event.is_set() or (stop_event is not None and stop_event.is_set())
+
+        local_tz = datetime.now().astimezone().tzinfo or timezone.utc
+        if getattr(segment, "hsc_sts_ms", 0) > 0:
+            sts_ms = int(segment.hsc_sts_ms)
+        else:
+            sts_ms = self._wall_ts_to_utc_ms(segment.start_ts, local_tz)
+
+        from_wall = int(start_ts if start_ts is not None else segment.start_ts)
+        seek_sec = max(0, min(from_wall - int(segment.start_ts), max(0, segment.duration_sec - 1)))
+        pts_ms = sts_ms + (seek_sec * 1000) + 1
+        wall_offset_ms = (int(segment.start_ts) * 1000) - sts_ms
+
+        last_err = "HSC SD playback failed"
+        for attempt in range(2):
+            if is_stopped():
+                return False, "Cancelled"
+            sock: Optional[socket.socket] = None
+            received_any_media = False
+            finished_cleanly = False
+            try:
+                token, send_sec, sid, aes_key, aes_iv = self._ensure_hsc_key_session(force_refresh=(attempt > 0))
+                sock = self._open_relay_channel(token, call_type=5)
+                self._stream_sock = sock
+                self._locked_video_stream = None
+
+                self._send_iotc_json(
+                    sock,
+                    self.METHOD_SD_REPLAY,
+                    {
+                        "sts": sts_ms,
+                        "pts": pts_ms,
+                        "time_id": 0,
+                        "frames": 100,
+                        "speed": 10,
+                        "mode": 2,
+                        "video": 1,
+                        "audio": 1 if self.enable_audio else 0,
+                        "rtype": 1,
+                        "vsspec": 1,
+                    },
+                    sid=sid,
+                    aes_key=aes_key,
+                    aes_iv=aes_iv,
+                    sec_type=send_sec,
+                )
+
+                window_packets = 0
+                session_expired_before_media = False
+
+                while not is_stopped():
+                    try:
+                        iotc_cmd, pkt_sec, pkt_sid, payload = self._recv_iotc_packet(
+                            sock, header_timeout=5.0, stop_event=stop_event
+                        )
+                    except socket.timeout:
+                        break
+
+                    if send_sec == 2 and pkt_sid not in (0, sid & 0xFF):
+                        continue
+
+                    if send_sec in (0, 1) and pkt_sec in (0, 1) and pkt_sec != send_sec:
+                        send_sec = pkt_sec
+                        self._sec_type = pkt_sec
+
+                    if iotc_cmd in (self.IOTC_CMD_JSON_REQ, self.IOTC_CMD_JSON_PUSH):
+                        try:
+                            jobj = self.decrypt_iotc_json(pkt_sec, payload, aes_key, aes_iv)
+                        except Exception:
+                            continue
+                        res_obj = jobj.get("result") if isinstance(jobj.get("result"), dict) else {}
+                        if res_obj.get("code") == 1104:
+                            self._invalidate_hsc_key_session(clear_meta=True)
+                            if not received_any_media:
+                                session_expired_before_media = True
+                            break
+
+                        mid = jobj.get("method_id")
+                        p_obj = jobj.get("params") if isinstance(jobj.get("params"), dict) else (
+                            jobj.get("data") if isinstance(jobj.get("data"), dict) else jobj
+                        )
+                        if mid == self.METHOD_SD_INFO or "info_id" in p_obj:
+                            info_id = p_obj.get("info_id")
+                            if info_id == 1:
+                                self._update_media_attrs(jobj)
+                            elif info_id == 3:
+                                finished_cleanly = True
+                                return True, "Segment finished"
+
+                    elif iotc_cmd == self.IOTC_CMD_MEDIA:
+                        parsed_media = self.decrypt_iotc_media(pkt_sec, payload, aes_key, aes_iv)
+                        if parsed_media is None:
+                            continue
+                        _q, mtype, seq, ts_ms, stream_idx, media_bytes = parsed_media
+                        received_any_media = True
+                        window_packets += 1
+                        if window_packets >= 90 and not is_stopped():
+                            window_packets = 0
+                            self._send_iotc_json(
+                                sock,
+                                self.METHOD_SD_REPLAY,
+                                {"frames": 100},
+                                sid=sid,
+                                aes_key=aes_key,
+                                aes_iv=aes_iv,
+                                sec_type=send_sec,
+                            )
+
+                        wall_ts_ms = ts_ms + wall_offset_ms if ts_ms > 0 else 0
+                        if mtype == 4:
+                            if self.enable_audio:
+                                aframe = self._convert_hsc_audio_to_frame(seq, wall_ts_ms, media_bytes)
+                                if aframe is not None:
+                                    cb(aframe)
+                        else:
+                            if self._locked_video_stream is None:
+                                self._locked_video_stream = stream_idx
+                            elif stream_idx != self._locked_video_stream:
+                                continue
+                            inspected = self._inspect_annexb_video(media_bytes, self._video_codec_hint)
+                            if inspected is None:
+                                continue
+                            norm_nal, vcodec, is_key = inspected
+                            self._video_codec_hint = vcodec
+                            cb(
+                                CameraFrame(
+                                    is_audio=False,
+                                    raw_type=0x28 if vcodec == VideoCodec.H265 else 0x00,
+                                    payload=norm_nal,
+                                    codec=vcodec,
+                                    is_keyframe=is_key,
+                                    frame_id=seq,
+                                    frame_type=0 if is_key else 1,
+                                    frame_rate=20,
+                                    timestamp=wall_ts_ms,
+                                )
+                            )
+
+                if session_expired_before_media and attempt == 0:
+                    continue
+                return True, "Stopped"
+
+            except _HscAuthError as ae:
+                return False, str(ae)
+            except Exception as exc:
+                if is_stopped():
+                    return True, "Stopped"
+                last_err = str(exc) if str(exc).startswith("Camera ") else f"HSC playback error: {exc}"
+                break
+            finally:
+                if sock is not None and not finished_cleanly:
+                    try:
+                        sock.settimeout(0.2)
+                        self._send_iotc_json(sock, self.METHOD_SD_STOP, {}, sec_type=send_sec)
+                    except Exception:
+                        pass
+                self._close_stream_sock()
+
+        return False, last_err

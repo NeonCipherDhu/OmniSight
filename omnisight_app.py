@@ -30,6 +30,7 @@ from PyQt6.QtCore import (
     QEvent,
     QMimeData,
     QPoint,
+    QPointF,
     QRect,
     QRectF,
     QSettings,
@@ -54,8 +55,10 @@ from PyQt6.QtGui import (
     QKeyEvent,
     QMouseEvent,
     QPainter,
+    QPainterPath,
     QPen,
     QPixmap,
+    QPolygonF,
     QResizeEvent,
     QTransform,
     QWheelEvent,
@@ -112,6 +115,7 @@ from stream_worker import (
     get_local_capture_thumbnail_path,
     get_segment_backup_path,
     load_local_backup_segments,
+    mp4_has_audio_track,
     save_qimage_as_segment_thumbnail,
     save_segment_backup_meta,
 )
@@ -124,7 +128,7 @@ from omnisight_protocol import (
 )
 
 BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 APP_DIR = (
     Path(sys.executable).resolve().parent
     if getattr(sys, "frozen", False)
@@ -1144,10 +1148,23 @@ class CameraConfigDialog(QDialog):
 
         self.cmb_proto = QComboBox()
         self.cmb_proto.addItem("LAN Protocol TCP 8800 (Compatible with V380 cameras)", "lan8800")
+        self.cmb_proto.addItem("V380 Cloud / HSC Protocol (Gen-3 Cameras — No Port 8800)", "hsc")
         self.cmb_proto.addItem("RTSP / ONVIF Stream (TCP 554)", "rtsp")
         self.cmb_proto.addItem("Synthetic Test Pattern (Simulator)", "demo")
+        detected_hsc = False
         if config:
-            norm_proto = "lan8800" if config.protocol in ("lan8800", "v380") else config.protocol
+            ip_k = (config.ip or "").strip()
+            did_k = str(config.device_id or "").strip()
+            with LanCameraDiscovery._REGISTRY_LOCK:
+                detected_hsc = (
+                    (ip_k and ip_k in LanCameraDiscovery._DETECTED_HSC_DEVICES)
+                    or (did_k and did_k != "0" and did_k in LanCameraDiscovery._DETECTED_HSC_DEVICES)
+                )
+            norm_proto = (
+                "hsc"
+                if (config.protocol == "hsc" or (config.protocol in ("lan8800", "v380") and detected_hsc))
+                else ("lan8800" if config.protocol in ("lan8800", "v380") else config.protocol)
+            )
             idx = self.cmb_proto.findData(norm_proto)
             if idx >= 0:
                 self.cmb_proto.setCurrentIndex(idx)
@@ -1173,16 +1190,38 @@ class CameraConfigDialog(QDialog):
         form.addRow("TCP Port", self.spn_port)
 
         self.edt_dev_id = QLineEdit(config.device_id if config else "")
-        self.edt_dev_id.setPlaceholderText("8-digit Device ID")
+        self.edt_dev_id.setPlaceholderText("8 or 9-digit Device ID")
         form.addRow("Device ID", self.edt_dev_id)
 
-        self.edt_user = QLineEdit(config.username if config else "admin")
-        form.addRow("Username", self.edt_user)
+        init_user = config.username if config else "admin"
+        init_pass = config.password if config else ""
+        if self.cmb_proto.currentData() == "hsc":
+            if init_user.strip().lower() == "admin" or (
+                config and config.device_id and init_user.strip() == str(config.device_id).strip()
+            ):
+                init_user = ""
+            if not init_user and parent is not None and hasattr(parent, "cameras"):
+                for other_c in getattr(parent, "cameras", []):
+                    if (
+                        getattr(other_c, "protocol", "") == "hsc"
+                        and getattr(other_c, "username", "").strip()
+                        and getattr(other_c, "username", "").strip().lower() != "admin"
+                        and getattr(other_c, "password", "")
+                    ):
+                        init_user = other_c.username.strip()
+                        if not init_pass:
+                            init_pass = other_c.password
+                        break
 
-        self.edt_pass = QLineEdit(config.password if config else "")
+        self.lbl_user_row = QLabel("Username")
+        self.edt_user = QLineEdit(init_user)
+        form.addRow(self.lbl_user_row, self.edt_user)
+
+        self.lbl_pass_row = QLabel("Password")
+        self.edt_pass = QLineEdit(init_pass)
         self.edt_pass.setEchoMode(QLineEdit.EchoMode.PasswordEchoOnEdit)
         self.edt_pass.setPlaceholderText("Camera password")
-        form.addRow("Password", self.edt_pass)
+        form.addRow(self.lbl_pass_row, self.edt_pass)
 
         self.cmb_quality = QComboBox()
         self.cmb_quality.addItem("HD (Main Stream)", 1)
@@ -1252,14 +1291,30 @@ class CameraConfigDialog(QDialog):
         proto = self.cmb_proto.currentData()
         is_demo = proto == "demo"
         is_rtsp = proto == "rtsp"
+        is_hsc = proto == "hsc"
 
         self.edt_ip.setEnabled(not is_demo)
         self.btn_scan.setEnabled(not is_demo)
         self.spn_port.setEnabled(proto in ("lan8800", "v380"))
-        self.edt_dev_id.setEnabled(proto in ("lan8800", "v380"))
+        self.edt_dev_id.setEnabled(proto in ("lan8800", "v380", "hsc"))
         self.edt_user.setEnabled(not is_demo)
         self.edt_pass.setEnabled(not is_demo)
         self.edt_rtsp.setEnabled(is_rtsp)
+
+        if is_hsc:
+            self.lbl_user_row.setText("V380 Pro Account")
+            self.edt_user.setPlaceholderText("V380 Pro email, phone, or username")
+            self.lbl_pass_row.setText("V380 Pro Password")
+            self.edt_pass.setPlaceholderText("V380 Pro app login password")
+            cur_u = self.edt_user.text().strip()
+            cur_id = self.edt_dev_id.text().strip()
+            if cur_u.lower() == "admin" or (cur_id and cur_u == cur_id):
+                self.edt_user.setText("")
+        else:
+            self.lbl_user_row.setText("Username")
+            self.edt_user.setPlaceholderText("admin or Device ID")
+            self.lbl_pass_row.setText("Password")
+            self.edt_pass.setPlaceholderText("Camera password")
 
     def _open_scan(self) -> None:
         dlg = DiscoveryDialog(self)
@@ -1267,21 +1322,27 @@ class CameraConfigDialog(QDialog):
             cam = dlg.selected_camera
             self.edt_ip.setText(cam.ip)
             self.spn_port.setValue(cam.port)
+            cam_proto = "hsc" if getattr(cam, "protocol", "lan8800") == "hsc" else "lan8800"
+            p_idx = self.cmb_proto.findData(cam_proto)
+            if p_idx >= 0:
+                self.cmb_proto.setCurrentIndex(p_idx)
             if cam.dev_id:
                 self.edt_dev_id.setText(cam.dev_id)
-                if not self.edt_user.text().strip() or self.edt_user.text().strip() == "admin":
+                if cam_proto != "hsc" and (not self.edt_user.text().strip() or self.edt_user.text().strip() == "admin"):
                     self.edt_user.setText(cam.dev_id)
             if self._initial is None and (not self.edt_name.text().strip() or self.edt_name.text() == "Camera 01"):
                 self.edt_name.setText(cam.name or f"Camera ({cam.ip})")
 
     def get_config(self) -> CameraConfig:
         cam_id = self._initial.cam_id if self._initial else uuid.uuid4().hex[:8]
+        proto = self.cmb_proto.currentData()
         dev_id = self.edt_dev_id.text().strip()
-        user = self.edt_user.text().strip() or dev_id or "admin"
+        raw_user = self.edt_user.text().strip()
+        user = raw_user if proto == "hsc" else (raw_user or dev_id or "admin")
         return CameraConfig(
             cam_id=cam_id,
             name=self.edt_name.text().strip() or "Camera",
-            protocol=self.cmb_proto.currentData(),
+            protocol=proto,
             ip=self.edt_ip.text().strip() or "192.168.1.100",
             port=self.spn_port.value(),
             device_id=dev_id,
@@ -1483,12 +1544,14 @@ class VideoCanvas(QWidget):
         self._last_detection_ts: float = 0.0
         self._dismiss_hit_rects: List[Tuple[QRect, tuple]] = []
         self._box_hit_rects: List[Tuple[QRect, tuple]] = []
-        self._chime_zone: Optional[List[List[float]]] = None
+        self._chime_zone: Optional[List[List[List[float]]]] = None
         self._editing_chime_zone: bool = False
-        self._chime_drag_start: Optional[Tuple[float, float]] = None
-        self._chime_drag_curr: Optional[Tuple[float, float]] = None
+        self._chime_draft_nodes: List[List[float]] = []
+        self._chime_drag_vertex: Optional[Tuple[int, int]] = None
+        self._chime_hover_vertex: Optional[Tuple[int, int]] = None
         self._chime_done_rect: QRect = QRect()
         self._chime_reset_rect: QRect = QRect()
+        self._chime_undo_rect: QRect = QRect()
         self._chime_delete_rects: List[Tuple[QRect, int]] = []
         self._auto_track_enabled: bool = False
         self._tracking_state: str = ""
@@ -1743,9 +1806,12 @@ class VideoCanvas(QWidget):
         new_mode = bool(enabled)
         if self._editing_chime_zone == new_mode and not new_mode:
             return
+        if not new_mode and self._editing_chime_zone and len(self._chime_draft_nodes) >= 3:
+            self._close_draft_chime_polygon()
         self._editing_chime_zone = new_mode
-        self._chime_drag_start = None
-        self._chime_drag_curr = None
+        self._chime_draft_nodes.clear()
+        self._chime_drag_vertex = None
+        self._chime_hover_vertex = None
         if self._editing_chime_zone:
             self._zoom = 1.0
             self._pan_offset = QPoint(0, 0)
@@ -1787,6 +1853,62 @@ class VideoCanvas(QWidget):
         xn = max(0.0, min(1.0, (pos.x() - target.left()) / float(tw)))
         yn = max(0.0, min(1.0, (pos.y() - target.top()) / float(th)))
         return (xn, yn)
+
+    def _norm_to_pointf(self, xn: float, yn: float, target: Optional[QRect] = None) -> QPointF:
+        t = target if target is not None else self._get_video_target_rect()
+        return QPointF(
+            float(t.left()) + float(xn) * float(t.width()),
+            float(t.top()) + float(yn) * float(t.height()),
+        )
+
+    def _is_near_draft_start_node(self, pos: QPoint, radius_px: float = 14.0) -> bool:
+        if len(self._chime_draft_nodes) < 3:
+            return False
+        p0 = self._norm_to_pointf(self._chime_draft_nodes[0][0], self._chime_draft_nodes[0][1])
+        dx = float(pos.x()) - p0.x()
+        dy = float(pos.y()) - p0.y()
+        return (dx * dx + dy * dy) <= (radius_px * radius_px)
+
+    def _find_chime_vertex_at(self, pos: QPoint, radius_px: float = 11.0) -> Optional[Tuple[int, int]]:
+        if self._chime_draft_nodes:
+            return None
+        zones = CameraConfig.normalize_chime_zones(self._chime_zone)
+        if not zones:
+            return None
+        target = self._get_video_target_rect()
+        best: Optional[Tuple[int, int]] = None
+        best_d2 = radius_px * radius_px
+        for z_idx, poly in enumerate(zones):
+            for v_idx, v in enumerate(poly):
+                pt = self._norm_to_pointf(v[0], v[1], target)
+                dx = float(pos.x()) - pt.x()
+                dy = float(pos.y()) - pt.y()
+                d2 = dx * dx + dy * dy
+                if d2 <= best_d2:
+                    best_d2 = d2
+                    best = (z_idx, v_idx)
+        return best
+
+    def _close_draft_chime_polygon(self) -> bool:
+        if len(self._chime_draft_nodes) < 3:
+            self._chime_draft_nodes.clear()
+            self.update()
+            return False
+        new_poly = CameraConfig.normalize_single_chime_box(self._chime_draft_nodes)
+        self._chime_draft_nodes.clear()
+        if new_poly is not None:
+            zones = CameraConfig.normalize_chime_zones(self._chime_zone)
+            if len(zones) >= CameraConfig.MAX_CHIME_ZONES:
+                zones[-1] = new_poly
+            else:
+                zones.append(new_poly)
+            self._chime_zone = zones
+            self.chime_zone_changed.emit(self._chime_zone)
+            self.update()
+            return True
+        self.show_error_toast("Shape area is too small — place at least 3 spread-out nodes")
+        self.update()
+        return False
 
     def notify_manual_connect_started(self) -> None:
         self._has_disconnected = False
@@ -2027,10 +2149,19 @@ class VideoCanvas(QWidget):
                     return
                 if self._chime_reset_rect.contains(event.pos()):
                     self._chime_zone = None
-                    self._chime_drag_start = None
-                    self._chime_drag_curr = None
+                    self._chime_draft_nodes.clear()
+                    self._chime_drag_vertex = None
+                    self._chime_hover_vertex = None
                     self.chime_zone_changed.emit(None)
                     self.update()
+                    event.accept()
+                    return
+                if not self._chime_undo_rect.isNull() and self._chime_undo_rect.contains(event.pos()):
+                    if len(self._chime_draft_nodes) >= 3:
+                        self._close_draft_chime_polygon()
+                    elif self._chime_draft_nodes:
+                        self._chime_draft_nodes.pop()
+                        self.update()
                     event.accept()
                     return
                 for del_rect, box_idx in self._chime_delete_rects:
@@ -2039,18 +2170,73 @@ class VideoCanvas(QWidget):
                         if 0 <= box_idx < len(zones):
                             zones.pop(box_idx)
                         self._chime_zone = zones if zones else None
-                        self._chime_drag_start = None
-                        self._chime_drag_curr = None
+                        self._chime_drag_vertex = None
+                        self._chime_hover_vertex = None
                         self.chime_zone_changed.emit(self._chime_zone)
                         self.update()
                         event.accept()
                         return
-                self._chime_drag_start = self._pos_to_norm(event.pos())
-                self._chime_drag_curr = self._chime_drag_start
+
+                # If user is currently placing nodes for an open polygon
+                if self._chime_draft_nodes:
+                    if self._is_near_draft_start_node(event.pos()):
+                        self._close_draft_chime_polygon()
+                        event.accept()
+                        return
+                    xn, yn = self._pos_to_norm(event.pos())
+                    last_pt = self._norm_to_pointf(self._chime_draft_nodes[-1][0], self._chime_draft_nodes[-1][1])
+                    if (
+                        (float(event.pos().x()) - last_pt.x()) ** 2
+                        + (float(event.pos().y()) - last_pt.y()) ** 2
+                    ) >= 16.0:
+                        self._chime_draft_nodes.append([round(xn, 4), round(yn, 4)])
+                    self.update()
+                    event.accept()
+                    return
+
+                # Check if user clicked an existing closed polygon vertex to drag/reshape it
+                hit_v = self._find_chime_vertex_at(event.pos())
+                if hit_v is not None:
+                    self._chime_drag_vertex = hit_v
+                    self.setCursor(Qt.CursorShape.SizeAllCursor)
+                    self.update()
+                    event.accept()
+                    return
+
+                # Otherwise start placing a new polygon shape
+                zones = CameraConfig.normalize_chime_zones(self._chime_zone)
+                if len(zones) >= CameraConfig.MAX_CHIME_ZONES:
+                    self.show_error_toast(f"Maximum of {CameraConfig.MAX_CHIME_ZONES} Chime Zones reached — remove one first")
+                    event.accept()
+                    return
+                xn, yn = self._pos_to_norm(event.pos())
+                self._chime_draft_nodes = [[round(xn, 4), round(yn, 4)]]
                 self.update()
                 event.accept()
                 return
             elif event.button() == Qt.MouseButton.RightButton:
+                # Right-click while placing nodes undoes the last placed node
+                if self._chime_draft_nodes:
+                    self._chime_draft_nodes.pop()
+                    self.update()
+                    event.accept()
+                    return
+                # Right-click on an existing polygon vertex removes that vertex (if polygon has > 3 nodes)
+                hit_v = self._find_chime_vertex_at(event.pos())
+                if hit_v is not None:
+                    z_idx, v_idx = hit_v
+                    zones = CameraConfig.normalize_chime_zones(self._chime_zone)
+                    if 0 <= z_idx < len(zones) and len(zones[z_idx]) > 3 and 0 <= v_idx < len(zones[z_idx]):
+                        zones[z_idx].pop(v_idx)
+                        norm_poly = CameraConfig.normalize_single_chime_box(zones[z_idx])
+                        if norm_poly is not None:
+                            zones[z_idx] = norm_poly
+                            self._chime_zone = zones
+                            self._chime_hover_vertex = None
+                            self.chime_zone_changed.emit(self._chime_zone)
+                            self.update()
+                            event.accept()
+                            return
                 self.set_chime_zone_edit_mode(False)
                 event.accept()
                 return
@@ -2074,19 +2260,32 @@ class VideoCanvas(QWidget):
         self._sync_ptz_edge_buttons()
 
         if self._editing_chime_zone:
-            if self._chime_drag_start is not None and (event.buttons() & Qt.MouseButton.LeftButton):
-                self._chime_drag_curr = self._pos_to_norm(event.pos())
-                self.setCursor(Qt.CursorShape.CrossCursor)
+            if self._chime_drag_vertex is not None and (event.buttons() & Qt.MouseButton.LeftButton):
+                z_idx, v_idx = self._chime_drag_vertex
+                zones = CameraConfig.normalize_chime_zones(self._chime_zone)
+                if 0 <= z_idx < len(zones) and 0 <= v_idx < len(zones[z_idx]):
+                    xn, yn = self._pos_to_norm(event.pos())
+                    zones[z_idx][v_idx] = [round(xn, 4), round(yn, 4)]
+                    self._chime_zone = zones
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
                 self.update()
                 event.accept()
                 return
+
+            self._chime_hover_vertex = self._find_chime_vertex_at(event.pos())
             over_del = any(dr.contains(event.pos()) for dr, _ in self._chime_delete_rects)
+            over_start = self._is_near_draft_start_node(event.pos())
+            over_undo = not self._chime_undo_rect.isNull() and self._chime_undo_rect.contains(event.pos())
             if (
                 self._chime_done_rect.contains(event.pos())
                 or self._chime_reset_rect.contains(event.pos())
+                or over_undo
                 or over_del
+                or over_start
             ):
                 self.setCursor(Qt.CursorShape.PointingHandCursor)
+            elif self._chime_hover_vertex is not None:
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
             else:
                 self.setCursor(Qt.CursorShape.CrossCursor)
             self.update()
@@ -2129,24 +2328,12 @@ class VideoCanvas(QWidget):
         if (
             self._editing_chime_zone
             and event.button() == Qt.MouseButton.LeftButton
-            and self._chime_drag_start is not None
+            and self._chime_drag_vertex is not None
         ):
-            end_pt = self._pos_to_norm(event.pos())
-            x1 = min(self._chime_drag_start[0], end_pt[0])
-            y1 = min(self._chime_drag_start[1], end_pt[1])
-            x2 = max(self._chime_drag_start[0], end_pt[0])
-            y2 = max(self._chime_drag_start[1], end_pt[1])
-            self._chime_drag_start = None
-            self._chime_drag_curr = None
-            new_box = CameraConfig.normalize_single_chime_box([x1, y1, x2, y2])
-            if new_box is not None:
-                zones = CameraConfig.normalize_chime_zones(self._chime_zone)
-                if len(zones) >= CameraConfig.MAX_CHIME_ZONES:
-                    zones[-1] = new_box
-                else:
-                    zones.append(new_box)
-                self._chime_zone = zones
-                self.chime_zone_changed.emit(self._chime_zone)
+            self._chime_drag_vertex = None
+            zones = CameraConfig.normalize_chime_zones(self._chime_zone)
+            self._chime_zone = zones if zones else None
+            self.chime_zone_changed.emit(self._chime_zone)
             self.update()
             event.accept()
             return
@@ -2156,6 +2343,8 @@ class VideoCanvas(QWidget):
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
         if self._editing_chime_zone:
+            if event.button() == Qt.MouseButton.LeftButton and len(self._chime_draft_nodes) >= 3:
+                self._close_draft_chime_polygon()
             event.accept()
             return
         if event.button() == Qt.MouseButton.LeftButton:
@@ -2738,6 +2927,7 @@ class VideoCanvas(QWidget):
     def _paint_chime_zone_overlay(self, painter: QPainter, target: QRect) -> None:
         self._chime_done_rect = QRect()
         self._chime_reset_rect = QRect()
+        self._chime_undo_rect = QRect()
         self._chime_delete_rects.clear()
         rect = self.rect()
         if target.width() < 24 or target.height() < 24:
@@ -2746,108 +2936,184 @@ class VideoCanvas(QWidget):
         saved_zones = CameraConfig.normalize_chime_zones(self._chime_zone)
 
         if self._editing_chime_zone:
-            drag_box: Optional[List[float]] = None
-            if self._chime_drag_start is not None and self._chime_drag_curr is not None:
-                x1 = min(self._chime_drag_start[0], self._chime_drag_curr[0])
-                y1 = min(self._chime_drag_start[1], self._chime_drag_curr[1])
-                x2 = max(self._chime_drag_start[0], self._chime_drag_curr[0])
-                y2 = max(self._chime_drag_start[1], self._chime_drag_curr[1])
-                if (x2 - x1) >= 0.015 and (y2 - y1) >= 0.015:
-                    drag_box = [x1, y1, x2, y2]
+            poly_items: List[Tuple[QPolygonF, List[QPointF], int]] = []
+            for idx, poly in enumerate(saved_zones):
+                qpts = [self._norm_to_pointf(v[0], v[1], target) for v in poly]
+                if len(qpts) >= 3:
+                    poly_items.append((QPolygonF(qpts), qpts, idx))
 
-            all_boxes: List[Tuple[List[float], int, bool]] = [
-                (b, idx, False) for idx, b in enumerate(saved_zones)
-            ]
-            if drag_box is not None:
-                all_boxes.append((drag_box, len(saved_zones), True))
+            # Dim areas outside the union of all saved closed polygons
+            if poly_items:
+                outer_path = QPainterPath()
+                outer_path.addRect(QRectF(target))
+                holes_path = QPainterPath()
+                holes_path.setFillRule(Qt.FillRule.WindingFill)
+                for qpoly, _, _ in poly_items:
+                    sub = QPainterPath()
+                    sub.setFillRule(Qt.FillRule.OddEvenFill)
+                    sub.addPolygon(qpoly)
+                    sub.closeSubpath()
+                    holes_path = holes_path.united(sub)
+                dim_path = outer_path.subtracted(holes_path)
+                painter.save()
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(5, 5, 10, 148))
+                painter.drawPath(dim_path)
+                painter.restore()
 
-            if all_boxes:
-                from PyQt6.QtGui import QPainterPath
+            # Draw each closed polygon zone + draggable vertex handles + delete badge
+            for qpoly, qpts, idx in poly_items:
+                painter.save()
+                fill_path = QPainterPath()
+                fill_path.setFillRule(Qt.FillRule.OddEvenFill)
+                fill_path.addPolygon(qpoly)
+                fill_path.closeSubpath()
+                painter.fillPath(fill_path, QColor(245, 158, 11, 32))
 
-                zone_rects: List[Tuple[QRect, int, bool]] = []
-                for b, idx, is_drag in all_boxes:
-                    zx = int(round(target.left() + b[0] * target.width()))
-                    zy = int(round(target.top() + b[1] * target.height()))
-                    zw = max(10, int(round((b[2] - b[0]) * target.width())))
-                    zh = max(10, int(round((b[3] - b[1]) * target.height())))
-                    zr = QRect(zx, zy, zw, zh).intersected(target)
-                    if zr.width() >= 8 and zr.height() >= 8:
-                        zone_rects.append((zr, idx, is_drag))
+                edge_pen = QPen(QColor("#f59e0b"), 2.2, Qt.PenStyle.SolidLine)
+                edge_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                painter.setPen(edge_pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawPolygon(qpoly)
+                painter.restore()
 
-                # Dim areas outside the union of all Chime Trigger Zones
-                if zone_rects:
-                    outer_path = QPainterPath()
-                    outer_path.addRect(QRectF(target))
-                    holes_path = QPainterPath()
-                    holes_path.setFillRule(Qt.FillRule.WindingFill)
-                    for zr, _, _ in zone_rects:
-                        holes_path.addRect(QRectF(zr))
-                    dim_path = outer_path.subtracted(holes_path.simplified())
-                    painter.save()
-                    painter.setPen(Qt.PenStyle.NoPen)
-                    painter.setBrush(QColor(5, 5, 10, 148))
-                    painter.drawPath(dim_path)
-                    painter.restore()
+                # Draw draggable node handles at each vertex
+                for v_idx, pt in enumerate(qpts):
+                    is_active_v = (
+                        self._chime_drag_vertex == (idx, v_idx)
+                        or self._chime_hover_vertex == (idx, v_idx)
+                    )
+                    rad = 6.5 if is_active_v else 4.8
+                    painter.setPen(
+                        QPen(QColor("#ffffff" if is_active_v else "#18181b"), 1.6)
+                    )
+                    painter.setBrush(
+                        QColor("#38bdf8" if is_active_v else "#fbbf24")
+                    )
+                    painter.drawEllipse(pt, rad, rad)
 
-                for z_rect, idx, is_drag in zone_rects:
-                    painter.fillRect(z_rect, QColor(245, 158, 11, 34 if is_drag else 24))
-                    dash_pen = QPen(
-                        QColor("#fde68a" if is_drag else "#f59e0b"),
+                # Zone tag badge (anchored near the topmost vertex of the polygon)
+                top_pt = min(qpts, key=lambda p: (p.y(), p.x()))
+                tag_label = f"CHIME #{idx + 1}  ×"
+                tag_w, tag_h = 88, 20
+                tag_x = max(target.left() + 4, min(target.right() - tag_w - 4, int(round(top_pt.x() - tag_w * 0.5))))
+                top_y = int(round(top_pt.y()))
+                tag_y = top_y - tag_h - 8 if (top_y - tag_h - 8) >= (target.top() + 38) else (top_y + 10)
+                tag_rect = QRect(tag_x, tag_y, tag_w, tag_h)
+                hov_del = (
+                    not self._chime_draft_nodes
+                    and self._hover_pos is not None
+                    and tag_rect.contains(self._hover_pos)
+                )
+                self._chime_delete_rects.append((tag_rect, idx))
+                painter.setPen(QPen(QColor("#ef4444" if hov_del else "#f59e0b"), 1.1))
+                painter.setBrush(
+                    QColor(153, 27, 27, 240) if hov_del else QColor(24, 18, 10, 232)
+                )
+                painter.drawRoundedRect(tag_rect, 4, 4)
+                painter.setPen(QColor("#ffffff" if hov_del else "#fde68a"))
+                painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+                painter.drawText(
+                    tag_rect,
+                    Qt.AlignmentFlag.AlignCenter,
+                    f"REMOVE #{idx + 1}" if hov_del else tag_label,
+                )
+
+            # Draw in-progress open polygon loop (when user is placing nodes)
+            if self._chime_draft_nodes:
+                draft_pts = [self._norm_to_pointf(v[0], v[1], target) for v in self._chime_draft_nodes]
+                near_start = (
+                    self._hover_pos is not None
+                    and self._is_near_draft_start_node(self._hover_pos)
+                )
+                cur_pt: Optional[QPointF] = None
+                if self._hover_pos is not None:
+                    if near_start:
+                        cur_pt = draft_pts[0]
+                    else:
+                        cxn, cyn = self._pos_to_norm(self._hover_pos)
+                        cur_pt = self._norm_to_pointf(cxn, cyn, target)
+
+                # Translucent preview fill of the polygon as it's being drawn
+                preview_pts = list(draft_pts)
+                if cur_pt is not None and not near_start:
+                    preview_pts.append(cur_pt)
+                if len(preview_pts) >= 3:
+                    prev_path = QPainterPath()
+                    prev_path.setFillRule(Qt.FillRule.OddEvenFill)
+                    prev_path.addPolygon(QPolygonF(preview_pts))
+                    prev_path.closeSubpath()
+                    painter.fillPath(
+                        prev_path,
+                        QColor(16, 185, 129, 42) if near_start else QColor(245, 158, 11, 28),
+                    )
+
+                # Solid placed edges
+                if len(draft_pts) >= 2:
+                    solid_pen = QPen(
+                        QColor("#10b981" if near_start else "#fbbf24"),
+                        2.3,
+                        Qt.PenStyle.SolidLine,
+                    )
+                    solid_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                    painter.setPen(solid_pen)
+                    for i in range(len(draft_pts) - 1):
+                        painter.drawLine(draft_pts[i], draft_pts[i + 1])
+
+                # Rubber-band edge from last placed node to cursor + faint closing preview line to start node
+                if cur_pt is not None:
+                    rb_pen = QPen(
+                        QColor("#10b981" if near_start else "#fde68a"),
                         2.0,
                         Qt.PenStyle.DashLine,
                     )
-                    painter.setPen(dash_pen)
-                    painter.setBrush(Qt.BrushStyle.NoBrush)
-                    painter.drawRect(z_rect)
+                    painter.setPen(rb_pen)
+                    painter.drawLine(draft_pts[-1], cur_pt)
+                    if len(draft_pts) >= 2 and not near_start:
+                        ghost_pen = QPen(QColor(251, 191, 36, 110), 1.3, Qt.PenStyle.DotLine)
+                        painter.setPen(ghost_pen)
+                        painter.drawLine(cur_pt, draft_pts[0])
 
-                    # Bold corner L-handles on each zone rectangle
-                    arm = max(8, min(18, min(z_rect.width(), z_rect.height()) // 4))
-                    c_pen = QPen(QColor("#fbbf24"), 3.2)
-                    c_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-                    painter.setPen(c_pen)
-                    zl, zt, zr, zb = z_rect.left(), z_rect.top(), z_rect.right(), z_rect.bottom()
-                    painter.drawLine(zl, zt, zl + arm, zt)
-                    painter.drawLine(zl, zt, zl, zt + arm)
-                    painter.drawLine(zr - arm, zt, zr, zt)
-                    painter.drawLine(zr, zt, zr, zt + arm)
-                    painter.drawLine(zl, zb - arm, zl, zb)
-                    painter.drawLine(zl, zb, zl + arm, zb)
-                    painter.drawLine(zr - arm, zb, zr, zb)
-                    painter.drawLine(zr, zb - arm, zr, zb)
+                # Draw placed nodes (with start node #1 highlighted as the loop-closing target)
+                for i, pt in enumerate(draft_pts):
+                    if i == 0:
+                        can_close = len(draft_pts) >= 3
+                        r0 = 8.0 if (can_close and near_start) else (6.5 if can_close else 5.5)
+                        painter.setPen(
+                            QPen(QColor("#ffffff"), 2.0)
+                        )
+                        painter.setBrush(
+                            QColor("#10b981" if can_close else "#fbbf24")
+                        )
+                        painter.drawEllipse(pt, r0, r0)
+                        if can_close:
+                            lbl_txt = "CLICK TO CLOSE LOOP" if near_start else "START NODE (CLICK TO CLOSE)"
+                            lw = 136 if near_start else 166
+                            lh = 19
+                            lx = max(target.left() + 4, min(target.right() - lw - 4, int(round(pt.x() - lw * 0.5))))
+                            ly = int(round(pt.y())) - lh - 10
+                            if ly < target.top() + 40:
+                                ly = int(round(pt.y())) + 12
+                            lrect = QRect(lx, ly, lw, lh)
+                            painter.setPen(QPen(QColor("#10b981"), 1.1))
+                            painter.setBrush(QColor(6, 78, 59, 238) if near_start else QColor(14, 24, 20, 228))
+                            painter.drawRoundedRect(lrect, 4, 4)
+                            painter.setPen(QColor("#ecfdf5" if near_start else "#6ee7b7"))
+                            painter.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+                            painter.drawText(lrect, Qt.AlignmentFlag.AlignCenter, lbl_txt)
+                    else:
+                        painter.setPen(QPen(QColor("#18181b"), 1.5))
+                        painter.setBrush(QColor("#fde68a"))
+                        painter.drawEllipse(pt, 4.8, 4.8)
 
-                    # Zone tag badge (with clickable '×' delete hit rect for saved boxes)
-                    tag_label = f"NEW ZONE #{idx + 1}" if is_drag else f"CHIME #{idx + 1}  ×"
-                    tag_w, tag_h = (92 if is_drag else 88), 20
-                    tag_x = max(target.left() + 4, min(target.right() - tag_w - 4, zl))
-                    tag_y = zt - tag_h - 4 if (zt - tag_h - 4) >= (target.top() + 38) else (zt + 5)
-                    tag_rect = QRect(tag_x, tag_y, tag_w, tag_h)
-                    hov_del = (
-                        not is_drag
-                        and self._hover_pos is not None
-                        and tag_rect.contains(self._hover_pos)
-                    )
-                    if not is_drag:
-                        self._chime_delete_rects.append((tag_rect, idx))
-                    painter.setPen(QPen(QColor("#ef4444" if hov_del else "#f59e0b"), 1.1))
-                    painter.setBrush(
-                        QColor(153, 27, 27, 240) if hov_del else QColor(24, 18, 10, 232)
-                    )
-                    painter.drawRoundedRect(tag_rect, 4, 4)
-                    painter.setPen(QColor("#ffffff" if hov_del else "#fde68a"))
-                    painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-                    painter.drawText(
-                        tag_rect,
-                        Qt.AlignmentFlag.AlignCenter,
-                        f"REMOVE #{idx + 1}" if hov_del else tag_label,
-                    )
-            else:
+            elif not poly_items:
                 # Whole Frame currently active in edit mode
                 vis_t = target.adjusted(2, 2, -2, -2)
                 painter.setPen(QPen(QColor(245, 158, 11, 185), 2.0, Qt.PenStyle.DashLine))
                 painter.setBrush(QColor(245, 158, 11, 14))
                 painter.drawRect(vis_t)
 
-                hint_w = min(rect.width() - 24, 380)
+                hint_w = min(rect.width() - 24, 430)
                 hint_h = 28
                 hint_rect = QRect(rect.center().x() - hint_w // 2, rect.center().y() - hint_h // 2, hint_w, hint_h)
                 painter.setPen(QPen(QColor(245, 158, 11, 160), 1.0))
@@ -2858,11 +3124,11 @@ class VideoCanvas(QWidget):
                 painter.drawText(
                     hint_rect,
                     Qt.AlignmentFlag.AlignCenter,
-                    f"Whole Frame Active — Drag to add up to {CameraConfig.MAX_CHIME_ZONES} Chime Zones",
+                    "Click on Footage to Place Polygon Nodes • Close Loop at Start Node",
                 )
 
-            # Top Interactive HUD Control Bar for Multi-Zone Chime Area Editor
-            bar_w = min(rect.width() - 12, 440)
+            # Top Interactive HUD Control Bar for Polygon Chime Zone Editor
+            bar_w = min(rect.width() - 12, 500)
             bar_h = 30
             bar_x = max(6, rect.center().x() - bar_w // 2)
             bar_y = 8
@@ -2872,7 +3138,7 @@ class VideoCanvas(QWidget):
             painter.drawRoundedRect(bar_rect, 6, 6)
 
             done_w, done_h = 54, 22
-            reset_w, reset_h = 80, 22
+            reset_w, reset_h = 76, 22
             done_x = bar_rect.right() - done_w - 6
             done_y = bar_y + (bar_h - done_h) // 2
             reset_x = done_x - reset_w - 6
@@ -2881,14 +3147,41 @@ class VideoCanvas(QWidget):
             self._chime_done_rect = QRect(done_x, done_y, done_w, done_h)
             self._chime_reset_rect = QRect(reset_x, reset_y, reset_w, reset_h)
 
-            lbl_rect = QRect(bar_x + 10, bar_y, max(60, reset_x - bar_x - 14), bar_h)
+            right_most_btn_x = reset_x
+            if self._chime_draft_nodes:
+                can_close_draft = len(self._chime_draft_nodes) >= 3
+                act_w = 78 if can_close_draft else 72
+                act_x = reset_x - act_w - 6
+                self._chime_undo_rect = QRect(act_x, done_y, act_w, done_h)
+                right_most_btn_x = act_x
+                hov_act = self._hover_pos is not None and self._chime_undo_rect.contains(self._hover_pos)
+                if can_close_draft:
+                    painter.setPen(QPen(QColor("#34d399" if hov_act else "#10b981"), 1.0))
+                    painter.setBrush(QColor(5, 150, 105, 240) if hov_act else QColor(6, 95, 70, 230))
+                    act_lbl = "Close Loop"
+                else:
+                    painter.setPen(QPen(QColor("#fbbf24" if hov_act else "#52525b"), 1.0))
+                    painter.setBrush(QColor(63, 63, 70, 240) if hov_act else QColor(24, 24, 30, 220))
+                    act_lbl = "Undo Node"
+                painter.drawRoundedRect(self._chime_undo_rect, 4, 4)
+                painter.setPen(QColor("#ffffff"))
+                painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+                painter.drawText(self._chime_undo_rect, Qt.AlignmentFlag.AlignCenter, act_lbl)
+
+            lbl_rect = QRect(bar_x + 10, bar_y, max(60, right_most_btn_x - bar_x - 14), bar_h)
             painter.setPen(QColor("#fef3c7"))
             painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-            status_lbl = (
-                f"CHIME ZONES ({len(saved_zones)}/{CameraConfig.MAX_CHIME_ZONES}) — DRAG TO ADD • × TO REMOVE"
-                if saved_zones
-                else f"DRAG TO ADD CHIME ZONES (0/{CameraConfig.MAX_CHIME_ZONES})"
-            )
+            if self._chime_draft_nodes:
+                n_pts = len(self._chime_draft_nodes)
+                status_lbl = (
+                    f"DRAWING ({n_pts} NODES) — CLICK START NODE OR DOUBLE-CLICK TO CLOSE"
+                    if n_pts >= 3
+                    else f"PLACING NODES ({n_pts}/3 MIN) — CLICK TO ADD • RIGHT-CLICK UNDO"
+                )
+            elif saved_zones:
+                status_lbl = f"ZONES ({len(saved_zones)}/{CameraConfig.MAX_CHIME_ZONES}) — CLICK TO ADD SHAPE • DRAG NODES TO EDIT"
+            else:
+                status_lbl = f"CLICK TO PLACE NODES (0/{CameraConfig.MAX_CHIME_ZONES}) • CLOSE LOOP TO SAVE"
             painter.drawText(
                 lbl_rect,
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
@@ -2897,7 +3190,7 @@ class VideoCanvas(QWidget):
 
             # 'Full Frame' reset pill
             hov_reset = self._hover_pos is not None and self._chime_reset_rect.contains(self._hover_pos)
-            is_custom = bool(saved_zones)
+            is_custom = bool(saved_zones or self._chime_draft_nodes)
             painter.setPen(
                 QPen(
                     QColor("#fbbf24" if hov_reset else ("#52525b" if is_custom else "#27272a")),
@@ -2930,39 +3223,42 @@ class VideoCanvas(QWidget):
                 return
 
             multi = len(saved_zones) > 1
-            for idx, z_box in enumerate(saved_zones):
+            for idx, z_poly in enumerate(saved_zones):
+                qpts = [self._norm_to_pointf(v[0], v[1], target) for v in z_poly]
+                if len(qpts) < 3:
+                    continue
+                qpoly = QPolygonF(qpts)
                 triggered = any(
                     len(det) >= 4
                     and CameraConfig.box_in_single_chime_box(
                         (float(det[0]), float(det[1]), float(det[2]), float(det[3])),
-                        z_box,
+                        z_poly,
                     )
                     for det in self._detections
                 )
-                zx = int(round(target.left() + z_box[0] * target.width()))
-                zy = int(round(target.top() + z_box[1] * target.height()))
-                zw = max(10, int(round((z_box[2] - z_box[0]) * target.width())))
-                zh = max(10, int(round((z_box[3] - z_box[1]) * target.height())))
-                z_rect = QRect(zx, zy, zw, zh).intersected(target)
-                if z_rect.width() < 8 or z_rect.height() < 8:
-                    continue
 
                 border_col = QColor(251, 191, 36, 225) if triggered else QColor(245, 158, 11, 145)
                 if triggered:
-                    painter.fillRect(z_rect, QColor(245, 158, 11, 22))
+                    fill_path = QPainterPath()
+                    fill_path.setFillRule(Qt.FillRule.OddEvenFill)
+                    fill_path.addPolygon(qpoly)
+                    fill_path.closeSubpath()
+                    painter.fillPath(fill_path, QColor(245, 158, 11, 26))
                 painter.setPen(QPen(border_col, 1.8 if triggered else 1.4, Qt.PenStyle.DashLine))
                 painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.drawRect(z_rect)
+                painter.drawPolygon(qpoly)
 
+                top_pt = min(qpts, key=lambda p: (p.y(), p.x()))
                 base_lbl = f"CHIME #{idx + 1}" if multi else "CHIME AREA"
                 tag_text = f"{base_lbl} • TRIGGERED" if triggered else base_lbl
                 tag_w = (128 if multi else 132) if triggered else (68 if multi else 76)
                 tag_h = 17
-                tag_x = max(target.left() + 4, min(target.right() - tag_w - 4, z_rect.left()))
+                tag_x = max(target.left() + 4, min(target.right() - tag_w - 4, int(round(top_pt.x() - tag_w * 0.5))))
+                top_y = int(round(top_pt.y()))
                 tag_y = (
-                    z_rect.top() - tag_h - 3
-                    if (z_rect.top() - tag_h - 3) >= (target.top() + 4)
-                    else (z_rect.top() + 3)
+                    top_y - tag_h - 4
+                    if (top_y - tag_h - 4) >= (target.top() + 4)
+                    else (top_y + 4)
                 )
                 tag_rect = QRect(tag_x, tag_y, tag_w, tag_h)
                 painter.setPen(QPen(border_col, 1.0))
@@ -3385,6 +3681,15 @@ class CameraTileWidget(QFrame):
             return "SIM"
         if p == "rtsp":
             return "RTSP"
+        if p == "hsc":
+            return "HSC"
+        ip_k = (self.config.ip or "").strip()
+        did_k = str(self.config.device_id or "").strip()
+        with LanCameraDiscovery._REGISTRY_LOCK:
+            if (ip_k and ip_k in LanCameraDiscovery._DETECTED_HSC_DEVICES) or (
+                did_k and did_k != "0" and did_k in LanCameraDiscovery._DETECTED_HSC_DEVICES
+            ):
+                return "HSC"
         return "LAN"
 
     def set_selected(self, selected: bool) -> None:
@@ -3790,6 +4095,9 @@ class CameraTileWidget(QFrame):
 
     def _on_status(self, cam_id: str, status_text: str, is_connected: bool) -> None:
         _ = cam_id
+        new_badge = self._protocol_badge()
+        if self.badge_lbl.text() != new_badge:
+            self.badge_lbl.setText(new_badge)
         self._update_wifi_btn(is_connected)
         self.canvas.set_status(status_text, is_connected)
         low = (status_text or "").lower()
@@ -3838,17 +4146,17 @@ class CameraTileWidget(QFrame):
             if editing:
                 self.btn_chime_zone.setIcon(lucide_icon("scan", "#fbbf24", 14))
                 self.btn_chime_zone.setToolTip(
-                    f"Editing Chime Trigger Zones ({n_zones}/{CameraConfig.MAX_CHIME_ZONES}) — Drag on footage to add zones or click to finish"
+                    f"Editing Chime Trigger Zones ({n_zones}/{CameraConfig.MAX_CHIME_ZONES}) — Click footage to place nodes & close loop, or drag nodes to reshape"
                 )
             elif n_zones > 0:
                 self.btn_chime_zone.setIcon(lucide_icon("scan", "#f59e0b", 14))
                 self.btn_chime_zone.setToolTip(
-                    f"Chime Trigger Area: {zone_desc} Set — Click to add/remove zones (up to {CameraConfig.MAX_CHIME_ZONES})"
+                    f"Chime Trigger Area: {zone_desc} Set — Click to edit polygon nodes or add/remove shapes (up to {CameraConfig.MAX_CHIME_ZONES})"
                 )
             else:
                 self.btn_chime_zone.setIcon(lucide_icon("scan", "#71717a", 14))
                 self.btn_chime_zone.setToolTip(
-                    f"Chime Trigger Area: Whole Frame (Default) — Click to draw up to {CameraConfig.MAX_CHIME_ZONES} custom trigger areas"
+                    f"Chime Trigger Area: Whole Frame (Default) — Click to draw up to {CameraConfig.MAX_CHIME_ZONES} custom polygon trigger shapes"
                 )
 
     def toggle_chime_zone_editor(self) -> None:
@@ -5073,7 +5381,7 @@ class BackupRangeDialog(QDialog):
         vbox.addLayout(form)
 
         # Skip Existing Checkbox
-        self.chk_skip = QCheckBox("Skip clips that already have a local backup on disk")
+        self.chk_skip = QCheckBox("Skip clips that already have a local backup (auto-upgrades silent backups)")
         self.chk_skip.setChecked(True)
         self.chk_skip.setStyleSheet("color: #d4d4d8; font-size: 11px;")
         vbox.addWidget(self.chk_skip)
@@ -5191,6 +5499,7 @@ class FootageReviewWorkspace(QWidget):
 
         self.all_segments: List[RecordingSegment] = []
         self.filtered_segments: List[RecordingSegment] = []
+        self._live_sd_seg_ids: set = set()
         self.local_files: List[Path] = []
         self.current_segment: Optional[RecordingSegment] = None
         self.current_local_file: Optional[Path] = None
@@ -5365,23 +5674,23 @@ class FootageReviewWorkspace(QWidget):
         # Event Type Filter Pills
         ev_row = QHBoxLayout()
         ev_row.setSpacing(6)
-        self.btn_flt_all = QPushButton("All (0)")
+        self.btn_flt_all = QPushButton("All")
         self.btn_flt_all.setObjectName("optBtn")
         self.btn_flt_all.setCheckable(True)
         self.btn_flt_all.setChecked(True)
         self.btn_flt_all.setFixedHeight(30)
         self.btn_flt_all.clicked.connect(lambda: self._set_event_filter("all"))
 
-        self.btn_flt_anom = QPushButton("Anomalies (0)")
+        self.btn_flt_anom = QPushButton("Anomalies")
         self.btn_flt_anom.setObjectName("optBtn")
         self.btn_flt_anom.setCheckable(True)
         self.btn_flt_anom.setFixedHeight(30)
         self.btn_flt_anom.setIcon(lucide_icon("alert_triangle", "#ef4444", 13))
         self.btn_flt_anom.setIconSize(QSize(13, 13))
-        self.btn_flt_anom.setToolTip("Show Only Anomaly / Alarm & Motion Triggered Clips")
+        self.btn_flt_anom.setToolTip("Show Only Anomaly / Alarm Triggered Clips")
         self.btn_flt_anom.clicked.connect(lambda: self._set_event_filter("anomaly"))
 
-        self.btn_flt_norm = QPushButton("Normal (0)")
+        self.btn_flt_norm = QPushButton("Normal")
         self.btn_flt_norm.setObjectName("optBtn")
         self.btn_flt_norm.setCheckable(True)
         self.btn_flt_norm.setFixedHeight(30)
@@ -5645,7 +5954,6 @@ class FootageReviewWorkspace(QWidget):
         self._tl_legend_dots: List[Tuple[QLabel, str, str]] = []
         for dot_col, full_txt, short_txt in (
             ("#ef4444", "Anomaly / Alarm", "Alarm"),
-            ("#f59e0b", "Motion", "Motion"),
             ("#3b82f6", "Continuous", "Cont."),
             ("#10b981", "Local Backup", "Backup"),
         ):
@@ -5906,6 +6214,30 @@ class FootageReviewWorkspace(QWidget):
         self.btn_flt_norm.setChecked(flt == "normal")
         self._populate_sd_clip_list()
 
+        # If the currently loaded/playing clip does not belong to the newly selected filter,
+        # switch playback (if playing) or reset selection so replay only plays the active filter.
+        if (
+            self.source_mode == "sdcard"
+            and self.current_segment is not None
+            and all(s.seg_id != self.current_segment.seg_id for s in self.filtered_segments)
+        ):
+            was_playing = (
+                (self.play_worker is not None and self.play_worker.isRunning() and not self.play_worker.is_paused())
+                or self._pending_sd_play is not None
+            )
+            prev_ts = self.current_position_ts or self.current_segment.start_ts
+            self.stop_playback()
+            self.current_segment = None
+            self.current_position_ts = 0
+            if was_playing and self.filtered_segments:
+                nxt = next(
+                    (s for s in self.filtered_segments if s.start_ts >= prev_ts),
+                    self.filtered_segments[0],
+                )
+                self.play_sd_segment(nxt, start_ts=nxt.start_ts)
+            else:
+                self.timeline.set_playhead(0, ensure_visible=False)
+
     def _day_start_utc_ts(self) -> int:
         qd = self.date_edit.date()
         dt = datetime(qd.year(), qd.month(), qd.day(), 0, 0, 0, tzinfo=timezone.utc)
@@ -5978,6 +6310,7 @@ class FootageReviewWorkspace(QWidget):
             self._retire_thread(old_lw)
 
         qd = self.date_edit.date()
+        self._live_sd_seg_ids = set()
         self.canvas.set_camera_info(cfg.name, f"SD Card • {qd.toString('MMMM d, yyyy')}")
 
         # Immediately load any local backups for this camera & date so they appear in the
@@ -5986,13 +6319,6 @@ class FootageReviewWorkspace(QWidget):
         if local_bk_segs:
             self.all_segments = list(local_bk_segs)
             backed_ids = {s.seg_id for s in local_bk_segs}
-            total = len(self.all_segments)
-            anom = sum(1 for s in self.all_segments if s.is_anomaly)
-            norm = total - anom
-            self.btn_flt_all.setText(f"All ({total})")
-            self.btn_flt_anom.setText(f"Anomalies ({anom})")
-            self.btn_flt_norm.setText(f"Normal ({norm})")
-            self.timeline.set_day_and_segments(self._day_start_utc_ts(), self.all_segments, backed_ids)
             self._populate_sd_clip_list()
             self.lbl_list_status.setText(f"{len(backed_ids)} backed up • Syncing SD...")
             if self.play_worker is None or not self.play_worker.isRunning():
@@ -6001,8 +6327,11 @@ class FootageReviewWorkspace(QWidget):
                     False,
                 )
         else:
+            self.all_segments = []
+            self.filtered_segments = []
             self.lbl_list_status.setText("Reading SD...")
             self.clip_list.clear()
+            self.timeline.set_day_and_segments(self._day_start_utc_ts(), [], set())
             self.canvas.set_status(f"Reading microSD card on {cfg.name}...", False)
 
         self.list_worker = SDCardListWorker(cfg, qd.year(), qd.month(), qd.day(), self)
@@ -6022,6 +6351,7 @@ class FootageReviewWorkspace(QWidget):
     def _on_sd_list_finished(self, ok: bool, summary: str, segments: list) -> None:
         cfg = self._active_config()
         qd = self.date_edit.date()
+        self._live_sd_seg_ids = {s.seg_id for s in segments if isinstance(s, RecordingSegment)}
         local_bk_segs = (
             load_local_backup_segments(BACKUP_DIR, cfg, qd.year(), qd.month(), qd.day())
             if cfg is not None
@@ -6044,17 +6374,12 @@ class FootageReviewWorkspace(QWidget):
 
         total = len(self.all_segments)
         anom = sum(1 for s in self.all_segments if s.is_anomaly)
-        norm = total - anom
-        self.btn_flt_all.setText(f"All ({total})")
-        self.btn_flt_anom.setText(f"Anomalies ({anom})")
-        self.btn_flt_norm.setText(f"Normal ({norm})")
 
         if backed_ids:
             self.lbl_list_status.setText(f"{total} clips • {len(backed_ids)} backed up")
         else:
             self.lbl_list_status.setText(summary)
 
-        self.timeline.set_day_and_segments(self._day_start_utc_ts(), self.all_segments, backed_ids)
         self._populate_sd_clip_list()
         self._launch_sd_thumbnail_fetcher()
 
@@ -6106,6 +6431,12 @@ class FootageReviewWorkspace(QWidget):
             self.filtered_segments = [s for s in self.all_segments if not s.is_anomaly]
         else:
             self.filtered_segments = list(self.all_segments)
+
+        if self.source_mode == "sdcard":
+            backed_ids = self._compute_backed_up_ids(self.filtered_segments)
+            self.timeline.set_day_and_segments(
+                self._day_start_utc_ts(), self.filtered_segments, backed_ids
+            )
 
         cfg = self._active_config()
         ordered_segs = reversed(self.filtered_segments) if self.sort_newest_first else self.filtered_segments
@@ -6181,7 +6512,7 @@ class FootageReviewWorkspace(QWidget):
             self.play_local_capture(Path(data))
 
     def _select_clip_in_list(self, segment: RecordingSegment) -> None:
-        """Select and scroll to `segment` in `self.clip_list` (switching filter to All if hidden)."""
+        """Select and scroll to `segment` in `self.clip_list`."""
         found_item: Optional[QListWidgetItem] = None
         for i in range(self.clip_list.count()):
             it = self.clip_list.item(i)
@@ -6190,16 +6521,6 @@ class FootageReviewWorkspace(QWidget):
                 if isinstance(data, RecordingSegment) and data.seg_id == segment.seg_id:
                     found_item = it
                     break
-
-        if found_item is None and self.event_filter != "all":
-            self._set_event_filter("all")
-            for i in range(self.clip_list.count()):
-                it = self.clip_list.item(i)
-                if it is not None:
-                    data = it.data(Qt.ItemDataRole.UserRole)
-                    if isinstance(data, RecordingSegment) and data.seg_id == segment.seg_id:
-                        found_item = it
-                        break
 
         if found_item is not None:
             self.clip_list.blockSignals(True)
@@ -6229,6 +6550,22 @@ class FootageReviewWorkspace(QWidget):
         # Only 1x is available for footage still on the SD card; 2x-16x unlock when downloaded locally
         self._update_speed_controls_lock(unlocked=(local_backup is not None))
 
+        # If a legacy backup file was saved without an audio track and the clip is still on the SD card,
+        # stream 1x playback from the SD card so audio is audible (until the user re-downloads/upgrades it)
+        use_local_file = local_backup is not None
+        legacy_silent_bk = (
+            local_backup is not None
+            and bool(cfg.audio_enabled)
+            and (cfg.protocol or "lan8800").lower() != "demo"
+            and not mp4_has_audio_track(local_backup)
+        )
+        if (
+            legacy_silent_bk
+            and segment.seg_id in self._live_sd_seg_ids
+            and abs(self.playback_speed - 1.0) < 0.05
+        ):
+            use_local_file = False
+
         self.lbl_player_title.setText(
             f"{cfg.name}  •  {segment.date_str}  {segment.start_time_str} – {segment.end_time_str} ({segment.duration_str})"
         )
@@ -6250,7 +6587,7 @@ class FootageReviewWorkspace(QWidget):
             )
         self.lbl_event_badge.setVisible(True)
 
-        if local_backup is not None:
+        if use_local_file and local_backup is not None:
             self.lbl_backup_badge.setVisible(True)
             self.lbl_backup_badge.setToolTip(f"Playing local backup file:\n{local_backup}")
             self.canvas.set_camera_info(cfg.name, f"Local Backup • {segment.kind_label}")
@@ -6270,7 +6607,12 @@ class FootageReviewWorkspace(QWidget):
             self._update_play_pause_btn(is_playing=True)
         else:
             self._stop_thumb_worker()
-            self.lbl_backup_badge.setVisible(False)
+            self.lbl_backup_badge.setVisible(local_backup is not None)
+            if legacy_silent_bk:
+                self.lbl_backup_badge.setToolTip(
+                    "Legacy local backup had no audio — streaming with audio from SD card.\n"
+                    "Right-click -> Re-Download Local Backup (or run Bulk Backup) to upgrade with audio."
+                )
             self.canvas.set_camera_info(cfg.name, f"SD Playback • {segment.kind_label}")
             self.canvas.set_status("Connecting to SD Card...", False)
             # Debounce rapid clicks across un-downloaded SD card clips by 120ms so only the
@@ -6338,7 +6680,9 @@ class FootageReviewWorkspace(QWidget):
             parent=self,
         )
         self.play_worker.frame_ready.connect(self._on_playback_frame)
+        self.play_worker.audio_ready.connect(self._on_playback_audio)
         self.play_worker.status_changed.connect(self._on_playback_status)
+        self.play_worker.segment_finished.connect(self._on_segment_finished)
         self.play_worker.start()
         self._update_play_pause_btn(is_playing=True)
 
@@ -6421,23 +6765,26 @@ class FootageReviewWorkspace(QWidget):
         self.main_win.status_bar.showMessage(msg, 4000)
 
     def _on_segment_finished(self) -> None:
-        # Auto-advance to the next chronological segment on the SD card
+        # Auto-advance to the next chronological segment within the active filter
         if self.source_mode == "sdcard" and self.current_segment is not None:
+            segs = self.filtered_segments if self.event_filter != "all" else self.all_segments
             nxt = next(
-                (s for s in self.all_segments if s.start_ts > self.current_segment.start_ts),
+                (s for s in segs if s.start_ts > self.current_segment.start_ts),
                 None,
             )
             if nxt is not None:
                 self.play_sd_segment(nxt, start_ts=nxt.start_ts)
                 return
+            self.current_position_ts = self.current_segment.start_ts
         self._update_play_pause_btn(is_playing=False)
 
     def _on_timeline_seek(self, target_ts: int, from_timeline_click: bool = True) -> None:
-        if self.source_mode != "sdcard" or not self.all_segments:
+        segs = self.filtered_segments if self.event_filter != "all" else self.all_segments
+        if self.source_mode != "sdcard" or not segs:
             return
         # 1. Exact segment match if target_ts is inside an anomaly segment
         exact_anom = next(
-            (s for s in self.all_segments if s.is_anomaly and s.start_ts <= target_ts < s.end_ts),
+            (s for s in segs if s.is_anomaly and s.start_ts <= target_ts < s.end_ts),
             None,
         )
         if exact_anom is not None:
@@ -6449,7 +6796,7 @@ class FootageReviewWorkspace(QWidget):
             tl_w = max(100.0, float(self.timeline.width() - 16))
             anom_tol = max(2, int(round((self.timeline._view_span_sec / tl_w) * 3.5)))
             near_anoms = [
-                s for s in self.all_segments
+                s for s in segs
                 if s.is_anomaly and (s.start_ts - anom_tol) <= target_ts <= (s.end_ts + anom_tol)
             ]
             if near_anoms:
@@ -6460,16 +6807,16 @@ class FootageReviewWorkspace(QWidget):
                 self.play_sd_segment(seg, start_ts=seg.start_ts)
                 return
 
-        # 3. Exact segment match (continuous or any segment)
+        # 3. Exact segment match (continuous or any segment in active filter)
         seg = next(
-            (s for s in self.all_segments if s.start_ts <= target_ts < s.end_ts),
+            (s for s in segs if s.start_ts <= target_ts < s.end_ts),
             None,
         )
-        # 4. Next chronological segment (or last segment of the day)
+        # 4. Next chronological segment (or last segment of the active filter)
         if seg is None:
-            seg = next((s for s in self.all_segments if s.start_ts >= target_ts), None)
-            if seg is None and self.all_segments:
-                seg = self.all_segments[-1]
+            seg = next((s for s in segs if s.start_ts >= target_ts), None)
+            if seg is None and segs:
+                seg = segs[-1]
             if seg is not None:
                 target_ts = seg.start_ts
         if seg is not None:
@@ -6483,10 +6830,16 @@ class FootageReviewWorkspace(QWidget):
             return
 
         if self.source_mode == "sdcard":
-            if self.current_segment is not None:
-                self.play_sd_segment(self.current_segment, start_ts=self.current_position_ts or self.current_segment.start_ts)
+            if (
+                self.current_segment is not None
+                and any(s.seg_id == self.current_segment.seg_id for s in self.filtered_segments)
+            ):
+                replay_ts = self.current_position_ts or self.current_segment.start_ts
+                if replay_ts >= self.current_segment.end_ts - 1:
+                    replay_ts = self.current_segment.start_ts
+                self.play_sd_segment(self.current_segment, start_ts=replay_ts)
             elif self.filtered_segments:
-                first_seg = self.filtered_segments[-1]
+                first_seg = self.filtered_segments[-1] if self.sort_newest_first else self.filtered_segments[0]
                 self.play_sd_segment(first_seg, start_ts=first_seg.start_ts)
         elif self.source_mode == "local" and self.current_local_file is not None:
             self.play_local_capture(self.current_local_file)
@@ -6524,15 +6877,21 @@ class FootageReviewWorkspace(QWidget):
         for spd, btn in self.speed_btns.items():
             btn.setChecked(abs(spd - speed) < 0.05)
         if self.play_worker is not None and self.play_worker.isRunning():
-            # If the clip finished downloading while playing from SD, switch seamlessly to local backup playback
-            if not self.play_worker.local_file and self.source_mode == "sdcard" and self.current_segment is not None:
+            if self.source_mode == "sdcard" and self.current_segment is not None:
                 cfg = self._active_config()
-                if cfg and find_segment_backup_file(BACKUP_DIR, cfg, self.current_segment) is not None:
-                    self.play_sd_segment(
-                        self.current_segment,
-                        start_ts=self.current_position_ts or self.current_segment.start_ts,
+                bk = find_segment_backup_file(BACKUP_DIR, cfg, self.current_segment) if cfg else None
+                if bk is not None:
+                    has_bk_aud = mp4_has_audio_track(bk) or not bool(cfg and cfg.audio_enabled)
+                    want_local = has_bk_aud or abs(speed - 1.0) >= 0.05 or (
+                        self.current_segment.seg_id not in self._live_sd_seg_ids
                     )
-                    return
+                    currently_local = bool(self.play_worker.local_file)
+                    if want_local != currently_local:
+                        self.play_sd_segment(
+                            self.current_segment,
+                            start_ts=self.current_position_ts or self.current_segment.start_ts,
+                        )
+                        return
             self.play_worker.set_speed(speed)
 
     def _update_play_pause_btn(self, is_playing: bool) -> None:
@@ -8654,14 +9013,15 @@ class OmniSightMainWindow(QMainWindow):
                 self.select_camera(existing.cam_id)
                 self.edit_selected_camera()
                 return
+            is_hsc_found = getattr(found, "protocol", "lan8800") == "hsc"
             preset = CameraConfig(
                 cam_id=uuid.uuid4().hex[:8],
                 name=found.name or "Camera",
-                protocol="lan8800",
+                protocol="hsc" if is_hsc_found else "lan8800",
                 ip=found.ip,
                 port=found.port,
                 device_id=found.dev_id,
-                username=found.dev_id or "admin",
+                username="" if is_hsc_found else (found.dev_id or "admin"),
                 password="",
                 quality=1,
             )
@@ -9025,7 +9385,7 @@ class OmniSightMainWindow(QMainWindow):
         self._sync_optics_buttons(tile.config)
         if editing:
             self.status_bar.showMessage(
-                f"Click and drag a box on '{tile.config.name}' footage to set the Chime Trigger Area (e.g. Gate). Click Done or press Esc when finished.",
+                f"Click on '{tile.config.name}' footage to place polygon nodes, then click the start node (or double-click) to close the loop. Drag nodes to reshape.",
                 6000,
             )
         else:

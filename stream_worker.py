@@ -37,7 +37,9 @@ from PyQt6.QtMultimedia import QAudioFormat, QAudioSink, QMediaDevices
 
 from omnisight_protocol import (
     CameraFrame,
+    HscCameraClient,
     LanCameraClient,
+    LanCameraDiscovery,
     RecordingSegment,
     VideoCodec,
     decode_adpcm_to_pcm16,
@@ -224,7 +226,7 @@ def _dpapi_decrypt(value: str) -> str:
 class CameraConfig:
     cam_id: str
     name: str
-    protocol: str = "lan8800"  # "lan8800" | "rtsp" | "demo"
+    protocol: str = "lan8800"  # "lan8800" | "hsc" | "rtsp" | "demo"
     ip: str = "192.168.1.100"
     port: int = 8800
     device_id: str = ""
@@ -240,7 +242,7 @@ class CameraConfig:
     detection_sensitivity: str = "ultra"  # "standard" | "high" | "ultra"
     detection_sound: bool = True
     detection_sound_cooldown: int = 10  # 5 | 10 | 20 seconds
-    chime_zone: Optional[Any] = None  # None = whole frame, or [[x1, y1, x2, y2], ...] (up to 10 boxes, backward-compatible with single [x1,y1,x2,y2])
+    chime_zone: Optional[Any] = None  # None = whole frame, or list of closed polygons [[[x1,y1],[x2,y2],[x3,y3],...], ...] (backward-compatible with legacy [x1,y1,x2,y2] boxes)
     gpu_acceleration: bool = True
     ptz_presets: List[Dict[str, Any]] = field(default_factory=list)
     ignored_objects: List[Dict[str, Any]] = field(default_factory=list)
@@ -251,94 +253,226 @@ class CameraConfig:
     MAX_CHIME_ZONES = 10
 
     @staticmethod
-    def normalize_single_chime_box(zone: Any) -> Optional[List[float]]:
-        """Validate and normalize a single chime trigger box [x1, y1, x2, y2] in [0.0..1.0], or None."""
-        if not zone or not isinstance(zone, (list, tuple)) or len(zone) < 4:
+    def _polygon_area(pts: List[List[float]]) -> float:
+        """Return the unsigned area of a 2D polygon using the Shoelace formula."""
+        n = len(pts)
+        if n < 3:
+            return 0.0
+        area2 = 0.0
+        for i in range(n):
+            x1, y1 = pts[i][0], pts[i][1]
+            x2, y2 = pts[(i + 1) % n][0], pts[(i + 1) % n][1]
+            area2 += x1 * y2 - x2 * y1
+        return abs(area2) * 0.5
+
+    @staticmethod
+    def _point_in_polygon(px: float, py: float, pts: List[List[float]]) -> bool:
+        """Return True if point (px, py) lies inside or on the boundary of polygon `pts` (ray-casting)."""
+        n = len(pts)
+        if n < 3:
+            return False
+        inside = False
+        j = n - 1
+        for i in range(n):
+            xi, yi = pts[i][0], pts[i][1]
+            xj, yj = pts[j][0], pts[j][1]
+            if (yi > py) != (yj > py):
+                x_int = (xj - xi) * (py - yi) / ((yj - yi) or 1e-12) + xi
+                if px <= x_int:
+                    inside = not inside
+            j = i
+        return inside
+
+    @staticmethod
+    def _clip_polygon_to_rect(
+        pts: List[List[float]],
+        rx1: float,
+        ry1: float,
+        rx2: float,
+        ry2: float,
+    ) -> List[List[float]]:
+        """Clip an arbitrary polygon `pts` against axis-aligned box [rx1, ry1, rx2, ry2] (Sutherland-Hodgman)."""
+        def clip_edge(poly: List[List[float]], inside_fn, intersect_fn) -> List[List[float]]:
+            if not poly:
+                return []
+            out: List[List[float]] = []
+            prev = poly[-1]
+            prev_in = inside_fn(prev)
+            for curr in poly:
+                curr_in = inside_fn(curr)
+                if curr_in:
+                    if not prev_in:
+                        out.append(intersect_fn(prev, curr))
+                    out.append(curr)
+                elif prev_in:
+                    out.append(intersect_fn(prev, curr))
+                prev = curr
+                prev_in = curr_in
+            return out
+
+        res = list(pts)
+        # Left: x >= rx1
+        res = clip_edge(
+            res,
+            lambda p: p[0] >= rx1,
+            lambda p1, p2: [rx1, p1[1] + (p2[1] - p1[1]) * (rx1 - p1[0]) / ((p2[0] - p1[0]) or 1e-12)],
+        )
+        # Right: x <= rx2
+        res = clip_edge(
+            res,
+            lambda p: p[0] <= rx2,
+            lambda p1, p2: [rx2, p1[1] + (p2[1] - p1[1]) * (rx2 - p1[0]) / ((p2[0] - p1[0]) or 1e-12)],
+        )
+        # Top: y >= ry1
+        res = clip_edge(
+            res,
+            lambda p: p[1] >= ry1,
+            lambda p1, p2: [p1[0] + (p2[0] - p1[0]) * (ry1 - p1[1]) / ((p2[1] - p1[1]) or 1e-12), ry1],
+        )
+        # Bottom: y <= ry2
+        res = clip_edge(
+            res,
+            lambda p: p[1] <= ry2,
+            lambda p1, p2: [p1[0] + (p2[0] - p1[0]) * (ry2 - p1[1]) / ((p2[1] - p1[1]) or 1e-12), ry2],
+        )
+        return res
+
+    @staticmethod
+    def normalize_single_chime_box(zone: Any) -> Optional[List[List[float]]]:
+        """
+        Validate and normalize a single chime trigger zone into a closed polygon
+        `[[x1, y1], [x2, y2], [x3, y3], ...]` with coordinates in [0.0..1.0], or `None`.
+        Automatically upgrades legacy 4-float rectangles `[x1, y1, x2, y2]` into 4-vertex polygons.
+        """
+        if not zone or not isinstance(zone, (list, tuple)):
             return None
-        if isinstance(zone[0], (list, tuple)):
+
+        # Legacy 4-float rectangle [x1, y1, x2, y2]
+        if len(zone) == 4 and not isinstance(zone[0], (list, tuple)):
+            try:
+                x1 = max(0.0, min(1.0, float(zone[0])))
+                y1 = max(0.0, min(1.0, float(zone[1])))
+                x2 = max(0.0, min(1.0, float(zone[2])))
+                y2 = max(0.0, min(1.0, float(zone[3])))
+                if x1 > x2:
+                    x1, x2 = x2, x1
+                if y1 > y2:
+                    y1, y2 = y2, y1
+                if (x2 - x1) < 0.02 or (y2 - y1) < 0.02:
+                    return None
+                if x1 <= 0.01 and y1 <= 0.01 and x2 >= 0.99 and y2 >= 0.99:
+                    return None
+                rx1, ry1, rx2, ry2 = round(x1, 4), round(y1, 4), round(x2, 4), round(y2, 4)
+                return [[rx1, ry1], [rx2, ry1], [rx2, ry2], [rx1, ry2]]
+            except Exception:
+                return None
+
+        # Polygon list of [x, y] vertices
+        if len(zone) < 3:
             return None
+        pts: List[List[float]] = []
         try:
-            x1 = max(0.0, min(1.0, float(zone[0])))
-            y1 = max(0.0, min(1.0, float(zone[1])))
-            x2 = max(0.0, min(1.0, float(zone[2])))
-            y2 = max(0.0, min(1.0, float(zone[3])))
-            if x1 > x2:
-                x1, x2 = x2, x1
-            if y1 > y2:
-                y1, y2 = y2, y1
-            if (x2 - x1) < 0.025 or (y2 - y1) < 0.025:
+            for v in zone:
+                if not isinstance(v, (list, tuple)) or len(v) < 2 or isinstance(v[0], (list, tuple)):
+                    return None
+                vx = round(max(0.0, min(1.0, float(v[0]))), 4)
+                vy = round(max(0.0, min(1.0, float(v[1]))), 4)
+                if not pts or abs(pts[-1][0] - vx) > 1e-4 or abs(pts[-1][1] - vy) > 1e-4:
+                    pts.append([vx, vy])
+            # Strip duplicate closing point if caller passed first==last
+            if len(pts) > 3 and abs(pts[0][0] - pts[-1][0]) <= 1e-4 and abs(pts[0][1] - pts[-1][1]) <= 1e-4:
+                pts.pop()
+            if len(pts) < 3:
                 return None
-            if x1 <= 0.01 and y1 <= 0.01 and x2 >= 0.99 and y2 >= 0.99:
+            if CameraConfig._polygon_area(pts) < 0.0003:
                 return None
-            return [round(x1, 4), round(y1, 4), round(x2, 4), round(y2, 4)]
+            return pts
         except Exception:
             return None
 
     @staticmethod
-    def normalize_chime_zones(zone: Any) -> List[List[float]]:
+    def normalize_chime_zones(zone: Any) -> List[List[List[float]]]:
         """
-        Normalize `zone` into a list of up to `MAX_CHIME_ZONES` (10) boxes `[[x1, y1, x2, y2], ...]`.
-        Accepts None, a legacy single `[x1, y1, x2, y2]` box, or a list of boxes.
-        Returns `[]` when Whole Frame is active.
+        Normalize `zone` into a list of up to `MAX_CHIME_ZONES` (10) closed polygons
+        `[[[x1, y1], [x2, y2], ...], ...]`.
+        Accepts None, a legacy single `[x1, y1, x2, y2]` box, a single polygon `[[x1, y1], ...]`,
+        or a list of boxes/polygons. Returns `[]` when Whole Frame is active.
         """
         if not zone or not isinstance(zone, (list, tuple)):
             return []
-        # Legacy single box [x1, y1, x2, y2]
         single = CameraConfig.normalize_single_chime_box(zone)
         if single is not None:
             return [single]
-        boxes: List[List[float]] = []
+        polys: List[List[List[float]]] = []
         for item in zone:
-            b = CameraConfig.normalize_single_chime_box(item)
-            if b is not None:
-                boxes.append(b)
-                if len(boxes) >= CameraConfig.MAX_CHIME_ZONES:
+            p = CameraConfig.normalize_single_chime_box(item)
+            if p is not None:
+                polys.append(p)
+                if len(polys) >= CameraConfig.MAX_CHIME_ZONES:
                     break
-        return boxes
+        return polys
 
     @staticmethod
-    def normalize_chime_zone(zone: Any) -> Optional[List[List[float]]]:
+    def normalize_chime_zone(zone: Any) -> Optional[List[List[List[float]]]]:
         """
-        Validate and normalize chime trigger zone(s) into `[[x1, y1, x2, y2], ...]` (up to 10 boxes),
-        or `None` for Whole Frame.
+        Validate and normalize chime trigger zone(s) into a list of closed polygons
+        `[[[x1, y1], [x2, y2], ...], ...]` (up to 10 shapes), or `None` for Whole Frame.
         """
-        boxes = CameraConfig.normalize_chime_zones(zone)
-        return boxes if boxes else None
+        polys = CameraConfig.normalize_chime_zones(zone)
+        return polys if polys else None
 
     @staticmethod
     def box_in_single_chime_box(
         box: Tuple[float, float, float, float],
-        single_zone: List[float],
+        single_zone: Any,
     ) -> bool:
-        """Return True if a detected person bounding box (x1, y1, x2, y2) triggers `single_zone`."""
-        norm_zone = CameraConfig.normalize_single_chime_box(single_zone)
-        if norm_zone is None:
+        """Return True if a detected person bounding box (x1, y1, x2, y2) triggers `single_zone` polygon."""
+        poly = CameraConfig.normalize_single_chime_box(single_zone)
+        if poly is None:
             return False
         if not box or len(box) < 4:
             return False
-        zx1, zy1, zx2, zy2 = norm_zone[0], norm_zone[1], norm_zone[2], norm_zone[3]
         bx1, by1, bx2, by2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
+        if bx1 > bx2:
+            bx1, bx2 = bx2, bx1
+        if by1 > by2:
+            by1, by2 = by2, by1
         bw = max(1e-6, bx2 - bx1)
         bh = max(1e-6, by2 - by1)
+
+        # Quick AABB reject
+        px_min = min(v[0] for v in poly)
+        px_max = max(v[0] for v in poly)
+        py_min = min(v[1] for v in poly)
+        py_max = max(v[1] for v in poly)
+        if bx2 < px_min or bx1 > px_max or by2 < py_min or by1 > py_max:
+            return False
+
         bcx = (bx1 + bx2) * 0.5
         bcy = (by1 + by2) * 0.5
         foot_y = by1 + bh * 0.78
 
-        # 1. Person center or lower-body/feet point lies inside the chime trigger zone
-        if zx1 <= bcx <= zx2 and (zy1 <= bcy <= zy2 or zy1 <= foot_y <= zy2):
-            return True
+        # 1. Person center, lower-body/feet center, or left/right foot point lies inside the closed polygon
+        for tx, ty in (
+            (bcx, bcy),
+            (bcx, foot_y),
+            (bcx, by2),
+            (bx1 + bw * 0.25, foot_y),
+            (bx1 + bw * 0.75, foot_y),
+        ):
+            if CameraConfig._point_in_polygon(tx, ty, poly):
+                return True
 
-        # 2. Meaningful bounding-box intersection with the chime trigger zone
-        ix1 = max(bx1, zx1)
-        iy1 = max(by1, zy1)
-        ix2 = min(bx2, zx2)
-        iy2 = min(by2, zy2)
-        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
-        if inter <= 0.0:
+        # 2. Exact polygon-rectangle intersection area check (handles narrow/small or irregular shapes)
+        clipped = CameraConfig._clip_polygon_to_rect(poly, bx1, by1, bx2, by2)
+        if len(clipped) < 3:
+            return False
+        inter_area = CameraConfig._polygon_area(clipped)
+        if inter_area <= 0.0:
             return False
         person_area = bw * bh
-        zone_area = max(1e-6, (zx2 - zx1) * (zy2 - zy1))
-        return (inter / person_area) >= 0.20 or (inter / zone_area) >= 0.20
+        poly_area = max(1e-6, CameraConfig._polygon_area(poly))
+        return (inter_area / person_area) >= 0.18 or (inter_area / poly_area) >= 0.18
 
     @staticmethod
     def box_in_chime_zone(
@@ -384,6 +518,28 @@ class CameraConfig:
         if "chime_zone" in filtered:
             filtered["chime_zone"] = cls.normalize_chime_zone(filtered["chime_zone"])
         return cls(**filtered)
+
+
+def create_camera_client(config: CameraConfig, **kwargs: Any) -> Any:
+    """
+    Instantiate `HscCameraClient` for V380 Gen-3 HSC (`NVDEVRESULT^300`) cameras
+    (explicitly set to `protocol="hsc"` or auto-detected on LAN when `protocol="lan8800"`),
+    and `LanCameraClient` for legacy TCP Port 8800 cameras.
+    """
+    proto = (config.protocol or "lan8800").lower()
+    use_hsc = proto == "hsc" or (
+        proto in ("lan8800", "v380")
+        and LanCameraDiscovery.is_hsc_camera(config.ip, config.device_id)
+    )
+    client_cls = HscCameraClient if use_hsc else LanCameraClient
+    return client_cls(
+        ip=config.ip,
+        port=config.port,
+        device_id=config.device_id,
+        username=config.username,
+        password=config.password,
+        **kwargs,
+    )
 
 
 class LiveAudioOutput(QObject):
@@ -1423,6 +1579,10 @@ class CameraStreamWorker(QThread):
         self._rec_lock = threading.Lock()
         self._video_writer: Optional[cv2.VideoWriter] = None
         self._recording_path: str = ""
+        self._recording_video_temp_path: str = ""
+        self._recording_pcm_path: str = ""
+        self._recording_pcm_file: Optional[object] = None
+        self._rec_pcm_samples_written: int = 0
         self._rec_start_mono: float = 0.0
         self._rec_frames_written: int = 0
         self._latest_qimage: Optional[QImage] = None
@@ -2105,13 +2265,19 @@ class CameraStreamWorker(QThread):
 
     def start_recording(self, output_dir: Path) -> Optional[str]:
         with self._rec_lock:
-            if self._video_writer is not None:
+            if self._recording_active:
                 return self._recording_path
             output_dir.mkdir(parents=True, exist_ok=True)
             safe_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in self.config.name)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             filepath = output_dir / f"{safe_name}_{ts}.mp4"
             self._recording_path = str(filepath)
+            self._recording_video_temp_path = str(output_dir / f".tmp_{safe_name}_{ts}_v.mp4")
+            self._recording_pcm_path = str(output_dir / f".tmp_{safe_name}_{ts}_a.pcm")
+            self._recording_pcm_file = None
+            self._rec_pcm_samples_written = 0
+            self._rec_start_mono = 0.0
+            self._rec_frames_written = 0
             self._video_writer = None
             self._recording_active = True
             self._rec_thumb_has_person = False
@@ -2126,14 +2292,96 @@ class CameraStreamWorker(QThread):
             self._recording_active = False
             writer = self._video_writer
             self._video_writer = None
+            pcm_fh = self._recording_pcm_file
+            self._recording_pcm_file = None
             saved_path = self._recording_path
+            vid_tmp = self._recording_video_temp_path
+            pcm_tmp = self._recording_pcm_path
             self._recording_path = ""
+            self._recording_video_temp_path = ""
+            self._recording_pcm_path = ""
+            self._rec_pcm_samples_written = 0
             if writer is not None:
                 try:
                     writer.release()
                 except Exception:
                     pass
-        if was_active:
+            if pcm_fh is not None:
+                try:
+                    pcm_fh.close()
+                except Exception:
+                    pass
+
+        if was_active and saved_path:
+            try:
+                has_vid = bool(vid_tmp and os.path.isfile(vid_tmp) and os.path.getsize(vid_tmp) > 256)
+                has_pcm = bool(pcm_tmp and os.path.isfile(pcm_tmp) and os.path.getsize(pcm_tmp) > 0)
+                muxed_ok = False
+                if has_vid and has_pcm:
+                    mux_tmp = f"{saved_path}.mux.mp4"
+                    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                    res = subprocess.run(
+                        [
+                            get_ffmpeg_executable(),
+                            "-y",
+                            "-hide_banner",
+                            "-loglevel",
+                            "error",
+                            "-i",
+                            vid_tmp,
+                            "-f",
+                            "s16le",
+                            "-ar",
+                            "8000",
+                            "-ac",
+                            "1",
+                            "-i",
+                            pcm_tmp,
+                            "-map",
+                            "0:v:0",
+                            "-map",
+                            "1:a:0",
+                            "-c:v",
+                            "copy",
+                            "-c:a",
+                            "aac",
+                            "-ar",
+                            "16000",
+                            "-ac",
+                            "1",
+                            "-b:a",
+                            "48k",
+                            "-shortest",
+                            "-movflags",
+                            "+faststart",
+                            mux_tmp,
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=15.0,
+                        creationflags=creationflags,
+                    )
+                    if res.returncode == 0 and os.path.isfile(mux_tmp) and os.path.getsize(mux_tmp) > 512:
+                        os.replace(mux_tmp, saved_path)
+                        muxed_ok = True
+                    else:
+                        try:
+                            if os.path.isfile(mux_tmp):
+                                os.remove(mux_tmp)
+                        except Exception:
+                            pass
+                if has_vid and not muxed_ok:
+                    os.replace(vid_tmp, saved_path)
+            except Exception:
+                pass
+            finally:
+                for p in (vid_tmp, pcm_tmp):
+                    if p:
+                        try:
+                            if os.path.isfile(p):
+                                os.remove(p)
+                        except Exception:
+                            pass
             self.recording_changed.emit(self.config.cam_id, False, saved_path)
             return saved_path
         return None
@@ -2348,14 +2596,22 @@ class CameraStreamWorker(QThread):
             if frame.is_audio:
                 if frame.audio_codec == "aac":
                     self._feed_aac_to_ffmpeg(frame.payload)
+                elif frame.audio_codec == "pcm16":
+                    pcm = frame.payload
+                    if pcm:
+                        self._append_recording_pcm(pcm)
+                        level = self._compute_pcm_level(pcm)
+                        self.audio_ready.emit(self.config.cam_id, pcm, level)
                 elif frame.audio_codec == "alaw":
                     pcm = decode_alaw_to_pcm16(frame.payload)
                     if pcm:
+                        self._append_recording_pcm(pcm)
                         level = self._compute_pcm_level(pcm)
                         self.audio_ready.emit(self.config.cam_id, pcm, level)
                 else:
                     pcm = decode_adpcm_to_pcm16(frame.payload)
                     if pcm:
+                        self._append_recording_pcm(pcm)
                         level = self._compute_pcm_level(pcm)
                         self.audio_ready.emit(self.config.cam_id, pcm, level)
                 return
@@ -2388,12 +2644,8 @@ class CameraStreamWorker(QThread):
                     self._nal_pending_pframes += 1
                     self._nal_queue.put_nowait((frame.payload, codec, False, False))
 
-        self._lan_client = LanCameraClient(
-            ip=self.config.ip,
-            port=self.config.port,
-            device_id=self.config.device_id,
-            username=self.config.username,
-            password=self.config.password,
+        self._lan_client = create_camera_client(
+            self.config,
             stream_quality=self.config.quality,
             enable_audio=self.config.audio_enabled,
             on_frame=on_frame,
@@ -2588,6 +2840,7 @@ class CameraStreamWorker(QThread):
                 pcm = stdout.read(800)
                 if not pcm:
                     break
+                self._append_recording_pcm(pcm)
                 level = self._compute_pcm_level(pcm)
                 self.audio_ready.emit(self.config.cam_id, pcm, level)
             except Exception:
@@ -2881,8 +3134,9 @@ class CameraStreamWorker(QThread):
             h, w = bgr.shape[:2]
             now = time.monotonic()
             if self._video_writer is None:
+                target_vid = self._recording_video_temp_path or self._recording_path
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                self._video_writer = cv2.VideoWriter(self._recording_path, fourcc, 20.0, (w, h))
+                self._video_writer = cv2.VideoWriter(target_vid, fourcc, 20.0, (w, h))
                 self._rec_start_mono = now
                 self._rec_frames_written = 0
             try:
@@ -2893,6 +3147,31 @@ class CameraStreamWorker(QThread):
                 for _ in range(reps):
                     self._video_writer.write(bgr)
                     self._rec_frames_written += 1
+            except Exception:
+                pass
+
+    def _append_recording_pcm(self, pcm_bytes: bytes) -> None:
+        if not self._recording_active or not pcm_bytes:
+            return
+        with self._rec_lock:
+            if not self._recording_active or not self._recording_pcm_path or self._rec_start_mono <= 0.0:
+                return
+            try:
+                if self._recording_pcm_file is None:
+                    self._recording_pcm_file = open(self._recording_pcm_path, "wb")
+                    self._rec_pcm_samples_written = 0
+                fh = self._recording_pcm_file
+                elapsed = max(0.0, time.monotonic() - self._rec_start_mono)
+                expected_samples = int(elapsed * 8000.0)
+                gap_samples = expected_samples - self._rec_pcm_samples_written
+                # Pad initial offset or long stream dropout (>180 ms) so live audio stays synced with video
+                if 1440 <= gap_samples <= 80000:
+                    fh.write(b"\x00\x00" * gap_samples)
+                    self._rec_pcm_samples_written += gap_samples
+                aligned_len = (len(pcm_bytes) // 2) * 2
+                if aligned_len > 0:
+                    fh.write(pcm_bytes[:aligned_len])
+                    self._rec_pcm_samples_written += aligned_len // 2
             except Exception:
                 pass
 
@@ -3083,13 +3362,7 @@ class SDCardListWorker(QThread):
                 self.finished_list.emit(True, f"{len(segments)} clips ({anom} anomalies • Demo SD)", segments)
             return
 
-        client = LanCameraClient(
-            ip=self.config.ip,
-            port=self.config.port,
-            device_id=self.config.device_id,
-            username=self.config.username,
-            password=self.config.password,
-        )
+        client = create_camera_client(self.config)
         self._client = client
         if self._stop_flag.is_set():
             return
@@ -3227,28 +3500,103 @@ class SDCardPlaybackWorker(QThread):
             self.status_changed.emit("Failed to open local video file", False)
             return
 
-        fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 20.0)
         if fps <= 1.0 or fps > 120.0:
-            fps = 25.0
+            fps = 20.0
 
+        offset_sec = 0.0
         seg = self.segment
         if seg is not None:
-            offset_sec = 0
             if self.start_ts and self.start_ts > seg.start_ts:
-                offset_sec = max(0, min(seg.duration_sec - 1, int(self.start_ts) - int(seg.start_ts)))
-            if offset_sec > 0:
-                cap.set(cv2.CAP_PROP_POS_MSEC, float(offset_sec) * 1000.0)
+                offset_sec = float(max(0, min(seg.duration_sec - 1, int(self.start_ts) - int(seg.start_ts))))
+            if offset_sec > 0.0:
+                cap.set(cv2.CAP_PROP_POS_MSEC, offset_sec * 1000.0)
             self.status_changed.emit(
                 f"Playing Local Backup ({seg.kind_label} • {seg.start_time_str})", True
             )
         else:
             if self.start_ts and self.start_ts > 0:
-                cap.set(cv2.CAP_PROP_POS_MSEC, float(self.start_ts) * 1000.0)
+                offset_sec = float(self.start_ts)
+                cap.set(cv2.CAP_PROP_POS_MSEC, offset_sec * 1000.0)
             self.status_changed.emit(f"Playing Local File ({Path(path).name})", True)
 
-        frame_idx = 0
-        if seg is not None and offset_sec > 0:
-            frame_idx = int(round(offset_sec * fps))
+        frame_idx = int(round(offset_sec * fps)) if offset_sec > 0.0 else 0
+
+        # Decode embedded audio track (AAC / MP4A / PCM) to 8000 Hz mono s16le in a sliding 4 MB buffer
+        audio_base_sec = offset_sec if offset_sec > 60.0 else 0.0
+        pcm_buf = bytearray()
+        pcm_base_byte = 0
+        pcm_lock = threading.Lock()
+        audio_cursor_bytes = int(max(0.0, (frame_idx / fps) - audio_base_sec) * 8000.0) * 2
+        audio_reader_thread: Optional[threading.Thread] = None
+
+        with self._ffmpeg_lock:
+            self._stop_ffmpeg_audio_unlocked()
+            if not self._stop_flag.is_set():
+                creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                ff_cmd = [
+                    get_ffmpeg_executable(),
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                ]
+                if audio_base_sec > 0.0:
+                    ff_cmd += ["-ss", f"{audio_base_sec:.3f}"]
+                ff_cmd += [
+                    "-i",
+                    path,
+                    "-vn",
+                    "-f",
+                    "s16le",
+                    "-ar",
+                    "8000",
+                    "-ac",
+                    "1",
+                    "pipe:1",
+                ]
+                try:
+                    aproc = subprocess.Popen(
+                        ff_cmd,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        bufsize=0,
+                        creationflags=creationflags,
+                    )
+                    self._ffmpeg_audio_proc = aproc
+
+                    def _local_audio_reader(proc: subprocess.Popen) -> None:
+                        nonlocal pcm_base_byte
+                        out = proc.stdout
+                        if out is None:
+                            return
+                        while not self._stop_flag.is_set():
+                            # Throttle decode if >240s ahead of playback cursor so memory stays <= 4 MB
+                            with pcm_lock:
+                                buffered_ahead = (pcm_base_byte + len(pcm_buf)) - audio_cursor_bytes
+                            if buffered_ahead > 3840000:
+                                self._stop_flag.wait(0.05)
+                                continue
+                            try:
+                                chunk = out.read(16000)
+                            except Exception:
+                                break
+                            if not chunk:
+                                break
+                            with pcm_lock:
+                                pcm_buf.extend(chunk)
+                                trim_to = max(0, (audio_cursor_bytes - pcm_base_byte) - 320000)
+                                trim_to = (trim_to // 2) * 2
+                                if trim_to >= 524288 and trim_to <= len(pcm_buf):
+                                    del pcm_buf[:trim_to]
+                                    pcm_base_byte += trim_to
+
+                    audio_reader_thread = threading.Thread(
+                        target=_local_audio_reader, args=(aproc,), daemon=True
+                    )
+                    audio_reader_thread.start()
+                except Exception:
+                    self._ffmpeg_audio_proc = None
 
         anchor_wall = time.monotonic()
         anchor_frame = frame_idx
@@ -3300,9 +3648,34 @@ class SDCardPlaybackWorker(QThread):
                     self.segment_finished.emit()
                     break
 
-                pos_sec = int(frame_idx / fps)
+                cur_media_sec = frame_idx / fps
+                pos_sec = int(cur_media_sec)
                 emit_ts = (int(seg.start_ts) + pos_sec) if seg is not None else pos_sec
                 self._current_ts = emit_ts
+
+                # Emit synchronized 8000 Hz PCM audio at 1x speed (with 80ms WASAPI lookahead cushion)
+                rel_audio_sec = max(0.0, cur_media_sec - audio_base_sec)
+                if abs(speed - 1.0) < 0.05:
+                    desired_end = int((rel_audio_sec + 0.08) * 8000.0) * 2
+                    min_valid = int(max(0.0, rel_audio_sec - 0.25) * 8000.0) * 2
+                    if audio_cursor_bytes < min_valid or audio_cursor_bytes > desired_end + 8000:
+                        audio_cursor_bytes = int(rel_audio_sec * 8000.0) * 2
+                    pcm_out = b""
+                    with pcm_lock:
+                        avail_end = pcm_base_byte + (len(pcm_buf) // 2) * 2
+                        end_b = min(desired_end, avail_end)
+                        start_b = max(audio_cursor_bytes, pcm_base_byte)
+                        if end_b > start_b:
+                            # Cap single write burst to 250ms (4000 bytes)
+                            if end_b - start_b > 4000:
+                                start_b = end_b - 4000
+                            pcm_out = bytes(pcm_buf[start_b - pcm_base_byte : end_b - pcm_base_byte])
+                            audio_cursor_bytes = end_b
+                    if pcm_out:
+                        lvl = CameraStreamWorker._compute_pcm_level(pcm_out)
+                        self.audio_ready.emit(pcm_out, lvl)
+                else:
+                    audio_cursor_bytes = int(rel_audio_sec * 8000.0) * 2
 
                 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
                 h, w, ch = rgb.shape
@@ -3317,6 +3690,10 @@ class SDCardPlaybackWorker(QThread):
                 self._stop_flag.wait(wait_s)
         finally:
             cap.release()
+            with self._ffmpeg_lock:
+                self._stop_ffmpeg_audio_unlocked()
+            if audio_reader_thread is not None and audio_reader_thread.is_alive():
+                audio_reader_thread.join(timeout=0.4)
 
     def _run_demo_sd_playback(self) -> None:
         seg = self.segment
@@ -3406,14 +3783,7 @@ class SDCardPlaybackWorker(QThread):
                 except queue.Full:
                     continue
 
-        client = LanCameraClient(
-            ip=self.config.ip,
-            port=self.config.port,
-            device_id=self.config.device_id,
-            username=self.config.username,
-            password=self.config.password,
-            enable_audio=True,
-        )
+        client = create_camera_client(self.config, enable_audio=True)
         self._lan_client = client
 
         def reader_thread_fn() -> None:
@@ -3496,6 +3866,11 @@ class SDCardPlaybackWorker(QThread):
                 if abs(speed - 1.0) < 0.05:
                     if frame.audio_codec == "aac":
                         self._feed_aac_to_ffmpeg(frame.payload)
+                    elif frame.audio_codec == "pcm16":
+                        pcm = frame.payload
+                        if pcm:
+                            lvl = CameraStreamWorker._compute_pcm_level(pcm)
+                            self.audio_ready.emit(pcm, lvl)
                     elif frame.audio_codec == "alaw":
                         pcm = decode_alaw_to_pcm16(frame.payload)
                         if pcm:
@@ -3787,8 +4162,8 @@ class SDCardPlaybackWorker(QThread):
 class SDCardExportWorker(QThread):
     """
     Downloads a segment (or sub-range `[start_ts, end_ts]`) from the camera's microSD card
-    and muxes the native H.264/H.265 stream directly into an `.mp4` file in `captures/recordings/`
-    without re-encoding (`-c:v copy`).
+    and muxes both the native H.264/H.265 video stream (`-c:v copy` at exact measured FPS)
+    and the recorded camera audio stream (`-c:a aac`) into an `.mp4` file.
     """
 
     progress_changed = pyqtSignal(int)             # 0..100
@@ -3830,168 +4205,357 @@ class SDCardExportWorker(QThread):
                 pass
 
     def run(self) -> None:
-        Path(self.output_path).parent.mkdir(parents=True, exist_ok=True)
+        out_p = Path(self.output_path)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
         total_sec = max(1.0, float(self.end_ts - self.start_ts))
+        uid = f"{os.getpid()}_{threading.get_ident()}_{int(time.monotonic() * 1000)}"
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
         if (self.config.protocol or "lan8800").lower() == "demo":
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(self.output_path, fourcc, 20.0, (960, 540))
-            steps = int(min(120, total_sec * 10))
-            for i in range(steps):
-                if self._stop_flag.is_set():
-                    writer.release()
-                    try:
-                        os.remove(self.output_path)
-                    except Exception:
-                        pass
+            tmp_demo_v = str(out_p.parent / f".tmp_demo_{uid}_v.mp4")
+            tmp_demo_a = str(out_p.parent / f".tmp_demo_{uid}_a.pcm")
+            tmp_demo_out = str(out_p.parent / f".tmp_demo_{uid}_out.mp4")
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                writer = cv2.VideoWriter(tmp_demo_v, fourcc, 20.0, (960, 540))
+                steps = max(20, int(min(120, total_sec * 10)))
+                for i in range(steps):
+                    if self._stop_flag.is_set():
+                        writer.release()
+                        if not self._cancelled.is_set():
+                            self.export_finished.emit(False, "Export cancelled", "")
+                        return
+                    frm = np.zeros((540, 960, 3), dtype=np.uint8)
+                    frm[:, :] = (30, 36, 44)
+                    cv2.putText(
+                        frm,
+                        f"DEMO SD EXPORT  {self.segment.start_time_str}",
+                        (24, 42),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (240, 240, 245),
+                        2,
+                        cv2.LINE_AA,
+                    )
+                    writer.write(frm)
                     if not self._cancelled.is_set():
-                        self.export_finished.emit(False, "Export cancelled", "")
-                    return
-                frm = np.zeros((540, 960, 3), dtype=np.uint8)
-                frm[:, :] = (30, 36, 44)
-                cv2.putText(
-                    frm,
-                    f"DEMO SD EXPORT  {self.segment.start_time_str}",
-                    (24, 42),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (240, 240, 245),
-                    2,
-                    cv2.LINE_AA,
-                )
-                writer.write(frm)
-                if not self._cancelled.is_set():
-                    self.progress_changed.emit(min(99, int((i + 1) * 100 / max(1, steps))))
-                time.sleep(0.01)
-            writer.release()
-            if not self._cancelled.is_set():
-                self.progress_changed.emit(100)
-                self.export_finished.emit(True, f"Saved {Path(self.output_path).name}", self.output_path)
-            return
+                        self.progress_changed.emit(min(96, int((i + 1) * 96 / max(1, steps))))
+                    time.sleep(0.01)
+                writer.release()
 
-        client = LanCameraClient(
-            ip=self.config.ip,
-            port=self.config.port,
-            device_id=self.config.device_id,
-            username=self.config.username,
-            password=self.config.password,
-            enable_audio=False,
-        )
-        self._client = client
+                # Synthesize gentle ambient 8000 Hz demo audio matching clip duration
+                dur_demo_s = max(1.0, steps / 20.0)
+                n_samp = int(dur_demo_s * 8000)
+                t_arr = np.arange(n_samp, dtype=np.float32) / 8000.0
+                wave = (np.sin(2.0 * math.pi * 220.0 * t_arr) * 0.04 * (0.5 + 0.5 * np.sin(2.0 * math.pi * 0.8 * t_arr)))
+                pcm_i16 = np.clip(wave * 32767.0, -32768, 32767).astype("<i2")
+                Path(tmp_demo_a).write_bytes(pcm_i16.tobytes())
 
-        ffmpeg_proc: Optional[subprocess.Popen] = None
-        seen_key = False
-        video_frames_written = 0
-        reached_end = False
-
-        def on_export_frame(frame: CameraFrame) -> None:
-            nonlocal ffmpeg_proc, seen_key, video_frames_written, reached_end
-            if self._stop_flag.is_set() or frame.is_audio:
-                return
-
-            sec = int(frame.timestamp // 1000) if frame.timestamp > 0 else self.start_ts
-            if sec >= self.end_ts and video_frames_written > 0:
-                reached_end = True
-                self._stop_flag.set()
-                client.stop()
-                return
-
-            if not seen_key:
-                if not frame.is_keyframe:
-                    return
-                seen_key = True
-                fmt = "hevc" if frame.codec == VideoCodec.H265 else "h264"
-                creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-                cmd = [
-                    get_ffmpeg_executable(),
-                    "-y",
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-r",
-                    "25",
-                    "-f",
-                    fmt,
-                    "-i",
-                    "pipe:0",
-                    "-c:v",
-                    "copy",
-                    "-movflags",
-                    "+faststart",
-                    self.output_path,
-                ]
-                ffmpeg_proc = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.PIPE,
+                res = subprocess.run(
+                    [
+                        get_ffmpeg_executable(),
+                        "-y",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-i",
+                        tmp_demo_v,
+                        "-f",
+                        "s16le",
+                        "-ar",
+                        "8000",
+                        "-ac",
+                        "1",
+                        "-i",
+                        tmp_demo_a,
+                        "-map",
+                        "0:v:0",
+                        "-map",
+                        "1:a:0",
+                        "-c:v",
+                        "copy",
+                        "-c:a",
+                        "aac",
+                        "-ar",
+                        "16000",
+                        "-ac",
+                        "1",
+                        "-b:a",
+                        "48k",
+                        "-shortest",
+                        "-movflags",
+                        "+faststart",
+                        tmp_demo_out,
+                    ],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
+                    timeout=15.0,
                     creationflags=creationflags,
                 )
-                self._ffmpeg_proc = ffmpeg_proc
+                if res.returncode == 0 and os.path.isfile(tmp_demo_out) and os.path.getsize(tmp_demo_out) > 512:
+                    os.replace(tmp_demo_out, self.output_path)
+                elif os.path.isfile(tmp_demo_v):
+                    os.replace(tmp_demo_v, self.output_path)
 
-            if ffmpeg_proc is not None and ffmpeg_proc.stdin is not None:
-                try:
-                    ffmpeg_proc.stdin.write(frame.payload)
-                    video_frames_written += 1
-                    pct = int(min(98.0, max(1.0, ((sec - self.start_ts) / total_sec) * 100.0)))
-                    if not self._cancelled.is_set():
-                        self.progress_changed.emit(pct)
-                except Exception:
-                    self._stop_flag.set()
-
-        with _get_camera_sd_lock(self.config.ip):
-            if self._cancelled.is_set():
-                return
-            _wait_camera_sd_cooldown(self.config.ip, self._stop_flag, 0.22)
-            if self._cancelled.is_set():
-                return
-            try:
-                ok, msg = client.stream_sd_segment(
-                    segment=self.segment,
-                    start_ts=self.start_ts,
-                    stop_event=self._stop_flag,
-                    on_frame=on_export_frame,
-                )
+                if not self._cancelled.is_set():
+                    self.progress_changed.emit(100)
+                    self.export_finished.emit(True, f"Saved {out_p.name}", self.output_path)
             finally:
-                _mark_camera_sd_closed(self.config.ip)
-
-        self._ffmpeg_proc = None
-        if ffmpeg_proc is not None:
-            try:
-                if ffmpeg_proc.stdin:
-                    ffmpeg_proc.stdin.close()
-                ffmpeg_proc.wait(timeout=5.0)
-            except Exception:
-                try:
-                    ffmpeg_proc.kill()
-                except Exception:
-                    pass
-
-        if self._cancelled.is_set():
-            try:
-                if os.path.isfile(self.output_path):
-                    os.remove(self.output_path)
-            except Exception:
-                pass
+                for p in (tmp_demo_v, tmp_demo_a, tmp_demo_out):
+                    try:
+                        if os.path.isfile(p):
+                            os.remove(p)
+                    except Exception:
+                        pass
             return
 
-        if video_frames_written > 0 and os.path.isfile(self.output_path) and os.path.getsize(self.output_path) > 512:
-            try:
-                seg_thumb = get_segment_thumbnail_path(_get_default_backup_root(), self.config, self.segment)
-                if not seg_thumb.is_file():
-                    extract_best_video_thumbnail(Path(self.output_path), seg_thumb)
-            except Exception:
-                pass
-            self.progress_changed.emit(100)
-            self.export_finished.emit(True, f"Saved {Path(self.output_path).name}", self.output_path)
-        else:
-            try:
-                if os.path.isfile(self.output_path):
-                    os.remove(self.output_path)
-            except Exception:
-                pass
-            err_msg = msg if not ok else "No video frames received in selected range"
-            self.export_finished.emit(False, f"Export failed: {err_msg}", "")
+        # Always request recorded audio from the SD card so backups/exports preserve full sound
+        client = create_camera_client(self.config, enable_audio=True)
+        self._client = client
+
+        tmp_v_path = str(out_p.parent / f".tmp_exp_{uid}_v.bin")
+        tmp_a_path = str(out_p.parent / f".tmp_exp_{uid}_a.bin")
+        tmp_out_mp4 = str(out_p.parent / f".tmp_exp_{uid}_out.mp4")
+
+        seen_key = False
+        video_codec = VideoCodec.H265
+        audio_mode: Optional[str] = None  # "aac" (ADTS) | "pcm16" (8000 Hz s16le mono)
+        video_frames_written = 0
+        audio_bytes_written = 0
+        pcm_samples_written = 0
+        v_first_ts: Optional[int] = None
+        v_last_ts: Optional[int] = None
+        a_first_ts: Optional[int] = None
+        reached_end = False
+        ok = False
+        msg = "Export failed"
+
+        try:
+            with open(tmp_v_path, "wb") as v_fh, open(tmp_a_path, "wb") as a_fh:
+
+                def on_export_frame(frame: CameraFrame) -> None:
+                    nonlocal seen_key, video_codec, audio_mode, video_frames_written
+                    nonlocal audio_bytes_written, pcm_samples_written, v_first_ts, v_last_ts, a_first_ts, reached_end
+                    if self._stop_flag.is_set() or reached_end:
+                        return
+
+                    if frame.is_audio:
+                        if not seen_key or not frame.payload:
+                            return
+                        fts_a = int(frame.timestamp) if frame.timestamp > 0 else 0
+                        if audio_mode is None:
+                            audio_mode = "aac" if frame.audio_codec == "aac" else "pcm16"
+                            if fts_a > 0:
+                                a_first_ts = fts_a
+                        try:
+                            if audio_mode == "aac":
+                                if frame.audio_codec == "aac":
+                                    a_fh.write(frame.payload)
+                                    audio_bytes_written += len(frame.payload)
+                            else:
+                                if frame.audio_codec == "pcm16":
+                                    pcm = frame.payload
+                                elif frame.audio_codec == "alaw":
+                                    pcm = decode_alaw_to_pcm16(frame.payload)
+                                elif frame.audio_codec == "adpcm":
+                                    pcm = decode_adpcm_to_pcm16(frame.payload)
+                                else:
+                                    pcm = b""
+                                if pcm:
+                                    if fts_a > 0 and a_first_ts is not None and fts_a >= a_first_ts:
+                                        expected_samp = int((fts_a - a_first_ts) * 8)
+                                        gap_samp = expected_samp - pcm_samples_written
+                                        if 1200 <= gap_samp <= 80000:
+                                            a_fh.write(b"\x00\x00" * gap_samp)
+                                            audio_bytes_written += gap_samp * 2
+                                            pcm_samples_written += gap_samp
+                                    aligned = (len(pcm) // 2) * 2
+                                    if aligned > 0:
+                                        a_fh.write(pcm[:aligned])
+                                        audio_bytes_written += aligned
+                                        pcm_samples_written += aligned // 2
+                        except Exception:
+                            pass
+                        return
+
+                    sec = int(frame.timestamp // 1000) if frame.timestamp > 0 else self.start_ts
+                    if sec >= self.end_ts and video_frames_written > 0:
+                        reached_end = True
+                        self._stop_flag.set()
+                        client.stop()
+                        return
+
+                    if not seen_key:
+                        if not frame.is_keyframe:
+                            return
+                        seen_key = True
+                        video_codec = (
+                            frame.codec if frame.codec != VideoCodec.UNKNOWN else VideoCodec.H265
+                        )
+
+                    try:
+                        v_fh.write(frame.payload)
+                        video_frames_written += 1
+                        if frame.timestamp > 0:
+                            fts_v = int(frame.timestamp)
+                            if v_first_ts is None:
+                                v_first_ts = fts_v
+                            v_last_ts = fts_v
+                        pct = int(min(95.0, max(1.0, ((sec - self.start_ts) / total_sec) * 95.0)))
+                        if not self._cancelled.is_set():
+                            self.progress_changed.emit(pct)
+                    except Exception:
+                        self._stop_flag.set()
+
+                with _get_camera_sd_lock(self.config.ip):
+                    if self._cancelled.is_set():
+                        return
+                    _wait_camera_sd_cooldown(self.config.ip, self._stop_flag, 0.22)
+                    if self._cancelled.is_set():
+                        return
+                    try:
+                        ok, msg = client.stream_sd_segment(
+                            segment=self.segment,
+                            start_ts=self.start_ts,
+                            stop_event=self._stop_flag,
+                            on_frame=on_export_frame,
+                        )
+                    finally:
+                        _mark_camera_sd_closed(self.config.ip)
+
+            if self._cancelled.is_set():
+                return
+
+            if video_frames_written > 0 and os.path.isfile(tmp_v_path) and os.path.getsize(tmp_v_path) > 256:
+                self.progress_changed.emit(97)
+                v_span_sec = (
+                    (v_last_ts - v_first_ts) / 1000.0
+                    if (v_first_ts is not None and v_last_ts is not None and v_last_ts > v_first_ts)
+                    else 0.0
+                )
+                measured_fps = (
+                    (video_frames_written - 1) / v_span_sec
+                    if (video_frames_written >= 2 and v_span_sec >= 0.2)
+                    else 20.0
+                )
+                measured_fps = max(4.0, min(60.0, measured_fps))
+                v_fmt = "hevc" if video_codec == VideoCodec.H265 else "h264"
+
+                has_audio_data = (
+                    audio_mode is not None
+                    and audio_bytes_written > 0
+                    and os.path.isfile(tmp_a_path)
+                    and os.path.getsize(tmp_a_path) > 0
+                )
+
+                def _run_mux(include_audio: bool) -> bool:
+                    cmd = [
+                        get_ffmpeg_executable(),
+                        "-y",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-r",
+                        f"{measured_fps:.6f}",
+                        "-f",
+                        v_fmt,
+                        "-i",
+                        tmp_v_path,
+                    ]
+                    if include_audio and audio_mode is not None:
+                        a_offset_s = (
+                            (a_first_ts - v_first_ts) / 1000.0
+                            if (a_first_ts is not None and v_first_ts is not None)
+                            else 0.0
+                        )
+                        if 0.04 <= abs(a_offset_s) <= 8.0:
+                            cmd += ["-itsoffset", f"{a_offset_s:.3f}"]
+                        if audio_mode == "aac":
+                            cmd += ["-f", "aac", "-i", tmp_a_path]
+                        else:
+                            cmd += ["-f", "s16le", "-ar", "8000", "-ac", "1", "-i", tmp_a_path]
+                        cmd += [
+                            "-map",
+                            "0:v:0",
+                            "-map",
+                            "1:a:0",
+                            "-c:v",
+                            "copy",
+                            "-c:a",
+                            "aac",
+                            "-ar",
+                            "16000",
+                            "-ac",
+                            "1",
+                            "-b:a",
+                            "48k",
+                        ]
+                    else:
+                        cmd += ["-c:v", "copy"]
+                    cmd += ["-movflags", "+faststart", tmp_out_mp4]
+
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=creationflags,
+                    )
+                    self._ffmpeg_proc = proc
+                    try:
+                        proc.wait(timeout=30.0)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                        return False
+                    finally:
+                        self._ffmpeg_proc = None
+                    return (
+                        not self._cancelled.is_set()
+                        and proc.returncode == 0
+                        and os.path.isfile(tmp_out_mp4)
+                        and os.path.getsize(tmp_out_mp4) > 512
+                    )
+
+                mux_ok = _run_mux(include_audio=has_audio_data)
+                if not mux_ok and has_audio_data and not self._cancelled.is_set():
+                    try:
+                        if os.path.isfile(tmp_out_mp4):
+                            os.remove(tmp_out_mp4)
+                    except Exception:
+                        pass
+                    mux_ok = _run_mux(include_audio=False)
+
+                if self._cancelled.is_set():
+                    return
+
+                if mux_ok:
+                    os.replace(tmp_out_mp4, self.output_path)
+                    try:
+                        seg_thumb = get_segment_thumbnail_path(
+                            _get_default_backup_root(), self.config, self.segment
+                        )
+                        if not seg_thumb.is_file():
+                            extract_best_video_thumbnail(Path(self.output_path), seg_thumb)
+                    except Exception:
+                        pass
+                    self.progress_changed.emit(100)
+                    self.export_finished.emit(True, f"Saved {out_p.name}", self.output_path)
+                    return
+
+            if not self._cancelled.is_set():
+                err_msg = msg if not ok else "No video frames received in selected range"
+                self.export_finished.emit(False, f"Export failed: {err_msg}", "")
+        finally:
+            self._ffmpeg_proc = None
+            for p in (tmp_v_path, tmp_a_path, tmp_out_mp4):
+                try:
+                    if os.path.isfile(p):
+                        os.remove(p)
+                except Exception:
+                    pass
 
 
 def _safe_camera_folder_name(cfg: CameraConfig) -> str:
@@ -4022,6 +4586,53 @@ def find_segment_backup_file(backup_root: Path, cfg: CameraConfig, seg: Recordin
             if cand.is_file() and cand.stat().st_size > 512:
                 return cand
     return None
+
+
+def mp4_has_audio_track(mp4_path: Path) -> bool:
+    """
+    Fast (<0.1 ms) ISO-BMFF (.mp4/.mov) atom check that inspects the `moov` box
+    for an audio `hdlr` (`handler_type == b'soun'`) without spawning FFmpeg or reading `mdat`.
+    """
+    try:
+        file_size = mp4_path.stat().st_size
+        if file_size < 64:
+            return False
+        with open(mp4_path, "rb") as f:
+            pos = 0
+            while pos + 8 <= file_size:
+                f.seek(pos)
+                hdr = f.read(16)
+                if len(hdr) < 8:
+                    break
+                box_size = int.from_bytes(hdr[0:4], "big")
+                box_type = hdr[4:8]
+                hdr_len = 8
+                if box_size == 1:
+                    if len(hdr) < 16:
+                        break
+                    box_size = int.from_bytes(hdr[8:16], "big")
+                    hdr_len = 16
+                elif box_size == 0:
+                    box_size = file_size - pos
+                if box_size < hdr_len or pos + box_size > file_size:
+                    break
+                if box_type == b"moov":
+                    moov_len = min(box_size - hdr_len, 8 * 1024 * 1024)
+                    f.seek(pos + hdr_len)
+                    moov_data = f.read(moov_len)
+                    idx = 0
+                    while True:
+                        h_idx = moov_data.find(b"hdlr", idx)
+                        if h_idx < 0 or h_idx + 16 > len(moov_data):
+                            break
+                        if moov_data[h_idx + 12 : h_idx + 16] == b"soun":
+                            return True
+                        idx = h_idx + 4
+                    return False
+                pos += box_size
+    except Exception:
+        pass
+    return False
 
 
 def save_segment_backup_meta(backup_root: Path, cfg: CameraConfig, segments: List[RecordingSegment]) -> None:
@@ -4226,13 +4837,7 @@ class SDCardBulkBackupWorker(QThread):
                     lw.run()
                     candidates.extend(res_list)
                 else:
-                    client = LanCameraClient(
-                        ip=self.config.ip,
-                        port=self.config.port,
-                        device_id=self.config.device_id,
-                        username=self.config.username,
-                        password=self.config.password,
-                    )
+                    client = create_camera_client(self.config)
                     ok, _msg, day_segs = client.list_sd_recordings(cur_dt.year, cur_dt.month, cur_dt.day)
                     if ok and day_segs:
                         candidates.extend(day_segs)
@@ -4278,7 +4883,9 @@ class SDCardBulkBackupWorker(QThread):
 
             if self.skip_existing:
                 existing = find_segment_backup_file(self.backup_root, self.config, seg)
-                if existing is not None:
+                if existing is not None and (
+                    not self.config.audio_enabled or mp4_has_audio_track(existing)
+                ):
                     saved_count += 1
                     skipped_count += 1
                     save_segment_backup_meta(self.backup_root, self.config, [seg])
@@ -4749,14 +5356,7 @@ class SDCardThumbnailFetchWorker(QThread):
             got_keyframe_bytes: List[Tuple[bytes, VideoCodec]] = []
             local_stop = threading.Event()
 
-            client = LanCameraClient(
-                ip=self.config.ip,
-                port=self.config.port,
-                device_id=self.config.device_id,
-                username=self.config.username,
-                password=self.config.password,
-                enable_audio=False,
-            )
+            client = create_camera_client(self.config, enable_audio=False)
             self._client = client
 
             def on_kf(frame: CameraFrame) -> None:

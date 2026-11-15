@@ -21,5 +21,6 @@ installer/
 
 # Local IDE & agent configs
 .agents/
+.brain/
 .vscode/
 .idea/

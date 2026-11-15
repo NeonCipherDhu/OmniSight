@@ -375,6 +375,17 @@ def patch_installed_exe_carchive(install_dir: Path | None = None) -> bool:
     patch_py = tmp_dir / "repack_carchive.py"
     staged_exe = tmp_dir / "OmniSight.exe.new"
 
+    base_exe_path = exe_path
+    payload_zip = BUILD_DIR / "OmniSight_Payload.zip"
+    if payload_zip.is_file() and payload_zip.stat().st_mtime > exe_path.stat().st_mtime:
+        try:
+            with zipfile.ZipFile(payload_zip, "r") as zf:
+                extracted_base = tmp_dir / "OmniSight.exe.base"
+                extracted_base.write_bytes(zf.read("OmniSight.exe"))
+                base_exe_path = extracted_base
+        except Exception:
+            pass
+
     cs_code = f"""using System;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -418,7 +429,7 @@ from _struct import pack, unpack
 import zlib
 
 root_dir = {repr(str(ROOT))}
-exe_path = {repr(str(exe_path))}
+exe_path = {repr(str(base_exe_path))}
 staged_exe = {repr(str(staged_exe))}
 
 with open(exe_path, "rb") as f:
@@ -440,16 +451,14 @@ with open(os.path.join(root_dir, "omnisight_app.py"), "rb") as f:
 app_code_raw = marshal.dumps(compile(app_src, "omnisight_app.py", "exec"))
 app_code_comp = zlib.compress(app_code_raw, 6)
 
-# Helper to update PYZ.pyz with stream_worker.py and v380_protocol.py
+# Helper to update PYZ.pyz with stream_worker.py and omnisight_protocol.py cleanly without dead bytes
 def update_pyz(pyz_bytes):
-    pyz_magic = pyz_bytes[:8]
     old_toc_off = unpack("!i", pyz_bytes[8:12])[0]
-    header_rest = pyz_bytes[12:17]
     toc = marshal.loads(pyz_bytes[old_toc_off:])
     is_list = isinstance(toc, list)
     toc_dict = dict(toc) if is_list else dict(toc)
 
-    body = bytearray(pyz_bytes[:old_toc_off])
+    replacements = {{}}
     for mod_name, src_filename in (
         ("stream_worker", "stream_worker.py"),
         ("omnisight_protocol", "omnisight_protocol.py"),
@@ -460,13 +469,22 @@ def update_pyz(pyz_bytes):
             with open(mod_file, "rb") as mf:
                 msrc = mf.read()
             mcode = marshal.dumps(compile(msrc, src_filename, "exec"))
-            mcomp = zlib.compress(mcode, 6)
-            new_pos = len(body)
-            body.extend(mcomp)
-            toc_dict[mod_name] = (0, new_pos, len(mcomp))
+            replacements[mod_name] = zlib.compress(mcode, 6)
+
+    body = bytearray(pyz_bytes[:17])
+    new_toc_dict = {{}}
+    for mod_name, (ispkg, old_pos, old_len) in toc_dict.items():
+        mcomp = replacements.get(mod_name)
+        if mcomp is None:
+            mcomp = pyz_bytes[old_pos : old_pos + old_len]
+        else:
+            ispkg = 0
+        new_pos = len(body)
+        body.extend(mcomp)
+        new_toc_dict[mod_name] = (ispkg, new_pos, len(mcomp))
 
     new_pyz_toc_off = len(body)
-    toc_out = list(toc_dict.items()) if is_list else toc_dict
+    toc_out = list(new_toc_dict.items()) if is_list else new_toc_dict
     body.extend(marshal.dumps(toc_out))
     body[8:12] = pack("!i", new_pyz_toc_off)
     return bytes(body)
